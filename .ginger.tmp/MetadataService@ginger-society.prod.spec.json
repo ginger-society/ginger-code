@@ -1,0 +1,2814 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "MetadataService",
+    "description": "Rocket.rs CRUD REST API example",
+    "contact": {
+      "name": "Repository",
+      "url": "https://github.com/ginger-society/template-backend-rust"
+    },
+    "version": "0.6.0-nightly.0"
+  },
+  "servers": [
+    {
+      "url": "/metadata"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "description": "This is a description. <br />You can do simple html <br /> like <b>this<b/>",
+        "operationId": "routes_index",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dbschema": {
+      "post": {
+        "operationId": "metadata_create_dbschema",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDbschemaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateDbschemaResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          },
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschemas": {
+      "get": {
+        "operationId": "metadata_get_dbschemas",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "page_number",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GetDbschemaResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschema/{schema_id}/{branch_name}": {
+      "put": {
+        "operationId": "metadata_update_dbschema",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDbschemaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dbschema"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschemas-branch/{schema_id}": {
+      "get": {
+        "operationId": "metadata_get_dbschema_by_id",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetDbschemaByIdResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/user-land/dbschemas-branch/{schema_id}": {
+      "get": {
+        "operationId": "metadata_get_dbschema_by_id_userland",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetDbschemaByIdResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschemas/{schema_id}/branches": {
+      "post": {
+        "operationId": "metadata_create_dbschema_branch",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDbschemaBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateDbschemaBranchResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschemas/{schema_id}/branches/{branch_id}": {
+      "put": {
+        "operationId": "metadata_update_dbschema_branch",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDbschemaBranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateDbschemaBranchResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/services": {
+      "put": {
+        "operationId": "metadata_update_or_create_service",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateServiceResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          },
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/services-and-envs/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_services_and_envs",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_number",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServicesTrimmedResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/services-and-envs/{org_id}/{service_identifier}/{env}": {
+      "get": {
+        "operationId": "metadata_get_service_and_env_by_id",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesEnvResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/services/{service_identifier}/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_service_by_id",
+        "parameters": [
+          {
+            "name": "service_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/create_or_update_package": {
+      "post": {
+        "operationId": "metadata_create_or_update_package",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrUpdatePackageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateOrUpdatePackageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          },
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/packages/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_user_packages",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PackageResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/dbschemas-and-tables/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_dbschemas_and_tables",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GetDbschemaAndTablesResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/update-pipeline-status": {
+      "put": {
+        "operationId": "metadata_update_pipeline_status",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PipelineStatusUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          },
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/organization": {
+      "post": {
+        "operationId": "metadata_create_organization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrganizationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateOrganizationResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/update-block-positions/{org_id}": {
+      "post": {
+        "operationId": "metadata_update_block_positions",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/get-workspaces": {
+      "get": {
+        "operationId": "metadata_get_workspaces",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkspaceSummaryResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/get-workspace/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_workspace",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDetailResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/get-workspace-details/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_workspace_details",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceSummaryResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manage-workspace/{org_id}/delete": {
+      "delete": {
+        "operationId": "metadata_delete_workspace",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/user-land/services-and-envs/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_services_and_envs_user_land",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_number",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServicesTrimmedResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/user-land/services-and-envs/{org_id}/{service_identifier}/{env}": {
+      "get": {
+        "operationId": "metadata_get_service_and_env_by_id_user_land",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesEnvResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/get-current-workspace": {
+      "get": {
+        "operationId": "metadata_get_current_workspace",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APISessionDetailsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/version/{org_id}/{package_name}": {
+      "get": {
+        "operationId": "metadata_get_package_version_plain_text",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "package_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/update-db-pipeline/{org_id}/{schema_name}/{branch_name}": {
+      "put": {
+        "operationId": "metadata_update_db_pipeline",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schema_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDbPipelineRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dbschema"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/public/services-and-envs/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_services_and_envs_public",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_number",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServicesTrimmedResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/public/get-workspace/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_workspace_public",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceDetailResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/dbschemas-and-tables/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_dbschemas_and_tables_public",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GetDbschemaAndTablesResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/packages/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_user_packages_public",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PackageResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public/services-and-envs/{org_id}/{service_identifier}/{env}": {
+      "get": {
+        "operationId": "metadata_get_service_and_env_by_id_public",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicesEnvResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/public/dbschemas-branch/{schema_id}": {
+      "get": {
+        "operationId": "metadata_get_dbschema_by_id_public",
+        "parameters": [
+          {
+            "name": "schema_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetDbschemaByIdResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates": {
+      "get": {
+        "operationId": "metadata_get_all_templates",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Templates"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/user-land/packages/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_user_packages_user_land",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PackageResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/user-land/dbschemas-and-tables/{org_id}/{env}": {
+      "get": {
+        "operationId": "metadata_get_dbschemas_and_tables_user_land",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GetDbschemaAndTablesResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/create-snapshot": {
+      "post": {
+        "operationId": "metadata_create_snapshot",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/get-snapshots/{org_id}": {
+      "get": {
+        "operationId": "metadata_get_snapshots",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SnapshotsResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/version-details/{org_id}/{package_name}": {
+      "get": {
+        "operationId": "metadata_get_package_version",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "package_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "MessageResponse": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "description": "This is a message from the server.",
+            "type": "string"
+          }
+        }
+      },
+      "CreateDbschemaResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "identifier",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "identifier": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateDbschemaRequest": {
+        "type": "object",
+        "required": [
+          "db_type",
+          "name",
+          "organisation_id",
+          "repo_origin",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "data": {
+            "type": "string",
+            "nullable": true
+          },
+          "organisation_id": {
+            "type": "string"
+          },
+          "db_type": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          },
+          "schema": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "GetDbschemaResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "organization_id",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "identifier": {
+            "type": "string",
+            "nullable": true
+          },
+          "organization_id": {
+            "type": "string"
+          }
+        }
+      },
+      "Dbschema": {
+        "type": "object",
+        "required": [
+          "created_at",
+          "db_type",
+          "id",
+          "name",
+          "updated_at"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "data": {
+            "type": "string",
+            "nullable": true
+          },
+          "group_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "identifier": {
+            "type": "string",
+            "nullable": true
+          },
+          "organization_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "db_type": {
+            "type": "string"
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "UpdateDbschemaRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "organisation_id",
+          "repo_origin",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "organisation_id": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "GetDbschemaByIdResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "string",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "data": {
+            "type": "string",
+            "nullable": true
+          },
+          "branch_id": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "org_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "group_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreateDbschemaBranchResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateDbschemaBranchRequest": {
+        "type": "object",
+        "required": [
+          "branch_name"
+        ],
+        "properties": {
+          "branch_name": {
+            "type": "string"
+          },
+          "data": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateDbschemaBranchResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "UpdateDbschemaBranchRequest": {
+        "type": "object",
+        "required": [
+          "branch_name"
+        ],
+        "properties": {
+          "branch_name": {
+            "type": "string"
+          },
+          "data": {
+            "type": "string",
+            "nullable": true
+          },
+          "merged": {
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateServiceResponse": {
+        "type": "object",
+        "required": [
+          "message",
+          "service_id"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "service_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "UpdateServiceRequest": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "dependencies",
+          "description",
+          "env",
+          "identifier",
+          "organization_id",
+          "spec",
+          "tables"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "env": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string"
+          },
+          "base_url_ws": {
+            "type": "string",
+            "nullable": true
+          },
+          "spec": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "db_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "cache_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "message_queue_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "service_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "string",
+            "nullable": true
+          },
+          "lang": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ServicesTrimmedResponse": {
+        "type": "object",
+        "required": [
+          "dependencies",
+          "description",
+          "envs",
+          "identifier",
+          "organization_id",
+          "tables"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "envs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServicesEnvTrimmedResponse"
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "db_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "cache_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "message_queue_schema_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "service_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "lang": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ServicesEnvTrimmedResponse": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "env_key"
+        ],
+        "properties": {
+          "env_key": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string"
+          },
+          "base_url_ws": {
+            "type": "string",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "version": {
+            "type": "string",
+            "nullable": true
+          },
+          "pipeline_status": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ServicesEnvResponse": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "spec"
+        ],
+        "properties": {
+          "spec": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string"
+          }
+        }
+      },
+      "ServiceResponse": {
+        "type": "object",
+        "required": [
+          "db_schema_id",
+          "dependencies",
+          "description",
+          "id",
+          "identifier",
+          "organization_id",
+          "tables"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "identifier": {
+            "type": "string"
+          },
+          "group_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "db_schema_id": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreateOrUpdatePackageResponse": {
+        "type": "object",
+        "required": [
+          "message",
+          "package_id"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "package_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateOrUpdatePackageRequest": {
+        "type": "object",
+        "required": [
+          "dependencies",
+          "description",
+          "env",
+          "identifier",
+          "lang",
+          "organization_id",
+          "package_type",
+          "version"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "package_type": {
+            "type": "string"
+          },
+          "lang": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "env": {
+            "type": "string"
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "PackageResponse": {
+        "type": "object",
+        "required": [
+          "dependencies",
+          "description",
+          "identifier",
+          "lang",
+          "organization_id",
+          "package_type",
+          "updated_at",
+          "version"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "package_type": {
+            "type": "string"
+          },
+          "lang": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string"
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pipeline_status": {
+            "type": "string",
+            "nullable": true
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "GetDbschemaAndTablesResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "organization_id",
+          "tables",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "string",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "identifier": {
+            "type": "string",
+            "nullable": true
+          },
+          "db_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "organization_id": {
+            "type": "string"
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pipeline_status": {
+            "type": "string",
+            "nullable": true
+          },
+          "repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "PipelineStatusUpdateRequest": {
+        "type": "object",
+        "required": [
+          "env",
+          "identifier",
+          "org_id",
+          "status",
+          "update_type"
+        ],
+        "properties": {
+          "env": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "update_type": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "identifier": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateOrganizationResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateOrganizationRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkspaceSummaryResponse": {
+        "type": "object",
+        "required": [
+          "group_id",
+          "is_active",
+          "is_admin",
+          "slug"
+        ],
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "is_admin": {
+            "type": "boolean"
+          },
+          "group_id": {
+            "type": "string"
+          },
+          "infra_repo_origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "quick_links": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "WorkspaceDetailResponse": {
+        "type": "object",
+        "required": [
+          "is_active",
+          "is_admin"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "block_positions": {
+            "type": "string",
+            "nullable": true
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "is_admin": {
+            "type": "boolean"
+          }
+        }
+      },
+      "APISessionDetailsResponse": {
+        "type": "object",
+        "required": [
+          "exp",
+          "group_id",
+          "org_id",
+          "scopes",
+          "sub"
+        ],
+        "properties": {
+          "sub": {
+            "type": "string"
+          },
+          "exp": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0.0
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "group_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "org_id": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateDbPipelineRequest": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "Templates": {
+        "type": "object",
+        "required": [
+          "description",
+          "id",
+          "identifier",
+          "repo_link",
+          "short_name"
+        ],
+        "properties": {
+          "short_name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "repo_link": {
+            "type": "string"
+          },
+          "identifier": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateSnapshotRequest": {
+        "type": "object",
+        "required": [
+          "infra_repo_origin",
+          "org_id",
+          "quick_links",
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "org_id": {
+            "type": "string"
+          },
+          "infra_repo_origin": {
+            "type": "string"
+          },
+          "quick_links": {
+            "type": "string"
+          }
+        }
+      },
+      "SnapshotsResponse": {
+        "type": "object",
+        "required": [
+          "created_at",
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "VersionResponse": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAPIAuth": {
+        "description": "Requires a Bearer token to access",
+        "type": "apiKey",
+        "name": "X-API-Authorization",
+        "in": "header"
+      },
+      "BearerAuth": {
+        "description": "Requires a Bearer token to access",
+        "type": "apiKey",
+        "name": "Authorization",
+        "in": "header"
+      }
+    }
+  }
+}

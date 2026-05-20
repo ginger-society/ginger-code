@@ -1,0 +1,1826 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "IAMService",
+    "description": "IAM - Identity and Access Management system",
+    "contact": {
+      "name": "Repository",
+      "url": "https://github.com/ginger-society/IAM"
+    },
+    "version": "0.5.2-nightly.0"
+  },
+  "servers": [
+    {
+      "url": "/iam"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "description": "This is a description. <br />You can do simple html <br /> like <b>this<b/>",
+        "operationId": "routes_index",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/register": {
+      "post": {
+        "operationId": "identity_register",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/login": {
+      "post": {
+        "operationId": "identity_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IAMLoginResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/refresh-token": {
+      "post": {
+        "operationId": "identity_refresh_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshTokenResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/validate": {
+      "get": {
+        "operationId": "identity_validate_token",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateTokenResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/validate-api-token": {
+      "get": {
+        "operationId": "identity_validate_api_token",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateAPITokenResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/change-password": {
+      "post": {
+        "operationId": "identity_change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/update-profile": {
+      "put": {
+        "operationId": "identity_update_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/app-details/{client_id_}": {
+      "get": {
+        "operationId": "identity_get_app_by_client_id",
+        "parameters": [
+          {
+            "name": "client_id_",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/group-memberships": {
+      "get": {
+        "operationId": "identity_get_group_memberships",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/create-group": {
+      "post": {
+        "operationId": "identity_create_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGroupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Group"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/request-password": {
+      "post": {
+        "operationId": "identity_request_password_reset",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/reset-password": {
+      "post": {
+        "operationId": "identity_reset_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetPasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/create-api-token": {
+      "post": {
+        "operationId": "identity_create_api_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateApiTokenResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/logout": {
+      "post": {
+        "operationId": "identity_logout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LogoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/group-ownerships": {
+      "get": {
+        "operationId": "identity_get_group_ownserships",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/get_members/{group_param}": {
+      "get": {
+        "operationId": "identity_get_members",
+        "parameters": [
+          {
+            "name": "group_param",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserInfoResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/manage-membership/{group_param}/{user_id}/{action}": {
+      "put": {
+        "operationId": "identity_manage_membership",
+        "parameters": [
+          {
+            "name": "group_param",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/create-api-session-token": {
+      "post": {
+        "operationId": "identity_create_api_session_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "default": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionTokenResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api-tokens/{group_identifier}": {
+      "get": {
+        "operationId": "identity_get_api_tokens_by_group",
+        "parameters": [
+          {
+            "name": "group_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GroupApiTokenResponse"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/api-tokens/{token_id}/deactivate": {
+      "put": {
+        "operationId": "identity_deactivate_api_token",
+        "parameters": [
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/create-api-session-token-interactive/{group_identifier}": {
+      "post": {
+        "description": "this is used by the developers on their machine for creating a session. This assumes that there is an active session on the machine",
+        "operationId": "identity_create_api_session_token_interactive",
+        "parameters": [
+          {
+            "name": "group_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionTokenResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/clear-redis": {
+      "get": {
+        "operationId": "identity_clear_redis",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/get_group_members_ids/{group_identifier}": {
+      "get": {
+        "operationId": "identity_get_group_members_ids",
+        "parameters": [
+          {
+            "name": "group_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/user-land/get_group_members_ids/{group_identifier}": {
+      "get": {
+        "operationId": "identity_get_group_members_ids_user_land",
+        "parameters": [
+          {
+            "name": "group_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api-land/get_group_members_ids/{group_identifier}": {
+      "get": {
+        "operationId": "identity_get_group_members_ids_api_land",
+        "parameters": [
+          {
+            "name": "group_identifier",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/confirm-register/{registration_token}": {
+      "get": {
+        "operationId": "identity_registeration_confirmation",
+        "parameters": [
+          {
+            "name": "registration_token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/accept-invite/{invitation_token}": {
+      "post": {
+        "operationId": "identity_accept_invite",
+        "parameters": [
+          {
+            "name": "invitation_token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptInviteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/accessible-apps": {
+      "get": {
+        "operationId": "identity_get_accessible_apps",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccessibleApp"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/generate-app-tokens/{app_id}": {
+      "post": {
+        "operationId": "identity_generate_app_tokens",
+        "parameters": [
+          {
+            "name": "app_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/create_or_update_app": {
+      "post": {
+        "operationId": "identity_create_or_update_app",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOrUpdateAppRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/is_member/{group_param}": {
+      "get": {
+        "operationId": "identity_is_member",
+        "parameters": [
+          {
+            "name": "group_param",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IsMemberResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/docker-token": {
+      "get": {
+        "operationId": "identity_get_docker_token",
+        "parameters": [
+          {
+            "name": "service",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockerTokenResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BasicAuth": []
+          }
+        ]
+      }
+    },
+    "/ssh-cert/user-land": {
+      "post": {
+        "description": "Issue an SSH user certificate for an authenticated **user** (500-minute TTL).",
+        "operationId": "gitter_ssh_cert_user_land",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshCertResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ]
+      }
+    },
+    "/ssh-cert/api-land": {
+      "post": {
+        "description": "Issue an SSH user certificate for an **API token** caller (20-minute TTL).",
+        "operationId": "gitter_ssh_cert_api_land",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshCertResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    },
+    "/ssh-cert/isc-land": {
+      "post": {
+        "description": "Issue an SSH user certificate for an **ISC** service caller (365-day TTL).",
+        "operationId": "gitter_ssh_cert_isc_land",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SshCertResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "BearerAPIAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "MessageResponse": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "description": "This is a message from the server.",
+            "type": "string"
+          }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "required": [
+          "app_id",
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "app_id": {
+            "type": "string"
+          }
+        }
+      },
+      "IAMLoginResponse": {
+        "type": "object",
+        "required": [
+          "iam_tokens"
+        ],
+        "properties": {
+          "app_tokens": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LoginResponse"
+              }
+            ],
+            "nullable": true
+          },
+          "iam_tokens": {
+            "$ref": "#/components/schemas/LoginResponse"
+          }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "required": [
+          "access_token",
+          "refresh_token"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string"
+          },
+          "refresh_token": {
+            "type": "string"
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "client_id": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "RefreshTokenResponse": {
+        "type": "object",
+        "required": [
+          "access_token"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string"
+          }
+        }
+      },
+      "RefreshTokenRequest": {
+        "type": "object",
+        "required": [
+          "refresh_token"
+        ],
+        "properties": {
+          "refresh_token": {
+            "type": "string"
+          }
+        }
+      },
+      "ValidateTokenResponse": {
+        "type": "object",
+        "required": [
+          "exp",
+          "sub",
+          "user_id"
+        ],
+        "properties": {
+          "sub": {
+            "type": "string"
+          },
+          "exp": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0.0
+          },
+          "user_id": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "middle_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "client_id": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ValidateAPITokenResponse": {
+        "type": "object",
+        "required": [
+          "exp",
+          "group_id",
+          "scopes",
+          "sub"
+        ],
+        "properties": {
+          "sub": {
+            "type": "string"
+          },
+          "exp": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0.0
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "group_id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ChangePasswordRequest": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "email",
+          "new_password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateProfileRequest": {
+        "type": "object",
+        "properties": {
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "middle_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "mobile_number": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "AppResponse": {
+        "type": "object",
+        "required": [
+          "allow_registration",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "logo_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_dev": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_stage": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_prod": {
+            "type": "string",
+            "nullable": true
+          },
+          "tnc_link": {
+            "type": "string",
+            "nullable": true
+          },
+          "allow_registration": {
+            "type": "boolean"
+          },
+          "redirection_path": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "Group": {
+        "type": "object",
+        "required": [
+          "disabled",
+          "id",
+          "identifier"
+        ],
+        "properties": {
+          "identifier": {
+            "type": "string"
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "short_text": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateGroupRequest": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "RequestPasswordRequest": {
+        "type": "object",
+        "required": [
+          "app_id",
+          "email_id"
+        ],
+        "properties": {
+          "email_id": {
+            "type": "string"
+          },
+          "app_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ResetPasswordRequest": {
+        "type": "object",
+        "required": [
+          "new_password",
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateApiTokenResponse": {
+        "type": "object",
+        "required": [
+          "api_token"
+        ],
+        "properties": {
+          "api_token": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateApiTokenRequest": {
+        "type": "object",
+        "required": [
+          "days_to_expire",
+          "group_identifier",
+          "name"
+        ],
+        "properties": {
+          "days_to_expire": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "group_identifier": {
+            "type": "string"
+          }
+        }
+      },
+      "LogoutRequest": {
+        "type": "object",
+        "required": [
+          "refresh_token"
+        ],
+        "properties": {
+          "refresh_token": {
+            "type": "string"
+          }
+        }
+      },
+      "UserInfoResponse": {
+        "type": "object",
+        "required": [
+          "email_id",
+          "first_name",
+          "is_admin",
+          "last_name",
+          "pk"
+        ],
+        "properties": {
+          "first_name": {
+            "type": "string"
+          },
+          "last_name": {
+            "type": "string"
+          },
+          "middle_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "pk": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_admin": {
+            "type": "boolean"
+          },
+          "email_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSessionTokenResponse": {
+        "type": "object",
+        "required": [
+          "session_token"
+        ],
+        "properties": {
+          "session_token": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSessionTokenRequest": {
+        "type": "object",
+        "required": [
+          "api_token"
+        ],
+        "properties": {
+          "api_token": {
+            "type": "string"
+          }
+        }
+      },
+      "GroupApiTokenResponse": {
+        "description": "Struct to represent the API token response",
+        "type": "object",
+        "required": [
+          "created_at",
+          "expiry_date",
+          "is_active",
+          "name",
+          "pk"
+        ],
+        "properties": {
+          "expiry_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pk": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AcceptInviteRequest": {
+        "type": "object",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "AccessibleApp": {
+        "type": "object",
+        "required": [
+          "allow_registration",
+          "has_web_interface",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "logo_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "allow_registration": {
+            "type": "boolean"
+          },
+          "tnc_link": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_dev": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_stage": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_prod": {
+            "type": "string",
+            "nullable": true
+          },
+          "redirection_path": {
+            "type": "string",
+            "nullable": true
+          },
+          "has_web_interface": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CreateOrUpdateAppRequest": {
+        "type": "object",
+        "required": [
+          "client_id"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "logo_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "disabled": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "app_url_dev": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_stage": {
+            "type": "string",
+            "nullable": true
+          },
+          "app_url_prod": {
+            "type": "string",
+            "nullable": true
+          },
+          "group_id": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "tnc_link": {
+            "type": "string",
+            "nullable": true
+          },
+          "allow_registration": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "auth_redirection_path": {
+            "type": "string",
+            "nullable": true
+          },
+          "web_interface": {
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "IsMemberResponse": {
+        "type": "object",
+        "required": [
+          "is_member",
+          "is_owner"
+        ],
+        "properties": {
+          "is_member": {
+            "type": "boolean"
+          },
+          "is_owner": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DockerTokenResponse": {
+        "type": "object",
+        "required": [
+          "expires_in",
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0.0
+          }
+        }
+      },
+      "SshCertResponse": {
+        "type": "object",
+        "required": [
+          "certificate",
+          "principal",
+          "private_key_pem",
+          "public_key",
+          "valid_for"
+        ],
+        "properties": {
+          "private_key_pem": {
+            "description": "PEM-encoded ed25519 private key (write to ~/.ssh/id_ed25519)",
+            "type": "string"
+          },
+          "public_key": {
+            "description": "OpenSSH public key line (write to ~/.ssh/id_ed25519.pub)",
+            "type": "string"
+          },
+          "certificate": {
+            "description": "OpenSSH certificate line (write to ~/.ssh/id_ed25519-cert.pub)",
+            "type": "string"
+          },
+          "valid_for": {
+            "description": "Human-readable validity window",
+            "type": "string"
+          },
+          "principal": {
+            "description": "Principal embedded in the cert",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "description": "Requires a Bearer token to access",
+        "type": "apiKey",
+        "name": "Authorization",
+        "in": "header"
+      },
+      "BearerAPIAuth": {
+        "description": "Requires a Bearer token to access",
+        "type": "apiKey",
+        "name": "X-API-Authorization",
+        "in": "header"
+      },
+      "BasicAuth": {
+        "description": "Docker registry Basic auth. Use '__token__' as username and a valid Claims, ISCClaims or APIClaims JWT as the password.",
+        "type": "http",
+        "scheme": "basic"
+      }
+    }
+  }
+}

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-
+pub mod shared;
 // ── ANSI colours (only when stdout is a tty) ──────────────────────────────────
 
 const GREEN:  &str = "\x1b[32m";
