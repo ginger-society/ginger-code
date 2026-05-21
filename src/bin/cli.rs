@@ -1,8 +1,19 @@
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 pub mod shared;
+
+use ginger_shared_rs::utils::get_token_from_file_storage;
+use IAMService::apis::configuration::Configuration as IAMConfiguration;
+use IAMService::apis::default_api::identity_validate_api_token;
+use IAMService::get_configuration as get_iam_configuration;
+use MetadataService::apis::configuration::Configuration as MetadataConfiguration;
+use MetadataService::get_configuration as get_metadata_configuration;
+
+use crate::shared::ui::fetch_metadata_and_process;
+
+
 // ── ANSI colours (only when stdout is a tty) ──────────────────────────────────
 
 const GREEN:  &str = "\x1b[32m";
@@ -12,7 +23,6 @@ const BOLD:   &str = "\x1b[1m";
 const RESET:  &str = "\x1b[0m";
 
 fn is_tty() -> bool {
-    // SAFETY: trivial libc call
     unsafe { libc::isatty(1) == 1 }
 }
 
@@ -47,13 +57,10 @@ enum Cmd {
 
     /// Register a service and start forwarding immediately
     Register {
-        /// Kubernetes service name (must match `kubectl get svc`)
         #[arg(long)]
         service_name: String,
-        /// Port exposed by the Kubernetes service
         #[arg(long)]
         service_port: u16,
-        /// Local port kubectl will bind
         #[arg(long)]
         forwarding_port: u16,
     },
@@ -63,10 +70,12 @@ enum Cmd {
 
     /// Remove a service and tear down its forward
     Remove {
-        /// Kubernetes service name to remove
         #[arg(long)]
         service_name: String,
     },
+
+    /// Fetch metadata and list available services
+    Config,
 }
 
 // ── Socket I/O ────────────────────────────────────────────────────────────────
@@ -104,7 +113,6 @@ fn print_services(val: &serde_json::Value) {
         .map(|s| s["service_name"].as_str().unwrap_or("").len())
         .max().unwrap_or(12).max(12);
 
-    // Header
     println!("{}{:<name_w$}  {:>9}  {:>8}  {:>8}  {:<13}  {}{}",
         BOLD,
         "SERVICE", "SVC PORT", "FWD PORT", "RESTARTS", "STATUS", "PID",
@@ -121,8 +129,6 @@ fn print_services(val: &serde_json::Value) {
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        // ForwardStatus is a serde internally-tagged enum: {"status":"connected"}
-        // {"status":"offline"} or {"status":"retrying","attempt":N}
         let fst = &s["forward_status"];
         let tag = fst["status"].as_str().unwrap_or("retrying");
         let (icon, label) = match tag {
@@ -134,11 +140,36 @@ fn print_services(val: &serde_json::Value) {
             }
         };
 
-        // icon is 1 visible char + ANSI codes; pad label to fixed visible width
         println!("{:<name_w$}  {:>9}  {:>8}  {:>8}  {} {:<12}  {}",
             name, sport, fport, restarts,
             icon, label, pid_str,
             name_w = name_w);
+    }
+}
+
+// ── Session-guarded async commands ───────────────────────────────────────────
+
+#[tokio::main]
+async fn check_session_guard(
+    cmd: &Cmd,
+    iam_config: &IAMConfiguration,
+    metadata_config: &MetadataConfiguration,
+) {
+    match identity_validate_api_token(iam_config).await {
+        Ok(_) => {
+            let config_path = Path::new("services.toml");
+            match cmd {
+                Cmd::Config => {
+                    fetch_metadata_and_process(config_path, metadata_config).await;
+                }
+                // unreachable — socket commands are handled before this point
+                _ => unreachable!(),
+            }
+        }
+        Err(error) => {
+            eprintln!("Token validation failed: {:?}", error);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -147,11 +178,19 @@ fn print_services(val: &serde_json::Value) {
 fn main() {
     let cli = Cli::parse();
 
+    // Commands that need IAM + async
+    if matches!(cli.command, Cmd::Config) {
+        let token = get_token_from_file_storage();
+        let iam_config = get_iam_configuration(Some(token.clone()));
+        let metadata_config = get_metadata_configuration(Some(token.clone()));
+        check_session_guard(&cli.command, &iam_config, &metadata_config);
+        return;
+    }
+
+    // Remaining commands talk to the daemon over the Unix socket (sync)
     let val = match cli.command {
         Cmd::Ping => send(r#"{"cmd":"ping"}"#),
-
         Cmd::List => send(r#"{"cmd":"list"}"#),
-
         Cmd::Register { service_name, service_port, forwarding_port } => {
             send(&serde_json::json!({
                 "cmd":             "register",
@@ -160,13 +199,13 @@ fn main() {
                 "forwarding_port": forwarding_port,
             }).to_string())
         }
-
         Cmd::Remove { service_name } => {
             send(&serde_json::json!({
                 "cmd":          "remove",
                 "service_name": service_name,
             }).to_string())
         }
+        Cmd::Config => unreachable!(), // handled above
     };
 
     match val["status"].as_str() {
