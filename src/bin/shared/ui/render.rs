@@ -10,9 +10,10 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
-use crate::shared::ui::{popup::render_popup, types::{Focus, K8sService, Popup}};
-
-
+use crate::shared::ui::{
+    popup::render_popup,
+    types::{Focus, K8sService, Popup},
+};
 
 /* ================================================================
    STATUS COLOUR / ICON
@@ -83,6 +84,9 @@ pub fn help_text(
                 parts.push("s shell");
                 if has_lang {
                     parts.push(if ejected { "e uneject" } else { "e eject" });
+                }
+                if ejected {
+                    parts.push("c VS Code / Codium");
                 }
             }
             parts.push("q quit");
@@ -247,6 +251,9 @@ pub fn draw(
         if has_deployment && has_lang {
             hints.push(if svc.ejected { "[e] uneject" } else { "[e] eject" });
         }
+        if has_deployment && svc.ejected {
+            hints.push("[c] VS Code / Codium");
+        }
         if !hints.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("  {}", hints.join("   ")),
@@ -272,70 +279,115 @@ pub fn draw(
         right_chunks[0],
     );
 
-    /* ── Logs ─────────────────────────────────────────────────────────── */
-    let log_text = if let Some(svc) = selected {
-        logs.get(&svc.meta_name)
-            .map(|l| l.join("\n"))
-            .unwrap_or_else(|| "Fetching logs...".to_string())
+    /* ── Logs / Dev-mode panel ────────────────────────────────────────── */
+    let is_ejected = selected.map(|s| s.ejected).unwrap_or(false);
+
+    if is_ejected {
+        // The container runs `sleep infinity` — no application logs to show.
+        let dev_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "⚡ Service is in dev mode (ejected)",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "The container is running  sleep infinity  — there are no application logs.",
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Press  c  to open the workspace in VS Code / Codium.",
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+        ];
+
+        f.render_widget(
+            Paragraph::new(dev_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Dev Mode ")
+                        .border_style(Style::default().fg(Color::Magenta)),
+                )
+                .wrap(Wrap { trim: false }),
+            right_chunks[1],
+        );
     } else {
-        "No service selected".to_string()
-    };
+        let log_text = if let Some(svc) = selected {
+            logs.get(&svc.meta_name)
+                .map(|l| l.join("\n"))
+                .unwrap_or_else(|| "Fetching logs...".to_string())
+        } else {
+            "No service selected".to_string()
+        };
 
-    let num_lines  = log_text.lines().count();
-    let height     = right_chunks[1].height.saturating_sub(2) as usize;
-    let max_scroll = num_lines.saturating_sub(height);
+        let num_lines  = log_text.lines().count();
+        let height     = right_chunks[1].height.saturating_sub(2) as usize;
+        let max_scroll = num_lines.saturating_sub(height);
 
-    // Clamp scroll offset for rendering (actual mutation happens in the event loop)
-    let effective_offset = if auto_scroll {
-        max_scroll
-    } else {
-        scroll_offset.min(max_scroll)
-    };
+        let effective_offset = if auto_scroll {
+            max_scroll
+        } else {
+            scroll_offset.min(max_scroll)
+        };
 
-    let inner_log_area = Rect {
-        x:      right_chunks[1].x,
-        y:      right_chunks[1].y,
-        width:  right_chunks[1].width.saturating_sub(1),
-        height: right_chunks[1].height,
-    };
+        let inner_log_area = Rect {
+            x:      right_chunks[1].x,
+            y:      right_chunks[1].y,
+            width:  right_chunks[1].width.saturating_sub(1),
+            height: right_chunks[1].height,
+        };
 
-    f.render_widget(
-        Paragraph::new(log_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if auto_scroll {
-                        " Logs [FOLLOW] "
-                    } else {
-                        " Logs [PAUSED] "
-                    })
-                    .border_style(if *focus == Focus::Logs {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default()
-                    }),
-            )
-            .wrap(Wrap { trim: false })
-            .scroll((effective_offset as u16, 0)),
-        inner_log_area,
-    );
+        f.render_widget(
+            Paragraph::new(log_text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(if auto_scroll {
+                            " Logs [FOLLOW] "
+                        } else {
+                            " Logs [PAUSED] "
+                        })
+                        .border_style(if *focus == Focus::Logs {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        }),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((effective_offset as u16, 0)),
+            inner_log_area,
+        );
 
-    let mut scrollbar_state =
-        ScrollbarState::new(max_scroll.max(1)).position(effective_offset);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"))
-            .track_symbol(Some("│"))
-            .thumb_symbol("█"),
-        Rect {
-            x:      right_chunks[1].x + right_chunks[1].width.saturating_sub(1),
-            y:      right_chunks[1].y + 1,
-            width:  1,
-            height: right_chunks[1].height.saturating_sub(2),
-        },
-        &mut scrollbar_state,
-    );
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll.max(1)).position(effective_offset);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█"),
+            Rect {
+                x:      right_chunks[1].x + right_chunks[1].width.saturating_sub(1),
+                y:      right_chunks[1].y + 1,
+                width:  1,
+                height: right_chunks[1].height.saturating_sub(2),
+            },
+            &mut scrollbar_state,
+        );
+    }
 
     /* ── Help bar ─────────────────────────────────────────────────────── */
     f.render_widget(

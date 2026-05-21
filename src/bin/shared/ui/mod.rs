@@ -388,7 +388,13 @@ async fn run_tui(
                             });
                         }
 
-                        KeyCode::Esc   => break,
+                        KeyCode::Esc => {
+                            popup = Some(Popup {
+                                service_name: String::new(),
+                                action:   PopupAction::Quit,
+                                selected: 1, // default to "No" for safety
+                            });
+                        }
                         KeyCode::Left  => focus = Focus::Services,
                         KeyCode::Right => focus = Focus::Logs,
 
