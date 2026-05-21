@@ -416,6 +416,54 @@ async fn run_tui(
                             }
                         }
 
+                        /* ── Open VS Code remote ────────────────────────────────────── */
+                        KeyCode::Char('c') => {
+                            if has_deployment && is_ejected_now {
+                                if let Some(dep_name) = selected
+                                    .as_ref()
+                                    .and_then(|s| s.deployment_name.as_ref())
+                                {
+                                    let host_alias  = format!("{}-local", dep_name);
+                                    let remote_uri  = format!("vscode-remote://ssh-remote+{}/workspace", host_alias);
+
+                                    disable_raw_mode()?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        LeaveAlternateScreen,
+                                        DisableMouseCapture,
+                                        Clear(ClearType::All),
+                                        MoveTo(0, 0)
+                                    )?;
+                                    terminal.show_cursor()?;
+                                    io::stdout().flush()?;
+
+                                    println!("Opening VS Code: {}", remote_uri);
+                                    let result = tokio::process::Command::new("code")
+                                        .arg("--folder-uri")
+                                        .arg(&remote_uri)
+                                        .status()
+                                        .await;
+
+                                    match result {
+                                        Ok(s) if s.success() => println!("✓ VS Code launched"),
+                                        Ok(s)  => eprintln!("VS Code exited with status: {}", s),
+                                        Err(e) => eprintln!("Failed to launch VS Code (is `code` in PATH?): {e}"),
+                                    }
+
+                                    sleep(Duration::from_secs(1)).await;
+
+                                    enable_raw_mode()?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        EnterAlternateScreen,
+                                        EnableMouseCapture
+                                    )?;
+                                    terminal.hide_cursor()?;
+                                    terminal.clear()?;
+                                }
+                            }
+                        }
+
                         KeyCode::Up | KeyCode::Char('k') => {
                             if focus == Focus::Services {
                                 let mut idx = selected_idx.lock().unwrap();

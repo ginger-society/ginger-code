@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt as _;
 
@@ -23,10 +23,11 @@ fn send_to_daemon(payload: &str) -> Result<serde_json::Value, Box<dyn std::error
     Ok(serde_json::from_str(&resp)?)
 }
 
+// ── Port discovery ────────────────────────────────────────────────────────────
+
 /// Find an available port in the range 2200..=2299 that is not already
 /// registered with the daemon and is not bound on the local machine.
 fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
-    // Ask the daemon which ports are already in use
     let used_ports: std::collections::HashSet<u16> =
         match send_to_daemon(r#"{"cmd":"list"}"#) {
             Ok(val) => val["deployments"]
@@ -35,7 +36,6 @@ fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
                 .iter()
                 .filter_map(|d| d["forwarding_port"].as_u64().map(|p| p as u16))
                 .collect(),
-            // Daemon not running — fall back to OS-only check
             Err(_) => std::collections::HashSet::new(),
         };
 
@@ -43,13 +43,117 @@ fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
         if used_ports.contains(&port) {
             continue;
         }
-        // Try binding; if it succeeds the port is free on the OS side
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Ok(port);
         }
     }
 
     Err("No free port available in the 2200–2299 range".into())
+}
+
+// ── ~/.ssh/config helpers ─────────────────────────────────────────────────────
+
+const CONFIG_BEGIN_MARKER: &str = "# BEGIN ginger-eject:";
+const CONFIG_END_MARKER:   &str = "# END ginger-eject:";
+
+/// Append a Host block for `deployment_name` to ~/.ssh/config.
+/// The block is wrapped in marker comments so we can remove it cleanly later.
+fn add_ssh_config(
+    deployment_name: &str,
+    forwarding_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home     = dirs::home_dir().ok_or("Could not locate home directory")?;
+    let ssh_dir  = home.join(".ssh");
+    let cfg_path = ssh_dir.join("config");
+
+    // Ensure ~/.ssh/config exists
+    if !ssh_dir.exists() {
+        fs::create_dir_all(&ssh_dir)?;
+    }
+    if !cfg_path.exists() {
+        fs::File::create(&cfg_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let identity_file = home.join(".ssh").join("id_ed25519");
+    let cert_file     = home.join(".ssh").join("id_ed25519-cert.pub");
+    let host_alias    = format!("{}-local", deployment_name);
+
+    let block = format!(
+        "\n{begin} {name}\nHost {alias}\n    HostName localhost\n    Port {port}\n    User dev\n    IdentityFile {identity}\n    CertificateFile {cert}\n    IdentitiesOnly yes\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n{end} {name}\n",
+        begin    = CONFIG_BEGIN_MARKER,
+        end      = CONFIG_END_MARKER,
+        name     = deployment_name,
+        alias    = host_alias,
+        port     = forwarding_port,
+        identity = identity_file.display(),
+        cert     = cert_file.display(),
+    );
+
+    // Check it isn't already there (idempotent)
+    let existing = fs::read_to_string(&cfg_path).unwrap_or_default();
+    let marker   = format!("{} {}", CONFIG_BEGIN_MARKER, deployment_name);
+    if existing.contains(&marker) {
+        println!("  ~/.ssh/config already contains block for '{}', skipping", deployment_name);
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new().append(true).open(&cfg_path)?;
+    file.write_all(block.as_bytes())?;
+
+    println!(
+        "✓ Added SSH config block — connect with: ssh {alias}",
+        alias = host_alias
+    );
+    Ok(())
+}
+
+/// Remove the Host block for `deployment_name` from ~/.ssh/config.
+fn remove_ssh_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = dirs::home_dir()
+        .ok_or("Could not locate home directory")?
+        .join(".ssh")
+        .join("config");
+
+    if !cfg_path.exists() {
+        return Ok(());
+    }
+
+    let content  = fs::read_to_string(&cfg_path)?;
+    let begin    = format!("{} {}", CONFIG_BEGIN_MARKER, deployment_name);
+    let end      = format!("{} {}", CONFIG_END_MARKER,   deployment_name);
+
+    if !content.contains(&begin) {
+        println!("  No SSH config block found for '{}', nothing to remove", deployment_name);
+        return Ok(());
+    }
+
+    // Strip everything between (and including) the marker lines
+    let mut out      = String::with_capacity(content.len());
+    let mut skipping = false;
+
+    for line in content.lines() {
+        if line.trim_start().starts_with(&begin) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.trim_start().starts_with(&end) {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    fs::write(&cfg_path, out)?;
+    println!("✓ Removed SSH config block for '{}'", deployment_name);
+    Ok(())
 }
 
 // ── Builder image map ─────────────────────────────────────────────────────────
@@ -229,11 +333,12 @@ spec:
             ).into());
         }
 
-        println!("✓ SSH principal '{}' written — connect as: ssh dev@<host>", session_user);
+        println!("✓ SSH principal '{}' written", session_user);
 
-        // ── Pick a free local port and register with the daemon ───────────────
+        // ── Pick a free local port ────────────────────────────────────────────
         let forwarding_port = find_free_22xx_port()?;
 
+        // ── Register with daemon ──────────────────────────────────────────────
         let register_payload = serde_json::json!({
             "cmd":             "register",
             "deployment_name": deployment_name,
@@ -244,7 +349,7 @@ spec:
         match send_to_daemon(&register_payload.to_string()) {
             Ok(resp) if resp["status"] == "ok" => {
                 println!(
-                    "✓ Registered '{}' with daemon — SSH available at localhost:{}",
+                    "✓ Registered '{}' with daemon — port-forward on localhost:{}",
                     deployment_name, forwarding_port
                 );
             }
@@ -260,6 +365,16 @@ spec:
                 );
             }
         }
+
+        // ── Write ~/.ssh/config Host block ────────────────────────────────────
+        if let Err(e) = add_ssh_config(deployment_name, forwarding_port) {
+            eprintln!("Warning: could not update ~/.ssh/config: {e}");
+        }
+
+        println!(
+            "\nConnect with:  ssh {}-local",
+            deployment_name
+        );
     }
 
     Ok(())
@@ -343,6 +458,11 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
                 deployment_name
             );
         }
+    }
+
+    // ── Remove ~/.ssh/config Host block ───────────────────────────────────────
+    if let Err(e) = remove_ssh_config(deployment_name) {
+        eprintln!("Warning: could not clean up ~/.ssh/config: {e}");
     }
 
     Ok(())
