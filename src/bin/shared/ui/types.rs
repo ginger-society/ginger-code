@@ -26,6 +26,8 @@ pub enum PopupAction {
     Eject,
     Uneject,
     Quit,
+    /// Shown when the user presses 's' on an ejected service
+    ShellBlocked,
 }
 
 pub struct Popup {

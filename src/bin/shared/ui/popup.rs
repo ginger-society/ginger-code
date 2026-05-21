@@ -7,7 +7,6 @@ use ratatui::{
 
 use crate::shared::ui::types::{Popup, PopupAction};
 
-
 pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let popup_width = r.width * percent_x / 100;
     let x = r.x + (r.width.saturating_sub(popup_width)) / 2;
@@ -21,13 +20,68 @@ pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
 }
 
 pub fn render_popup(f: &mut ratatui::Frame, popup: &Popup, area: Rect) {
+    // ShellBlocked is an informational notice, not a confirm dialog
+    if popup.action == PopupAction::ShellBlocked {
+        let popup_area = centered_rect(60, 8, area);
+        f.render_widget(RatatuiClear, popup_area);
+
+        let body = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "⚠  Shell unavailable while service is ejected.",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "The pod is running  sleep infinity  — there is no app process to shell into.",
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Press  c  to open the workspace in VS Code / Codium,",
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "then use its integrated terminal instead.",
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+        ];
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(
+                " Shell Not Available ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+        f.render_widget(Paragraph::new(body).block(block), popup_area);
+        return;
+    }
+
+    // ── Confirm dialog (Eject / Uneject / Quit) ──────────────────────────────
     let popup_area = centered_rect(55, 7, area);
     f.render_widget(RatatuiClear, popup_area);
 
     let (action_label, action_color) = match popup.action {
-        PopupAction::Eject => ("EJECT", Color::Magenta),
-        PopupAction::Uneject => ("UNEJECT", Color::Cyan),
-        PopupAction::Quit => ("QUIT", Color::Red),
+        PopupAction::Eject       => ("EJECT",   Color::Magenta),
+        PopupAction::Uneject     => ("UNEJECT", Color::Cyan),
+        PopupAction::Quit        => ("QUIT",    Color::Red),
+        PopupAction::ShellBlocked => unreachable!(),
     };
 
     let yes_style = if popup.selected == 0 {

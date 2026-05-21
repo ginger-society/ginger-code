@@ -305,6 +305,11 @@ async fn run_tui(
                 Event::Key(key) => {
                     /* ── Popup active ───────────────────────────────────── */
                     if let Some(ref mut p) = popup {
+                        // ShellBlocked is just a notice — any key dismisses it
+                        if p.action == PopupAction::ShellBlocked {
+                            popup = None;
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Left  | KeyCode::Char('h') => p.selected = 0,
                             KeyCode::Right | KeyCode::Char('l') => p.selected = 1,
@@ -316,6 +321,7 @@ async fn run_tui(
                                             popup = None;
                                             break;
                                         }
+                                        PopupAction::ShellBlocked => unreachable!(),
                                         PopupAction::Eject | PopupAction::Uneject => {
                                             let (dep, lang, ejected) = {
                                                 let svcs = services.lock().unwrap();
@@ -430,17 +436,25 @@ async fn run_tui(
 
                         /* ── Shell into pod ─────────────────────────────── */
                         KeyCode::Char('s') => {
-                            let dep = {
+                            let (dep, ejected) = {
                                 let svcs = services.lock().unwrap();
                                 let idx  = *selected_idx.lock().unwrap();
                                 svcs.get(idx)
                                     .filter(|s| {
                                         s.status != "Not deployed" && s.status != "Unknown"
                                     })
-                                    .and_then(|s| s.deployment_name.clone())
+                                    .map(|s| (s.deployment_name.clone(), s.ejected))
+                                    .unwrap_or((None, false))
                             };
 
-                            if let Some(dep_name) = dep {
+                            if dep.is_some() && ejected {
+                                // Shell makes no sense against a sleep-infinity container
+                                popup = Some(Popup {
+                                    service_name: String::new(),
+                                    action:   PopupAction::ShellBlocked,
+                                    selected: 0,
+                                });
+                            } else if let Some(dep_name) = dep {
                                 disable_raw_mode()?;
                                 execute!(
                                     terminal.backend_mut(),
