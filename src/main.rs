@@ -12,16 +12,16 @@ use std::time::{Duration, Instant};
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct ServiceEntry {
-    pub service_name:    String,
-    pub service_port:    u16,
+pub struct DeploymentEntry {
+    pub deployment_name: String,
+    pub deployment_port: u16,
     pub forwarding_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
-    pub services: Vec<ServiceEntry>,
+    pub deployments: Vec<DeploymentEntry>,
 }
 
 impl Config {
@@ -36,10 +36,6 @@ impl Config {
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────
-//
-// The single source of truth is whether the kubectl child process is alive.
-// TCP probing the forwarding port is wrong — kubectl port-forward only completes
-// a connection when there is actual traffic, so a bare TCP connect always fails.
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -54,11 +50,11 @@ pub enum ForwardStatus {
 
 #[derive(Debug)]
 pub struct ForwardState {
-    pub child:      Option<Child>,
-    pub status:     ForwardStatus,
-    pub restarts:   u32,
+    pub child:    Option<Child>,
+    pub status:   ForwardStatus,
+    pub restarts: u32,
     /// Don't attempt another spawn until this instant
-    pub retry_at:   Option<Instant>,
+    pub retry_at: Option<Instant>,
 }
 
 impl ForwardState {
@@ -70,9 +66,6 @@ impl ForwardState {
 type StateMap = Arc<Mutex<HashMap<String, ForwardState>>>;
 
 // ── Network reachability ──────────────────────────────────────────────────────
-//
-// UDP "connect" to a well-known address — no packet is sent, but the OS must
-// find a route. If it can't, we have no default gateway → offline.
 
 fn has_network() -> bool {
     std::net::UdpSocket::bind("0.0.0.0:0")
@@ -95,9 +88,9 @@ fn backoff(attempt: u32) -> Duration {
 
 // ── kubectl helpers ───────────────────────────────────────────────────────────
 
-fn spawn_forward(entry: &ServiceEntry) -> Option<Child> {
-    let target = format!("svc/{}", entry.service_name);
-    let ports  = format!("{}:{}", entry.forwarding_port, entry.service_port);
+fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
+    let target = format!("deployment/{}", entry.deployment_name);
+    let ports  = format!("{}:{}", entry.forwarding_port, entry.deployment_port);
     match Command::new("kubectl")
         .args(["port-forward", &target, &ports])
         .stdout(std::process::Stdio::null())
@@ -106,11 +99,11 @@ fn spawn_forward(entry: &ServiceEntry) -> Option<Child> {
     {
         Ok(child) => {
             println!("[ginger-code] started  {} → localhost:{} (pid {})",
-                entry.service_name, entry.forwarding_port, child.id());
+                entry.deployment_name, entry.forwarding_port, child.id());
             Some(child)
         }
         Err(e) => {
-            eprintln!("[ginger-code] kubectl spawn failed for '{}': {e}", entry.service_name);
+            eprintln!("[ginger-code] kubectl spawn failed for '{}': {e}", entry.deployment_name);
             None
         }
     }
@@ -127,9 +120,6 @@ extern "C" { fn kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int; }
 fn libc_kill(pid: i32, sig: i32) { unsafe { kill(pid, sig); } }
 
 // ── Network monitor thread ────────────────────────────────────────────────────
-//
-// Polls every second. On offline→online transition: clears all backoff timers
-// so the watcher fires immediately — same snap-back as Chrome's offline page.
 
 fn run_net_monitor(state_map: StateMap) {
     let mut was_online = has_network();
@@ -138,17 +128,16 @@ fn run_net_monitor(state_map: StateMap) {
         let online = has_network();
 
         if !was_online && online {
-            println!("[ginger-code] network restored — triggering immediate retry for all services");
+            println!("[ginger-code] network restored — triggering immediate retry for all deployments");
             let mut map = state_map.lock().unwrap();
             for fw in map.values_mut() {
-                // Reset backoff so watcher fires on its very next tick
                 fw.retry_at = None;
                 if fw.status == ForwardStatus::Offline {
                     fw.status = ForwardStatus::Retrying { attempt: 0 };
                 }
             }
         } else if was_online && !online {
-            println!("[ginger-code] network lost — marking all services offline");
+            println!("[ginger-code] network lost — marking all deployments offline");
             let mut map = state_map.lock().unwrap();
             for fw in map.values_mut() {
                 if let Some(ref mut c) = fw.child { kill_child(c); }
@@ -163,9 +152,6 @@ fn run_net_monitor(state_map: StateMap) {
 }
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
-//
-// Ticks every second. Health signal = kubectl child process still alive.
-// No TCP probing — kubectl holds the port open as long as the tunnel is live.
 
 const TICK: Duration = Duration::from_secs(1);
 
@@ -173,13 +159,13 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
     loop {
         std::thread::sleep(TICK);
 
-        let entries: Vec<ServiceEntry> = Config::load(&cfg_path).services;
+        let entries: Vec<DeploymentEntry> = Config::load(&cfg_path).deployments;
         let active: std::collections::HashSet<String> =
-            entries.iter().map(|e| e.service_name.clone()).collect();
+            entries.iter().map(|e| e.deployment_name.clone()).collect();
 
         let mut map = state_map.lock().unwrap();
 
-        // Tear down state for removed services
+        // Tear down state for removed deployments
         map.retain(|name, fw| {
             if active.contains(name) { return true; }
             eprintln!("[ginger-code] removed  {} — killing forward", name);
@@ -188,26 +174,21 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
         });
 
         for entry in &entries {
-            let svc = &entry.service_name;
-            map.entry(svc.clone()).or_insert_with(ForwardState::new_pending);
-            let fw = map.get_mut(svc).unwrap();
+            let dep = &entry.deployment_name;
+            map.entry(dep.clone()).or_insert_with(ForwardState::new_pending);
+            let fw = map.get_mut(dep).unwrap();
 
-            // Don't touch services waiting on network
             if fw.status == ForwardStatus::Offline { continue; }
 
-            // Don't retry before the backoff window has elapsed
             if fw.retry_at.map_or(false, |t| Instant::now() < t) { continue; }
 
-            // ── Health check: is the child still alive? ───────────────────
             let child_alive = fw.child.as_mut()
                 .map_or(false, |c| c.try_wait().ok().flatten().is_none());
 
             if child_alive {
-                // Process is up → connected
                 fw.status   = ForwardStatus::Connected;
                 fw.retry_at = None;
             } else {
-                // Process died or never started → retry with backoff
                 if let Some(ref mut c) = fw.child { kill_child(c); }
                 fw.child = None;
 
@@ -218,7 +199,7 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
 
                 let delay = backoff(attempt);
                 eprintln!("[ginger-code] retrying {} (attempt {}, wait {:?})",
-                    svc, attempt, delay);
+                    dep, attempt, delay);
 
                 fw.status   = ForwardStatus::Retrying { attempt: attempt + 1 };
                 fw.retry_at = Some(Instant::now() + delay);
@@ -235,15 +216,15 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Request {
     Ping,
-    Register { service_name: String, service_port: u16, forwarding_port: u16 },
+    Register { deployment_name: String, deployment_port: u16, forwarding_port: u16 },
     List,
-    Remove   { service_name: String },
+    Remove   { deployment_name: String },
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct ServiceStatus {
-    pub service_name:    String,
-    pub service_port:    u16,
+pub struct DeploymentStatus {
+    pub deployment_name: String,
+    pub deployment_port: u16,
     pub forwarding_port: u16,
     pub forward_status:  ForwardStatus,
     pub restarts:        u32,
@@ -253,9 +234,9 @@ pub struct ServiceStatus {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
-    Ok       { message: String },
-    Services { services: Vec<ServiceStatus> },
-    Error    { message: String },
+    Ok          { message: String },
+    Deployments { deployments: Vec<DeploymentStatus> },
+    Error       { message: String },
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
@@ -264,32 +245,32 @@ fn dispatch(req: Request, path: &PathBuf, state_map: &StateMap) -> Response {
     match req {
         Request::Ping => Response::Ok { message: "pong".to_string() },
 
-        Request::Register { service_name, service_port, forwarding_port } => {
+        Request::Register { deployment_name, deployment_port, forwarding_port } => {
             let mut cfg = Config::load(path);
-            let is_new = !cfg.services.iter().any(|s| s.service_name == service_name);
-            cfg.services.retain(|s| s.service_name != service_name);
-            cfg.services.push(ServiceEntry {
-                service_name: service_name.clone(), service_port, forwarding_port,
+            let is_new = !cfg.deployments.iter().any(|d| d.deployment_name == deployment_name);
+            cfg.deployments.retain(|d| d.deployment_name != deployment_name);
+            cfg.deployments.push(DeploymentEntry {
+                deployment_name: deployment_name.clone(), deployment_port, forwarding_port,
             });
             cfg.save(path);
             if is_new {
                 state_map.lock().unwrap()
-                    .insert(service_name.clone(), ForwardState::new_pending());
+                    .insert(deployment_name.clone(), ForwardState::new_pending());
             }
             Response::Ok {
-                message: format!("Registered '{}' — forward starting (:{} → svc:{})",
-                    service_name, forwarding_port, service_port),
+                message: format!("Registered '{}' — forward starting (:{} → deployment:{})",
+                    deployment_name, forwarding_port, deployment_port),
             }
         }
 
         Request::List => {
             let cfg = Config::load(path);
             let map = state_map.lock().unwrap();
-            let services = cfg.services.iter().map(|e| {
-                let fw = map.get(&e.service_name);
-                ServiceStatus {
-                    service_name:    e.service_name.clone(),
-                    service_port:    e.service_port,
+            let deployments = cfg.deployments.iter().map(|e| {
+                let fw = map.get(&e.deployment_name);
+                DeploymentStatus {
+                    deployment_name: e.deployment_name.clone(),
+                    deployment_port: e.deployment_port,
                     forwarding_port: e.forwarding_port,
                     forward_status:  fw.map_or(
                         ForwardStatus::Retrying { attempt: 0 },
@@ -299,21 +280,21 @@ fn dispatch(req: Request, path: &PathBuf, state_map: &StateMap) -> Response {
                     pid:      fw.and_then(|f| f.child.as_ref().map(|c| c.id())),
                 }
             }).collect();
-            Response::Services { services }
+            Response::Deployments { deployments }
         }
 
-        Request::Remove { service_name } => {
+        Request::Remove { deployment_name } => {
             let mut cfg = Config::load(path);
-            let before = cfg.services.len();
-            cfg.services.retain(|s| s.service_name != service_name);
-            if cfg.services.len() == before {
+            let before = cfg.deployments.len();
+            cfg.deployments.retain(|d| d.deployment_name != deployment_name);
+            if cfg.deployments.len() == before {
                 return Response::Error {
-                    message: format!("Service '{}' not found", service_name),
+                    message: format!("Deployment '{}' not found", deployment_name),
                 };
             }
             cfg.save(path);
             Response::Ok {
-                message: format!("Removed '{}' — forward will be torn down shortly", service_name),
+                message: format!("Removed '{}' — forward will be torn down shortly", deployment_name),
             }
         }
     }
@@ -375,15 +356,15 @@ fn main() {
 
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
 
-    // Re-seed services from config on daemon restart
+    // Re-seed deployments from config on daemon restart
     {
         let cfg = Config::load(&cfg_path);
         let mut map = state_map.lock().unwrap();
-        for svc in &cfg.services {
-            map.insert(svc.service_name.clone(), ForwardState::new_pending());
+        for dep in &cfg.deployments {
+            map.insert(dep.deployment_name.clone(), ForwardState::new_pending());
         }
-        if !cfg.services.is_empty() {
-            println!("[ginger-code] resuming {} service(s)", cfg.services.len());
+        if !cfg.deployments.is_empty() {
+            println!("[ginger-code] resuming {} deployment(s)", cfg.deployments.len());
         }
     }
 

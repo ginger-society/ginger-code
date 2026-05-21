@@ -56,26 +56,26 @@ enum Cmd {
     /// Check the daemon is alive
     Ping,
 
-    /// Register a service and start forwarding immediately
+    /// Register a deployment and start forwarding immediately
     Register {
         #[arg(long)]
-        service_name: String,
+        deployment_name: String,
         #[arg(long)]
-        service_port: u16,
+        deployment_port: u16,
         #[arg(long)]
         forwarding_port: u16,
     },
 
-    /// Show all registered services with live connection status
+    /// Show all registered deployments with live connection status
     List,
 
-    /// Remove a service and tear down its forward
+    /// Remove a deployment and tear down its forward
     Remove {
         #[arg(long)]
-        service_name: String,
+        deployment_name: String,
     },
 
-    /// Fetch metadata and list available services
+    /// Fetch metadata and list available deployments
     Config,
 }
 
@@ -102,35 +102,35 @@ fn send(payload: &str) -> serde_json::Value {
 
 // ── List rendering ────────────────────────────────────────────────────────────
 
-fn print_services(val: &serde_json::Value) {
+fn print_deployments(val: &serde_json::Value) {
     let c = Colour::new();
 
-    let svcs = match val["services"].as_array() {
+    let deps = match val["deployments"].as_array() {
         Some(a) if !a.is_empty() => a,
-        _ => { println!("(no services registered)"); return; }
+        _ => { println!("(no deployments registered)"); return; }
     };
 
-    let name_w = svcs.iter()
-        .map(|s| s["service_name"].as_str().unwrap_or("").len())
-        .max().unwrap_or(12).max(12);
+    let name_w = deps.iter()
+        .map(|d| d["deployment_name"].as_str().unwrap_or("").len())
+        .max().unwrap_or(16).max(16);
 
     println!("{}{:<name_w$}  {:>9}  {:>8}  {:>8}  {:<13}  {}{}",
         BOLD,
-        "SERVICE", "SVC PORT", "FWD PORT", "RESTARTS", "STATUS", "PID",
+        "DEPLOYMENT", "DEP PORT", "FWD PORT", "RESTARTS", "STATUS", "PID",
         RESET,
         name_w = name_w);
     println!("{}", "─".repeat(name_w + 9 + 8 + 8 + 13 + 20));
 
-    for s in svcs {
-        let name     = s["service_name"].as_str().unwrap_or("?");
-        let sport    = s["service_port"].as_u64().unwrap_or(0);
-        let fport    = s["forwarding_port"].as_u64().unwrap_or(0);
-        let restarts = s["restarts"].as_u64().unwrap_or(0);
-        let pid_str  = s["pid"].as_u64()
+    for d in deps {
+        let name     = d["deployment_name"].as_str().unwrap_or("?");
+        let dport    = d["deployment_port"].as_u64().unwrap_or(0);
+        let fport    = d["forwarding_port"].as_u64().unwrap_or(0);
+        let restarts = d["restarts"].as_u64().unwrap_or(0);
+        let pid_str  = d["pid"].as_u64()
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        let fst = &s["forward_status"];
+        let fst = &d["forward_status"];
         let tag = fst["status"].as_str().unwrap_or("retrying");
         let (icon, label) = match tag {
             "connected" => (c.paint(GREEN,  "●"), c.paint(GREEN,  "CONNECTED")),
@@ -142,7 +142,7 @@ fn print_services(val: &serde_json::Value) {
         };
 
         println!("{:<name_w$}  {:>9}  {:>8}  {:>8}  {} {:<12}  {}",
-            name, sport, fport, restarts,
+            name, dport, fport, restarts,
             icon, label, pid_str,
             name_w = name_w);
     }
@@ -161,9 +161,8 @@ async fn check_session_guard(
             let config_path = Path::new("services.toml");
             match cmd {
                 Cmd::Config => {
-                    fetch_metadata_and_process(config_path, metadata_config , &session_details.sub).await;
+                    fetch_metadata_and_process(config_path, metadata_config, &session_details.sub).await;
                 }
-                // unreachable — socket commands are handled before this point
                 _ => unreachable!(),
             }
         }
@@ -192,27 +191,27 @@ fn main() {
     let val = match cli.command {
         Cmd::Ping => send(r#"{"cmd":"ping"}"#),
         Cmd::List => send(r#"{"cmd":"list"}"#),
-        Cmd::Register { service_name, service_port, forwarding_port } => {
+        Cmd::Register { deployment_name, deployment_port, forwarding_port } => {
             send(&serde_json::json!({
-                "cmd":             "register",
-                "service_name":    service_name,
-                "service_port":    service_port,
-                "forwarding_port": forwarding_port,
+                "cmd":              "register",
+                "deployment_name":  deployment_name,
+                "deployment_port":  deployment_port,
+                "forwarding_port":  forwarding_port,
             }).to_string())
         }
-        Cmd::Remove { service_name } => {
+        Cmd::Remove { deployment_name } => {
             send(&serde_json::json!({
-                "cmd":          "remove",
-                "service_name": service_name,
+                "cmd":             "remove",
+                "deployment_name": deployment_name,
             }).to_string())
         }
-        Cmd::Config => unreachable!(), // handled above
+        Cmd::Config => unreachable!(),
     };
 
     match val["status"].as_str() {
-        Some("ok")       => println!("✓  {}", val["message"].as_str().unwrap_or("ok")),
-        Some("services") => print_services(&val),
-        Some("error")    => {
+        Some("ok")          => println!("✓  {}", val["message"].as_str().unwrap_or("ok")),
+        Some("deployments") => print_deployments(&val),
+        Some("error")       => {
             eprintln!("✗  {}", val["message"].as_str().unwrap_or("unknown error"));
             std::process::exit(1);
         }
