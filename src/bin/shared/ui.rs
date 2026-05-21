@@ -73,7 +73,7 @@ fn meta_to_deployment_name(meta_name: &str) -> String {
         .split('/')
         .last()
         .unwrap_or(meta_name)
-        .to_string()
+        .to_lowercase()
 }
 
 async fn get_k8s_deployments() -> HashMap<String, (String, String)> {
