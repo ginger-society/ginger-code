@@ -157,11 +157,11 @@ async fn check_session_guard(
     metadata_config: &MetadataConfiguration,
 ) {
     match identity_validate_api_token(iam_config).await {
-        Ok(_) => {
+        Ok(session_details) => {
             let config_path = Path::new("services.toml");
             match cmd {
                 Cmd::Config => {
-                    fetch_metadata_and_process(config_path, metadata_config).await;
+                    fetch_metadata_and_process(config_path, metadata_config , &session_details.sub).await;
                 }
                 // unreachable — socket commands are handled before this point
                 _ => unreachable!(),

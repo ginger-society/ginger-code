@@ -53,6 +53,7 @@ use self::{
 pub async fn fetch_metadata_and_process(
     config_path: &Path,
     metadata_config: &MetadataConfiguration,
+    session_user: &str,
 ) {
     let config = read_service_config_file(config_path).unwrap();
 
@@ -94,7 +95,7 @@ pub async fn fetch_metadata_and_process(
         })
         .collect();
 
-    if let Err(e) = run_tui(initial_services).await {
+    if let Err(e) = run_tui(initial_services, session_user).await {
         eprintln!("TUI error: {}", e);
         exit(1);
     }
@@ -106,6 +107,7 @@ pub async fn fetch_metadata_and_process(
 
 async fn run_tui(
     initial_services: Vec<K8sService>,
+    session_user: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -351,11 +353,7 @@ async fn run_tui(
                                                 let result = if ejected {
                                                     uneject(&dep_name).await
                                                 } else {
-                                                    eject(
-                                                        &dep_name,
-                                                        lang.as_deref().unwrap_or(""),
-                                                    )
-                                                    .await
+                                                    eject(&dep_name, lang.as_deref().unwrap_or("")).await
                                                 };
 
                                                 if let Err(e) = result {
