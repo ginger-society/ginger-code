@@ -1,3 +1,6 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -95,13 +98,19 @@ fn kill_existing_forward(forwarding_port: u16) {
 // ── kubectl helpers ───────────────────────────────────────────────────────────
 
 fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
+
+    let kubectl = find_kubectl().unwrap_or_else(|| {
+        eprintln!("[ginger-code] kubectl not found in PATH or known locations");
+        std::path::PathBuf::from("kubectl")
+    });
+
     let target = format!("deployment/{}", entry.deployment_name);
     let ports  = format!("{}:{}", entry.forwarding_port, entry.deployment_port);
 
     kill_existing_forward(entry.forwarding_port); 
     eprintln!("[ginger-code] spawning kubectl port-forward {} {}", target, ports);
 
-    match Command::new("kubectl")
+    match Command::new(&kubectl)
         .args(["port-forward", &target, &ports])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -368,7 +377,40 @@ fn cleanup_stale_forwards(cfg: &Config) {
     }
 }
 
+fn find_kubectl() -> Option<std::path::PathBuf> {
+    // Try common locations explicitly if which fails
+    let candidates = [
+        "/usr/local/bin/kubectl",
+        "/opt/homebrew/bin/kubectl",
+        "/usr/bin/kubectl",
+        "/usr/local/bin/kubectl",
+    ];
+    for path in candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
 fn main() {
+
+    #[cfg(target_os = "macos")]
+    {
+        let current = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!(
+            "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}",
+            current
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // Detach from the terminal — no visible window
+        libc::setsid();
+    }
+    
+
     // Suppress macOS IMK noise
     #[cfg(target_os = "macos")]
     unsafe {

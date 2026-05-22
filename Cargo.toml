@@ -35,3 +35,6 @@ winit = { version = "0.30", features = [] }
 
 [package.metadata]
 organization = "ginger-society"
+
+[package.metadata.bundle]
+osx_minimum_system_version = "11.0"
