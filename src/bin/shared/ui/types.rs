@@ -3,6 +3,8 @@
 pub struct K8sService {
     /// e.g. "@ginger-society/dev-portal"
     pub meta_name: String,
+    /// e.g. "ginger-society"
+    pub organization_id: String,
     /// k8s deployment name if matched, e.g. "dev-portal"
     pub deployment_name: Option<String>,
     /// "Running" / "Pending" / "Degraded" / "Not deployed" / "Unknown"

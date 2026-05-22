@@ -89,6 +89,7 @@ pub async fn fetch_metadata_and_process(
                 deployment_name: Some(deployment_name),
                 status: "Unknown".to_string(),
                 ready:  "-".to_string(),
+                organization_id: s.organization_id.clone(),
                 lang,
                 ejected: false,
             }
@@ -138,7 +139,7 @@ async fn run_tui(
                             }
                         }
                     }
-                } // lock dropped before await
+                }
 
                 let deps: Vec<(usize, String)> = {
                     let svcs = services.lock().unwrap();
@@ -189,7 +190,6 @@ async fn run_tui(
     let mut scroll_offset: usize = 0;
     let mut popup: Option<Popup> = None;
 
-    // Last-drawn areas — updated each frame for mouse hit-testing
     let mut services_list_area = ratatui::layout::Rect::default();
     let mut logs_area          = ratatui::layout::Rect::default();
 
@@ -206,13 +206,12 @@ async fn run_tui(
 
         // ── Draw ──────────────────────────────────────────────────────────────
         let logs_snap = logs.lock().unwrap().clone();
-        let drawn = terminal.draw(|f| {
-            // Scroll offset clamping before draw (mirrors original logic)
+        terminal.draw(|f| {
             let log_text = selected.as_ref().and_then(|s| logs_snap.get(&s.meta_name))
                 .map(|l| l.join("\n"))
                 .unwrap_or_default();
             let num_lines  = log_text.lines().count();
-            let height     = f.size().height.saturating_sub(10) as usize; // approx
+            let height     = f.size().height.saturating_sub(10) as usize;
             let max_scroll = num_lines.saturating_sub(height);
             if auto_scroll {
                 scroll_offset = max_scroll;
@@ -239,11 +238,8 @@ async fn run_tui(
             );
         })?;
 
-        // `terminal.draw` returns the buffer we don't need; capture areas separately.
-        // Re-draw areas are captured via a cell so the closure can write them out.
-        // Simpler approach: re-compute from the last frame size (same layout math).
         {
-            use ratatui::layout::{Constraint, Direction, Layout, Rect};
+            use ratatui::layout::{Constraint, Direction, Layout};
             let area = terminal.get_frame().size();
             let root = Layout::default()
                 .direction(Direction::Vertical)
@@ -290,8 +286,8 @@ async fn run_tui(
                         }
                         MouseEventKind::ScrollUp => {
                             if focus == Focus::Logs {
-                                auto_scroll    = false;
-                                scroll_offset  = scroll_offset.saturating_sub(3);
+                                auto_scroll   = false;
+                                scroll_offset = scroll_offset.saturating_sub(3);
                             }
                         }
                         MouseEventKind::ScrollDown => {
@@ -307,7 +303,6 @@ async fn run_tui(
                 Event::Key(key) => {
                     /* ── Popup active ───────────────────────────────────── */
                     if let Some(ref mut p) = popup {
-                        // ShellBlocked is just a notice — any key dismisses it
                         if p.action == PopupAction::ShellBlocked {
                             popup = None;
                             continue;
@@ -325,7 +320,8 @@ async fn run_tui(
                                         }
                                         PopupAction::ShellBlocked => unreachable!(),
                                         PopupAction::Eject | PopupAction::Uneject => {
-                                            let (dep, lang, ejected) = {
+                                            // ── grab dep, lang, ejected, meta_name ──
+                                            let (dep, lang, ejected, meta_name) = {
                                                 let svcs = services.lock().unwrap();
                                                 let idx  = *selected_idx.lock().unwrap();
                                                 svcs.get(idx)
@@ -333,8 +329,9 @@ async fn run_tui(
                                                         s.deployment_name.clone(),
                                                         s.lang.clone(),
                                                         s.ejected,
+                                                        s.meta_name.clone(),
                                                     ))
-                                                    .unwrap_or((None, None, false))
+                                                    .unwrap_or((None, None, false, String::new()))
                                             };
 
                                             if let Some(dep_name) = dep {
@@ -353,7 +350,11 @@ async fn run_tui(
                                                 let result = if ejected {
                                                     uneject(&dep_name).await
                                                 } else {
-                                                    eject(&dep_name, lang.as_deref().unwrap_or("")).await
+                                                    eject(
+                                                        &dep_name,
+                                                        lang.as_deref().unwrap_or(""),
+                                                        &meta_name,
+                                                    ).await
                                                 };
 
                                                 if let Err(e) = result {
@@ -384,21 +385,14 @@ async fn run_tui(
 
                     /* ── Normal keys ────────────────────────────────────── */
                     match key.code {
-                        KeyCode::Char('q') => {
+                        KeyCode::Char('q') | KeyCode::Esc => {
                             popup = Some(Popup {
                                 service_name: String::new(),
                                 action:   PopupAction::Quit,
-                                selected: 1, // default to "No" for safety
+                                selected: 1,
                             });
                         }
 
-                        KeyCode::Esc => {
-                            popup = Some(Popup {
-                                service_name: String::new(),
-                                action:   PopupAction::Quit,
-                                selected: 1, // default to "No" for safety
-                            });
-                        }
                         KeyCode::Left  => focus = Focus::Services,
                         KeyCode::Right => focus = Focus::Logs,
 
@@ -416,15 +410,36 @@ async fn run_tui(
                             }
                         }
 
-                        /* ── Open VS Code remote ────────────────────────────────────── */
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if focus == Focus::Services {
+                                let mut idx = selected_idx.lock().unwrap();
+                                *idx = idx.saturating_sub(1);
+                                auto_scroll = true;
+                            } else {
+                                auto_scroll   = false;
+                                scroll_offset = scroll_offset.saturating_sub(1);
+                            }
+                        }
+
+                        KeyCode::PageDown  => { if focus == Focus::Logs { auto_scroll = true; } }
+                        KeyCode::PageUp    => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
+                        KeyCode::Char('g') => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
+                        KeyCode::Char('G') => { if focus == Focus::Logs { auto_scroll = true; } }
+
+                        /* ── Open VS Code remote ────────────────────────── */
                         KeyCode::Char('c') => {
                             if has_deployment && is_ejected_now {
-                                if let Some(dep_name) = selected
-                                    .as_ref()
-                                    .and_then(|s| s.deployment_name.as_ref())
-                                {
-                                    let host_alias  = format!("{}-local", dep_name);
-                                    let remote_uri  = format!("vscode-remote://ssh-remote+{}/workspace", host_alias);
+                                if let Some((dep_name, organization_id)) = selected
+                                        .as_ref()
+                                        .and_then(|s| s.deployment_name.as_ref().map(|d| (d, &s.organization_id)))
+                                    {
+                                    let host_alias = format!("{}-local", dep_name);
+                                    let remote_uri = format!(
+                                        "vscode-remote://ssh-remote+{}/workspace/{}-{}",
+                                        host_alias,
+                                        organization_id, // change this to organization id
+                                        dep_name
+                                    );
 
                                     disable_raw_mode()?;
                                     execute!(
@@ -464,22 +479,6 @@ async fn run_tui(
                             }
                         }
 
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if focus == Focus::Services {
-                                let mut idx = selected_idx.lock().unwrap();
-                                *idx = idx.saturating_sub(1);
-                                auto_scroll = true;
-                            } else {
-                                auto_scroll   = false;
-                                scroll_offset = scroll_offset.saturating_sub(1);
-                            }
-                        }
-
-                        KeyCode::PageDown  => { if focus == Focus::Logs { auto_scroll = true; } }
-                        KeyCode::PageUp    => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                        KeyCode::Char('g') => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                        KeyCode::Char('G') => { if focus == Focus::Logs { auto_scroll = true; } }
-
                         /* ── Shell into pod ─────────────────────────────── */
                         KeyCode::Char('s') => {
                             let (dep, ejected) = {
@@ -494,7 +493,6 @@ async fn run_tui(
                             };
 
                             if dep.is_some() && ejected {
-                                // Shell makes no sense against a sleep-infinity container
                                 popup = Some(Popup {
                                     service_name: String::new(),
                                     action:   PopupAction::ShellBlocked,
@@ -539,7 +537,7 @@ async fn run_tui(
                                     } else {
                                         PopupAction::Eject
                                     },
-                                    selected: 0, // default to "Yes"
+                                    selected: 0,
                                 });
                             }
                         }
