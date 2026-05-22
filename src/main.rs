@@ -6,8 +6,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
+mod tray;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,11 +41,8 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ForwardStatus {
-    /// kubectl child is running and has not exited
     Connected,
-    /// No routable network interface detected (wifi off etc.)
     Offline,
-    /// kubectl is not running; we are between retries
     Retrying { attempt: u32 },
 }
 
@@ -53,7 +51,6 @@ pub struct ForwardState {
     pub child:    Option<Child>,
     pub status:   ForwardStatus,
     pub restarts: u32,
-    /// Don't attempt another spawn until this instant
     pub retry_at: Option<Instant>,
 }
 
@@ -63,7 +60,7 @@ impl ForwardState {
     }
 }
 
-type StateMap = Arc<Mutex<HashMap<String, ForwardState>>>;
+pub type StateMap = Arc<Mutex<HashMap<String, ForwardState>>>;
 
 // ── Network reachability ──────────────────────────────────────────────────────
 
@@ -74,7 +71,7 @@ fn has_network() -> bool {
         .unwrap_or(false)
 }
 
-// ── Backoff: 0→2s  1→5s  2→10s  3→20s  4+→30s ───────────────────────────────
+// ── Backoff ───────────────────────────────────────────────────────────────────
 
 fn backoff(attempt: u32) -> Duration {
     match attempt {
@@ -86,15 +83,28 @@ fn backoff(attempt: u32) -> Duration {
     }
 }
 
+fn kill_existing_forward(forwarding_port: u16) {
+    // Find and kill any kubectl port-forward holding this port
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("kubectl port-forward.*{}:", forwarding_port)])
+        .status();
+    // Give it a moment to release the port
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 // ── kubectl helpers ───────────────────────────────────────────────────────────
 
 fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
     let target = format!("deployment/{}", entry.deployment_name);
     let ports  = format!("{}:{}", entry.forwarding_port, entry.deployment_port);
+
+    kill_existing_forward(entry.forwarding_port); 
+    eprintln!("[ginger-code] spawning kubectl port-forward {} {}", target, ports);
+
     match Command::new("kubectl")
         .args(["port-forward", &target, &ports])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
     {
         Ok(child) => {
@@ -110,25 +120,22 @@ fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
 }
 
 fn kill_child(child: &mut Child) {
-    libc_kill(child.id() as i32, 15); // SIGTERM
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
     std::thread::sleep(Duration::from_millis(200));
     let _ = child.kill();
     let _ = child.wait();
 }
 
-extern "C" { fn kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int; }
-fn libc_kill(pid: i32, sig: i32) { unsafe { kill(pid, sig); } }
+// ── Network monitor ───────────────────────────────────────────────────────────
 
-// ── Network monitor thread ────────────────────────────────────────────────────
-
-fn run_net_monitor(state_map: StateMap) {
+fn run_net_monitor(state_map: StateMap, shutdown: Arc<AtomicBool>) {
     let mut was_online = has_network();
-    loop {
+    while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(1));
         let online = has_network();
 
         if !was_online && online {
-            println!("[ginger-code] network restored — triggering immediate retry for all deployments");
+            println!("[ginger-code] network restored");
             let mut map = state_map.lock().unwrap();
             for fw in map.values_mut() {
                 fw.retry_at = None;
@@ -137,7 +144,7 @@ fn run_net_monitor(state_map: StateMap) {
                 }
             }
         } else if was_online && !online {
-            println!("[ginger-code] network lost — marking all deployments offline");
+            println!("[ginger-code] network lost");
             let mut map = state_map.lock().unwrap();
             for fw in map.values_mut() {
                 if let Some(ref mut c) = fw.child { kill_child(c); }
@@ -146,18 +153,15 @@ fn run_net_monitor(state_map: StateMap) {
                 fw.retry_at = None;
             }
         }
-
         was_online = online;
     }
 }
 
-// ── Watcher thread ────────────────────────────────────────────────────────────
+// ── Watcher ───────────────────────────────────────────────────────────────────
 
-const TICK: Duration = Duration::from_secs(1);
-
-fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
-    loop {
-        std::thread::sleep(TICK);
+fn run_watcher(state_map: StateMap, cfg_path: PathBuf, shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(1));
 
         let entries: Vec<DeploymentEntry> = Config::load(&cfg_path).deployments;
         let active: std::collections::HashSet<String> =
@@ -165,7 +169,6 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
 
         let mut map = state_map.lock().unwrap();
 
-        // Tear down state for removed deployments
         map.retain(|name, fw| {
             if active.contains(name) { return true; }
             eprintln!("[ginger-code] removed  {} — killing forward", name);
@@ -179,7 +182,6 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
             let fw = map.get_mut(dep).unwrap();
 
             if fw.status == ForwardStatus::Offline { continue; }
-
             if fw.retry_at.map_or(false, |t| Instant::now() < t) { continue; }
 
             let child_alive = fw.child.as_mut()
@@ -198,9 +200,7 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf) {
                 };
 
                 let delay = backoff(attempt);
-                eprintln!("[ginger-code] retrying {} (attempt {}, wait {:?})",
-                    dep, attempt, delay);
-
+                eprintln!("[ginger-code] retrying {} (attempt {}, wait {:?})", dep, attempt, delay);
                 fw.status   = ForwardStatus::Retrying { attempt: attempt + 1 };
                 fw.retry_at = Some(Instant::now() + delay);
                 fw.restarts += 1;
@@ -333,32 +333,68 @@ fn socket_path() -> PathBuf {
     PathBuf::from(runtime).join("ginger-code.sock")
 }
 
+// ── Spawn a background thread, always restart it ─────────────────────────────
+
+fn spawn_resilient<F>(name: &'static str, shutdown: Arc<AtomicBool>, f: F)
+where
+    F: Fn() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&f));
+                if let Err(e) = result {
+                    let msg = e.downcast_ref::<&str>().copied()
+                        .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("unknown panic");
+                    eprintln!("[ginger-code] thread '{}' panicked: {} — restarting in 2s", name, msg);
+                }
+                // Always wait before restarting (panic or clean exit).
+                // The shutdown check at the top of the loop prevents restarting after quit.
+                if !shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        })
+        .expect("spawn thread");
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+fn cleanup_stale_forwards(cfg: &Config) {
+    for dep in &cfg.deployments {
+        kill_existing_forward(dep.forwarding_port);
+    }
+}
+
 fn main() {
+    // Suppress macOS IMK noise
+    #[cfg(target_os = "macos")]
+    unsafe {
+        std::env::set_var("CFPREFERENCES_AVOID_DAEMON", "1");
+    }
+
     let sock_path = socket_path();
     let cfg_path  = config_path();
 
-    if sock_path.exists() { fs::remove_file(&sock_path).expect("remove stale socket"); }
-
-    let listener = UnixListener::bind(&sock_path).unwrap_or_else(|e| {
-        eprintln!("[ginger-code] cannot bind {:?}: {e}", sock_path);
-        std::process::exit(1);
-    });
-
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600)).ok();
+    // Clean up any stale socket from a previous crash.
+    // The socket thread will do the actual bind.
+    if sock_path.exists() {
+        fs::remove_file(&sock_path).expect("remove stale socket");
     }
 
     println!("[ginger-code] started\n  socket : {}\n  config : {}",
         sock_path.display(), cfg_path.display());
 
     let state_map: StateMap = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Re-seed deployments from config on daemon restart
+    // Seed state from config
     {
         let cfg = Config::load(&cfg_path);
+        cleanup_stale_forwards(&cfg);
+
         let mut map = state_map.lock().unwrap();
         for dep in &cfg.deployments {
             map.insert(dep.deployment_name.clone(), ForwardState::new_pending());
@@ -368,28 +404,63 @@ fn main() {
         }
     }
 
-    // Network monitor thread
-    {
+    // Network monitor
+    spawn_resilient("net-monitor", Arc::clone(&shutdown), {
         let sm = Arc::clone(&state_map);
-        std::thread::spawn(move || run_net_monitor(sm));
-    }
+        let sd = Arc::clone(&shutdown);
+        move || run_net_monitor(Arc::clone(&sm), Arc::clone(&sd))
+    });
 
-    // Watcher thread
-    {
+    // Watcher
+    spawn_resilient("watcher", Arc::clone(&shutdown), {
         let sm = Arc::clone(&state_map);
         let cp = cfg_path.clone();
-        std::thread::spawn(move || run_watcher(sm, cp));
-    }
+        let sd = Arc::clone(&shutdown);
+        move || run_watcher(Arc::clone(&sm), cp.clone(), Arc::clone(&sd))
+    });
 
-    // Accept loop
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let cp = cfg_path.clone();
-                let sm = Arc::clone(&state_map);
-                std::thread::spawn(move || handle_client(s, cp, sm));
+    // Socket listener — owns the bind entirely, re-binds on each restart
+    spawn_resilient("socket", Arc::clone(&shutdown), {
+        let cp = cfg_path.clone();
+        let sm = Arc::clone(&state_map);
+        let sp = sock_path.clone();
+        move || {
+            // Remove stale socket from a previous restart of this thread
+            if sp.exists() { let _ = fs::remove_file(&sp); }
+
+            let listener = match UnixListener::bind(&sp) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[ginger-code] socket bind failed: {e}");
+                    // spawn_resilient will sleep 2s and retry
+                    return;
+                }
+            };
+
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&sp, fs::Permissions::from_mode(0o600)).ok();
             }
-            Err(e) => eprintln!("[ginger-code] accept error: {e}"),
+
+            println!("[ginger-code] socket listening on {}", sp.display());
+
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let cp = cp.clone();
+                        let sm = Arc::clone(&sm);
+                        std::thread::spawn(move || handle_client(s, cp, sm));
+                    }
+                    Err(e) => {
+                        eprintln!("[ginger-code] accept error: {e}");
+                        break; // exit → spawn_resilient restarts
+                    }
+                }
+            }
         }
-    }
+    });
+    
+
+    // Tray — owns the main thread (required by macOS)
+    tray::run_tray(Arc::clone(&state_map), Arc::clone(&shutdown), sock_path.clone());
 }
