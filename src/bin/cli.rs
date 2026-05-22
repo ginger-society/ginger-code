@@ -48,7 +48,7 @@ impl Colour {
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -74,8 +74,7 @@ enum Cmd {
         #[arg(long)]
         deployment_name: String,
     },
-
-    /// Fetch metadata and list available deployments
+    #[command(hide = true)]  // hidden fallback, not shown in --help
     Config,
 }
 
@@ -161,7 +160,7 @@ async fn check_session_guard(
             let config_path = Path::new("services.toml");
             match cmd {
                 Cmd::Config => {
-                    fetch_metadata_and_process(config_path, metadata_config, &session_details.sub).await;
+                    fetch_metadata_and_process( metadata_config, &session_details.sub).await;
                 }
                 _ => unreachable!(),
             }
@@ -178,25 +177,27 @@ async fn check_session_guard(
 fn main() {
     let cli = Cli::parse();
 
-    // Commands that need IAM + async
-    if matches!(cli.command, Cmd::Config) {
+    let cmd = cli.command.unwrap_or(Cmd::Config);  // default to Config
+
+
+    if matches!(cmd, Cmd::Config) {
         let token = get_token_from_file_storage();
         let iam_config = get_iam_configuration(Some(token.clone()));
         let metadata_config = get_metadata_configuration(Some(token.clone()));
-        check_session_guard(&cli.command, &iam_config, &metadata_config);
+        check_session_guard(&cmd, &iam_config, &metadata_config);
         return;
     }
 
     // Remaining commands talk to the daemon over the Unix socket (sync)
-    let val = match cli.command {
-        Cmd::Ping => send(r#"{"cmd":"ping"}"#),
-        Cmd::List => send(r#"{"cmd":"list"}"#),
+    let val = match cmd {
+        Cmd::Ping     => send(r#"{"cmd":"ping"}"#),
+        Cmd::List     => send(r#"{"cmd":"list"}"#),
         Cmd::Register { deployment_name, deployment_port, forwarding_port } => {
             send(&serde_json::json!({
-                "cmd":              "register",
-                "deployment_name":  deployment_name,
-                "deployment_port":  deployment_port,
-                "forwarding_port":  forwarding_port,
+                "cmd":             "register",
+                "deployment_name": deployment_name,
+                "deployment_port": deployment_port,
+                "forwarding_port": forwarding_port,
             }).to_string())
         }
         Cmd::Remove { deployment_name } => {

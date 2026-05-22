@@ -28,7 +28,6 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::time::sleep;
 
-use IAMService::apis::configuration::Configuration as IAMConfiguration;
 use MetadataService::{
     apis::{
         configuration::Configuration as MetadataConfiguration,
@@ -51,18 +50,16 @@ use self::{
    ================================================================ */
 
 pub async fn fetch_metadata_and_process(
-    config_path: &Path,
     metadata_config: &MetadataConfiguration,
     session_user: &str,
 ) {
-    let config = read_service_config_file(config_path).unwrap();
 
     let raw_services = match metadata_get_services_and_envs(
         metadata_config,
         MetadataGetServicesAndEnvsParams {
             page_number: Some("1".to_string()),
             page_size:   Some("50".to_string()),
-            org_id:      config.organization_id.clone(),
+            org_id:      "ginger-society".to_string(),  // TODO: get from session or config
         },
     )
     .await
