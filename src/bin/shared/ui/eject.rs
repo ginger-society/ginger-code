@@ -115,8 +115,6 @@ fn add_ssh_config(
     let cert_file     = home.join(".ssh").join("id_ed25519-cert.pub");
     let host_alias    = format!("{}-local", deployment_name);
 
-    // ForwardAgent yes: the MacBook ssh-agent is forwarded into the pod so
-    // `git push source:repo.git` works without any private key in the pod.
     let block = format!(
         "\n{begin} {name}\n\
          Host {alias}\n\
@@ -197,10 +195,17 @@ fn remove_ssh_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
 // ── Workspace helpers ─────────────────────────────────────────────────────────
 
-async fn is_workspace_empty(pod_name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+async fn is_workspace_empty(
+    pod_name: &str,
+    container: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let out = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "--", "sh", "-c",
-               "find /workspace -mindepth 1 -maxdepth 1 | head -1"])
+        .args([
+            "exec", pod_name,
+            "-c", container,
+            "--", "sh", "-c",
+            "find /workspace -mindepth 1 -maxdepth 1 | head -1",
+        ])
         .output()
         .await?;
 
@@ -210,15 +215,19 @@ async fn is_workspace_empty(pod_name: &str) -> Result<bool, Box<dyn std::error::
 // ── SSH key helpers ───────────────────────────────────────────────────────────
 
 /// Write a permanent /home/dev/.ssh/config into the pod for `git push`.
-/// No private key is placed here — the MacBook ssh-agent is forwarded in
-/// via ForwardAgent yes on the local ~/.ssh/config Host block.
-async fn write_pod_ssh_config(pod_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Create /home/dev/.ssh owned by dev (kubectl exec runs as root)
+async fn write_pod_ssh_config(
+    pod_name: &str,
+    container: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let setup_status = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "--", "sh", "-c",
-               "mkdir -p /home/dev/.ssh && \
-                chmod 700 /home/dev/.ssh && \
-                chown dev:dev /home/dev/.ssh"])
+        .args([
+            "exec", pod_name,
+            "-c", container,
+            "--", "sh", "-c",
+            "mkdir -p /home/dev/.ssh && \
+             chmod 700 /home/dev/.ssh && \
+             chown dev:dev /home/dev/.ssh",
+        ])
         .status()
         .await?;
 
@@ -226,8 +235,6 @@ async fn write_pod_ssh_config(pod_name: &str) -> Result<(), Box<dyn std::error::
         return Err("Failed to create /home/dev/.ssh in pod".into());
     }
 
-    // SSH alias `source` resolves via this config — no key path needed because
-    // the forwarded agent supplies the identity.
     let pod_ssh_config =
         "Host source\n\
              User git\n\
@@ -238,7 +245,9 @@ async fn write_pod_ssh_config(pod_name: &str) -> Result<(), Box<dyn std::error::
 
     let write_status = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name, "--", "sh", "-c",
+            "exec", pod_name,
+            "-c", container,
+            "--", "sh", "-c",
             &format!(
                 "printf '%s' '{}' > /home/dev/.ssh/config && \
                  chmod 600 /home/dev/.ssh/config && \
@@ -259,14 +268,20 @@ async fn write_pod_ssh_config(pod_name: &str) -> Result<(), Box<dyn std::error::
 }
 
 /// Copy SSH keys into /root/.ssh temporarily for the initial git clone.
-/// /root is used because kubectl exec runs as root — avoids /home/dev permission issues.
-async fn copy_ssh_keys_to_root(pod_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn copy_ssh_keys_to_root(
+    pod_name: &str,
+    container: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let home    = dirs::home_dir().ok_or("Could not locate home directory")?;
     let ssh_dir = home.join(".ssh");
 
     let mkdir_status = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "--", "sh", "-c",
-               "mkdir -p /root/.ssh && chmod 700 /root/.ssh"])
+        .args([
+            "exec", pod_name,
+            "-c", container,
+            "--", "sh", "-c",
+            "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+        ])
         .status()
         .await?;
 
@@ -287,6 +302,9 @@ async fn copy_ssh_keys_to_root(pod_name: &str) -> Result<(), Box<dyn std::error:
             continue;
         }
 
+        // kubectl cp does not support -c / --container, so we copy to the pod
+        // (which lands in the first running container's filesystem) then chmod.
+        // Since after eject there is only one running container this is fine.
         let cp_status = tokio::process::Command::new("kubectl")
             .args(["cp", local.to_str().unwrap(), &format!("{}:{}", pod_name, remote_path)])
             .status()
@@ -298,7 +316,11 @@ async fn copy_ssh_keys_to_root(pod_name: &str) -> Result<(), Box<dyn std::error:
         }
 
         tokio::process::Command::new("kubectl")
-            .args(["exec", pod_name, "--", "chmod", perms, remote_path])
+            .args([
+                "exec", pod_name,
+                "-c", container,
+                "--", "chmod", perms, remote_path,
+            ])
             .status()
             .await?;
 
@@ -309,10 +331,16 @@ async fn copy_ssh_keys_to_root(pod_name: &str) -> Result<(), Box<dyn std::error:
 }
 
 /// Delete /root/.ssh entirely — the temporary clone keys live only there.
-/// /home/dev/.ssh/config is intentionally left in place for git push.
-async fn delete_root_ssh(pod_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn delete_root_ssh(
+    pod_name: &str,
+    container: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let rm_status = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "--", "rm", "-rf", "/root/.ssh"])
+        .args([
+            "exec", pod_name,
+            "-c", container,
+            "--", "rm", "-rf", "/root/.ssh",
+        ])
         .status()
         .await?;
 
@@ -321,8 +349,8 @@ async fn delete_root_ssh(pod_name: &str) -> Result<(), Box<dyn std::error::Error
     } else {
         eprintln!(
             "Warning: could not remove /root/.ssh from pod — remove manually:\n  \
-             kubectl exec {} -- rm -rf /root/.ssh",
-            pod_name
+             kubectl exec {} -c {} -- rm -rf /root/.ssh",
+            pod_name, container
         );
     }
 
@@ -330,8 +358,11 @@ async fn delete_root_ssh(pod_name: &str) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Clone the repo into /workspace using GIT_SSH_COMMAND with the temp root key.
-/// After clone, fix ownership to dev so the user can write to the directory.
-async fn clone_repo(pod_name: &str, repo_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn clone_repo(
+    pod_name: &str,
+    container: &str,
+    repo_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("  /workspace is empty — cloning {}...", repo_name);
 
     let clone_cmd = format!(
@@ -346,7 +377,11 @@ async fn clone_repo(pod_name: &str, repo_name: &str) -> Result<(), Box<dyn std::
     );
 
     let clone_status = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "--", "sh", "-c", &clone_cmd])
+        .args([
+            "exec", pod_name,
+            "-c", container,
+            "--", "sh", "-c", &clone_cmd,
+        ])
         .status()
         .await?;
 
@@ -371,14 +406,14 @@ async fn clone_repo(pod_name: &str, repo_name: &str) -> Result<(), Box<dyn std::
 
 fn builder_image(lang: &str) -> &'static str {
     match lang {
-        "TS"   => "gingersociety/dev-container-node:1",
-        "Rust" => "gingersociety/rust-rocket-api-builder:latest",
+        "TS"   => "gingersociety/dev-container-node:5",
+        "Rust" => "gingersociety/dev-container-rust:7",
         other  => todo!("builder image not yet defined for lang: {}", other),
     }
 }
 
 fn supports_ssh(lang: &str) -> bool {
-    lang == "TS"
+    matches!(lang, "TS" | "Rust")
 }
 
 // ── Eject ─────────────────────────────────────────────────────────────────────
@@ -452,7 +487,7 @@ spec:
 
     // ── Patch deployment ──────────────────────────────────────────────────────
     let command = if ssh {
-        serde_json::json!(["/usr/sbin/sshd", "-D", "-e"])
+        serde_json::json!(["/entrypoint.sh"])
     } else {
         serde_json::json!(["sleep", "infinity"])
     };
@@ -477,6 +512,11 @@ spec:
         },
         "spec": {
             "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": null  // ← kills second rollout
+                    }
+                },
                 "spec": {
                     "containers": [container],
                     "volumes": [{
@@ -510,38 +550,62 @@ spec:
         println!("  pod scheduled: {}", pod_name);
 
         println!("⏳ Waiting for pod container to be ready...");
-        let wait_status = tokio::process::Command::new("kubectl")
+
+        println!("\n⏸  Sleeping 5s to allow rollout to stabilize...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        println!("⏳ Re-checking current pod after stabilization...");
+        let final_pod = wait_for_pod_scheduled(deployment_name).await?;  // ← new pod name
+
+        tokio::process::Command::new("kubectl")
             .args([
                 "wait",
-                &format!("pod/{}", pod_name),
+                &format!("pod/{}", final_pod),
                 "--for=condition=Ready",
-                "--timeout=120s",
+                "--timeout=300s",
             ])
             .status()
             .await?;
 
-        if !wait_status.success() {
-            return Err(format!(
-                "Timed out waiting for pod '{}' to become ready", pod_name
-            ).into());
-        }
+        println!("✓ Pod ready: {}", final_pod);  // ← print final_pod not pod_name
 
-        println!("✓ Pod ready: {}", pod_name);
-
-        // ── Write SSH principal ───────────────────────────────────────────────
+        // Now use final_pod everywhere below, not pod_name
         let principal_cmd = format!(
-            "echo '{}' > /etc/ssh/auth_principals/dev",
+            "mkdir -p /etc/ssh/auth_principals && echo '{}' > /etc/ssh/auth_principals/dev",
             session_user
         );
 
+        println!("  pod_name = '{}'", final_pod);  // ← final_pod
+        println!("  container = '{}'", deployment_name);
+
         let exec_status = tokio::process::Command::new("kubectl")
-            .args(["exec", &pod_name, "--", "sh", "-c", &principal_cmd])
+            .args([
+                "exec", &final_pod,  // ← final_pod
+                "-c", deployment_name,
+                "--", "sh", "-c", &principal_cmd,
+            ])
             .status()
             .await?;
 
+        println!("  exec exit status = {:?}", exec_status);
+
+        // verify it was actually written
+        let verify_out = tokio::process::Command::new("kubectl")
+            .args([
+                "exec", &final_pod,
+                "-c", deployment_name,
+                "--", "sh", "-c",
+                "ls /etc/ssh/auth_principals && cat /etc/ssh/auth_principals/dev",
+            ])
+            .output()
+            .await?;
+
+        println!("  verify stdout = '{}'", String::from_utf8_lossy(&verify_out.stdout));
+        println!("  verify stderr = '{}'", String::from_utf8_lossy(&verify_out.stderr));
+
         if !exec_status.success() {
             return Err(format!(
-                "Failed to write SSH principal '{}' into pod {}", session_user, pod_name
+                "Failed to write SSH principal '{}' into pod {}", session_user, final_pod
             ).into());
         }
 
@@ -549,24 +613,22 @@ spec:
 
         // ── Write permanent /home/dev/.ssh/config (agent-forwarded push) ──────
         println!("⏳ Writing pod SSH config for git push...");
-        if let Err(e) = write_pod_ssh_config(&pod_name).await {
+        if let Err(e) = write_pod_ssh_config(&final_pod, deployment_name).await {
             eprintln!("Warning: {e}");
         }
 
         // ── Clone if workspace is empty ───────────────────────────────────────
-        // Keys only touch the pod for the duration of the clone, then wiped.
         println!("⏳ Checking workspace...");
-        match is_workspace_empty(&pod_name).await {
+        match is_workspace_empty(&final_pod, deployment_name).await {
             Ok(true) => {
                 println!("⏳ Copying SSH keys into pod for initial clone...");
-                match copy_ssh_keys_to_root(&pod_name).await {
+                match copy_ssh_keys_to_root(&final_pod, deployment_name).await {
                     Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
                     Ok(()) => {
-                        if let Err(e) = clone_repo(&pod_name, &repo_name).await {
+                        if let Err(e) = clone_repo(&final_pod, deployment_name, &repo_name.to_lowercase()).await {
                             eprintln!("Warning: {e}");
                         }
-                        // Always wipe regardless of clone success
-                        if let Err(e) = delete_root_ssh(&pod_name).await {
+                        if let Err(e) = delete_root_ssh(&final_pod, deployment_name).await {
                             eprintln!("Warning: {e}");
                         }
                     }
@@ -621,6 +683,9 @@ spec:
         println!("\nConnect with:  ssh {}-local", deployment_name);
         println!("Then push with: git push  (agent forwarding carries your key)");
     }
+
+    println!("\n⏸  Sleeping 2s — read the logs above, then Ctrl+C to exit early...");
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
 }
@@ -710,7 +775,6 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 // ── Pod scheduling wait ───────────────────────────────────────────────────────
-
 async fn wait_for_pod_scheduled(
     deployment_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -720,16 +784,19 @@ async fn wait_for_pod_scheduled(
             .args([
                 "get", "pods",
                 "-l", &label,
+                "--field-selector=status.phase!=Failed",
                 "--no-headers",
-                "-o", "custom-columns=NAME:.metadata.name",
+                "-o", "custom-columns=NAME:.metadata.name,DELETED:.metadata.deletionTimestamp",
             ])
             .output()
             .await?;
 
+        // Only pick a pod that has no deletionTimestamp (shows as <none>)
         if let Some(name) = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .find(|l| !l.is_empty())
-            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && l.contains("<none>"))
+            .filter_map(|l| l.split_whitespace().next().map(|s| s.trim().to_string()))
+            .next()
         {
             return Ok(name);
         }
