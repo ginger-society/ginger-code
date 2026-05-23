@@ -1,6 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -51,15 +50,26 @@ pub enum ForwardStatus {
 
 #[derive(Debug)]
 pub struct ForwardState {
-    pub child:    Option<Child>,
-    pub status:   ForwardStatus,
-    pub restarts: u32,
-    pub retry_at: Option<Instant>,
+    pub child:           Option<Child>,
+    pub status:          ForwardStatus,
+    pub restarts:        u32,
+    pub retry_at:        Option<Instant>,
+    pub spawned_at:      Option<Instant>,
+    pub forwarding_port: u16,
+    pub deployment_port: u16,
 }
 
 impl ForwardState {
-    fn new_pending() -> Self {
-        Self { child: None, status: ForwardStatus::Retrying { attempt: 0 }, restarts: 0, retry_at: None }
+    fn new_pending(entry: &DeploymentEntry) -> Self {
+        Self {
+            child:           None,
+            status:          ForwardStatus::Retrying { attempt: 0 },
+            restarts:        0,
+            retry_at:        None,
+            spawned_at:      None,
+            forwarding_port: entry.forwarding_port,
+            deployment_port: entry.deployment_port,
+        }
     }
 }
 
@@ -74,6 +84,16 @@ fn has_network() -> bool {
         .unwrap_or(false)
 }
 
+// ── TCP probe ─────────────────────────────────────────────────────────────────
+
+fn probe_port(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
 // ── Backoff ───────────────────────────────────────────────────────────────────
 
 fn backoff(attempt: u32) -> Duration {
@@ -86,19 +106,32 @@ fn backoff(attempt: u32) -> Duration {
     }
 }
 
+// ── Kill any process holding a port (used only at startup cleanup) ────────────
+
 fn kill_existing_forward(forwarding_port: u16) {
-    // Find and kill any kubectl port-forward holding this port
-    let _ = Command::new("pkill")
-        .args(["-f", &format!("kubectl port-forward.*{}:", forwarding_port)])
-        .status();
-    // Give it a moment to release the port
-    std::thread::sleep(Duration::from_millis(300));
+    // lsof -ti tcp:PORT gives exactly the PID holding that port — no pattern matching
+    let output = Command::new("lsof")
+        .args(["-ti", &format!("tcp:{}", forwarding_port)])
+        .output();
+
+    if let Ok(out) = output {
+        let pids = String::from_utf8_lossy(&out.stdout);
+        let mut killed = false;
+        for pid_str in pids.split_whitespace() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+                killed = true;
+            }
+        }
+        if killed {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
 }
 
 // ── kubectl helpers ───────────────────────────────────────────────────────────
 
 fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
-
     let kubectl = find_kubectl().unwrap_or_else(|| {
         eprintln!("[ginger-code] kubectl not found in PATH or known locations");
         std::path::PathBuf::from("kubectl")
@@ -107,7 +140,9 @@ fn spawn_forward(entry: &DeploymentEntry) -> Option<Child> {
     let target = format!("deployment/{}", entry.deployment_name);
     let ports  = format!("{}:{}", entry.forwarding_port, entry.deployment_port);
 
-    kill_existing_forward(entry.forwarding_port); 
+    // NOTE: no kill_existing_forward here — the watcher already called kill_child()
+    // on the previous Child before calling spawn_forward(). kill_existing_forward
+    // is only used during startup cleanup (cleanup_stale_forwards).
     eprintln!("[ginger-code] spawning kubectl port-forward {} {}", target, ports);
 
     match Command::new(&kubectl)
@@ -157,9 +192,10 @@ fn run_net_monitor(state_map: StateMap, shutdown: Arc<AtomicBool>) {
             let mut map = state_map.lock().unwrap();
             for fw in map.values_mut() {
                 if let Some(ref mut c) = fw.child { kill_child(c); }
-                fw.child    = None;
-                fw.status   = ForwardStatus::Offline;
-                fw.retry_at = None;
+                fw.child      = None;
+                fw.spawned_at = None;
+                fw.status     = ForwardStatus::Offline;
+                fw.retry_at   = None;
             }
         }
         was_online = online;
@@ -178,6 +214,7 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf, shutdown: Arc<AtomicBool>
 
         let mut map = state_map.lock().unwrap();
 
+        // Remove deployments that were deleted from config
         map.retain(|name, fw| {
             if active.contains(name) { return true; }
             eprintln!("[ginger-code] removed  {} — killing forward", name);
@@ -187,25 +224,29 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf, shutdown: Arc<AtomicBool>
 
         for entry in &entries {
             let dep = &entry.deployment_name;
-            map.entry(dep.clone()).or_insert_with(ForwardState::new_pending);
+            map.entry(dep.clone()).or_insert_with(|| ForwardState::new_pending(entry));
             let fw = map.get_mut(dep).unwrap();
 
+            // Network is down — don't touch anything
             if fw.status == ForwardStatus::Offline { continue; }
+
+            // Still waiting out the backoff delay
             if fw.retry_at.map_or(false, |t| Instant::now() < t) { continue; }
 
-            let child_alive = fw.child.as_mut()
+            let process_alive = fw.child.as_mut()
                 .map_or(false, |c| c.try_wait().ok().flatten().is_none());
 
-            if child_alive {
-                fw.status   = ForwardStatus::Connected;
-                fw.retry_at = None;
-            } else {
+            if !process_alive {
+                // Process exited — kill cleanly, increment attempt, respawn with backoff
                 if let Some(ref mut c) = fw.child { kill_child(c); }
-                fw.child = None;
+                fw.child      = None;
+                fw.spawned_at = None;
 
                 let attempt = match fw.status {
                     ForwardStatus::Retrying { attempt } => attempt,
-                    _ => 0,
+                    // Was connected but process died unexpectedly — reset attempt
+                    ForwardStatus::Connected            => 0,
+                    _                                   => 0,
                 };
 
                 let delay = backoff(attempt);
@@ -214,6 +255,26 @@ fn run_watcher(state_map: StateMap, cfg_path: PathBuf, shutdown: Arc<AtomicBool>
                 fw.retry_at = Some(Instant::now() + delay);
                 fw.restarts += 1;
                 fw.child    = spawn_forward(entry);
+                fw.spawned_at = Some(Instant::now());
+
+            } else {
+                // Process is alive — only promote to Connected after a settle window
+                // AND a successful TCP probe. This prevents the green-flicker where
+                // kubectl spawns, the process is briefly alive, we call it Connected,
+                // then kubectl exits a moment later because the k8s server is unreachable.
+                let settled = fw.spawned_at
+                    .map_or(false, |t| t.elapsed() > Duration::from_secs(3));
+
+                if settled && probe_port(entry.forwarding_port) {
+                    if fw.status != ForwardStatus::Connected {
+                        println!("[ginger-code] connected {} on :{}", dep, entry.forwarding_port);
+                    }
+                    fw.status   = ForwardStatus::Connected;
+                    fw.retry_at = None;
+                }
+                // else: stay in Retrying — don't touch attempt counter or retry_at.
+                // The process will either exit (caught above next tick) or eventually
+                // bind its port and pass the probe.
             }
         }
     }
@@ -263,8 +324,9 @@ fn dispatch(req: Request, path: &PathBuf, state_map: &StateMap) -> Response {
             });
             cfg.save(path);
             if is_new {
+                let entry = DeploymentEntry { deployment_name: deployment_name.clone(), deployment_port, forwarding_port };
                 state_map.lock().unwrap()
-                    .insert(deployment_name.clone(), ForwardState::new_pending());
+                    .insert(deployment_name.clone(), ForwardState::new_pending(&entry));
             }
             Response::Ok {
                 message: format!("Registered '{}' — forward starting (:{} → deployment:{})",
@@ -275,6 +337,8 @@ fn dispatch(req: Request, path: &PathBuf, state_map: &StateMap) -> Response {
         Request::List => {
             let cfg = Config::load(path);
             let map = state_map.lock().unwrap();
+            // Drive entirely from config order, joined with live state.
+            // This ensures List and the tray tooltip always agree on total count.
             let deployments = cfg.deployments.iter().map(|e| {
                 let fw = map.get(&e.deployment_name);
                 DeploymentStatus {
@@ -359,8 +423,6 @@ where
                         .unwrap_or("unknown panic");
                     eprintln!("[ginger-code] thread '{}' panicked: {} — restarting in 2s", name, msg);
                 }
-                // Always wait before restarting (panic or clean exit).
-                // The shutdown check at the top of the loop prevents restarting after quit.
                 if !shutdown.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_secs(2));
                 }
@@ -372,18 +434,17 @@ where
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn cleanup_stale_forwards(cfg: &Config) {
+    // Uses lsof for precise port-based killing — no pkill pattern matching
     for dep in &cfg.deployments {
         kill_existing_forward(dep.forwarding_port);
     }
 }
 
 fn find_kubectl() -> Option<std::path::PathBuf> {
-    // Try common locations explicitly if which fails
     let candidates = [
         "/usr/local/bin/kubectl",
         "/opt/homebrew/bin/kubectl",
         "/usr/bin/kubectl",
-        "/usr/local/bin/kubectl",
     ];
     for path in candidates {
         if std::path::Path::new(path).exists() {
@@ -394,7 +455,6 @@ fn find_kubectl() -> Option<std::path::PathBuf> {
 }
 
 fn main() {
-
     #[cfg(target_os = "macos")]
     {
         let current = std::env::var("PATH").unwrap_or_default();
@@ -406,12 +466,9 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     unsafe {
-        // Detach from the terminal — no visible window
         libc::setsid();
     }
-    
 
-    // Suppress macOS IMK noise
     #[cfg(target_os = "macos")]
     unsafe {
         std::env::set_var("CFPREFERENCES_AVOID_DAEMON", "1");
@@ -420,8 +477,6 @@ fn main() {
     let sock_path = socket_path();
     let cfg_path  = config_path();
 
-    // Clean up any stale socket from a previous crash.
-    // The socket thread will do the actual bind.
     if sock_path.exists() {
         fs::remove_file(&sock_path).expect("remove stale socket");
     }
@@ -439,7 +494,7 @@ fn main() {
 
         let mut map = state_map.lock().unwrap();
         for dep in &cfg.deployments {
-            map.insert(dep.deployment_name.clone(), ForwardState::new_pending());
+            map.insert(dep.deployment_name.clone(), ForwardState::new_pending(dep));
         }
         if !cfg.deployments.is_empty() {
             println!("[ginger-code] resuming {} deployment(s)", cfg.deployments.len());
@@ -461,20 +516,18 @@ fn main() {
         move || run_watcher(Arc::clone(&sm), cp.clone(), Arc::clone(&sd))
     });
 
-    // Socket listener — owns the bind entirely, re-binds on each restart
+    // Socket listener
     spawn_resilient("socket", Arc::clone(&shutdown), {
         let cp = cfg_path.clone();
         let sm = Arc::clone(&state_map);
         let sp = sock_path.clone();
         move || {
-            // Remove stale socket from a previous restart of this thread
             if sp.exists() { let _ = fs::remove_file(&sp); }
 
             let listener = match UnixListener::bind(&sp) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("[ginger-code] socket bind failed: {e}");
-                    // spawn_resilient will sleep 2s and retry
                     return;
                 }
             };
@@ -495,14 +548,13 @@ fn main() {
                     }
                     Err(e) => {
                         eprintln!("[ginger-code] accept error: {e}");
-                        break; // exit → spawn_resilient restarts
+                        break;
                     }
                 }
             }
         }
     });
-    
 
     // Tray — owns the main thread (required by macOS)
-    tray::run_tray(Arc::clone(&state_map), Arc::clone(&shutdown), sock_path.clone());
+    tray::run_tray(Arc::clone(&state_map), Arc::clone(&shutdown), sock_path.clone(), cfg_path.clone());
 }
