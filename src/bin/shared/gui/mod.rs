@@ -5,31 +5,39 @@ pub mod terminal;
 pub mod types;
 
 use eframe::egui;
-
-use types::{AppState, RightPane, TermState};
 use app::App;
 
-/// Launch the egui window. Called from your tray icon or CLI.
-/// The window will request focus / come to front on open.
+const ICON_BYTES: &[u8] = include_bytes!("../../../../assets/ginger-code.png");
+
 pub fn run_gui() -> eframe::Result<()> {
+    let icon = {
+        let img = ::image::load_from_memory(ICON_BYTES)  // :: prefix = crate root
+            .expect("Failed to load icon")
+            .into_rgba8();
+        let (w, h) = img.dimensions();
+        egui::viewport::IconData {
+            rgba:   img.into_raw(),
+            width:  w,
+            height: h,
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("GingerKube")
+            .with_title("Ginger Code")
+            .with_icon(std::sync::Arc::new(icon))
             .with_inner_size([1100.0, 680.0])
             .with_min_inner_size([600.0, 400.0])
             .with_decorations(false)
             .with_transparent(false)
-            // Raise window above everything when first shown
             .with_always_on_top(),
         ..Default::default()
     };
 
     eframe::run_native(
-        "GingerKube",
+        "Ginger Code",
         options,
         Box::new(|cc| {
-            // Request focus on the very first frame so the window comes
-            // forward even when launched from a background tray process.
             cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             Box::new(App::new(cc))
         }),

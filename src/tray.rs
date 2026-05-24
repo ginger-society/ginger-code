@@ -58,19 +58,10 @@ fn make_icon(svg: &str) -> Icon {
 
 // ── Dashboard launcher ────────────────────────────────────────────────────────
 
-const DASHBOARD_BIN: &str =
-    "/Users/pradeepyadav/Documents/ginger-society/ginger-code/target/debug/ginger-code-cli";
-
 fn open_dashboard() {
     #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                DASHBOARD_BIN
-            ),
-        ])
+    let result = std::process::Command::new("open")
+        .arg("/Applications/ginger-code-gui.app")
         .spawn();
 
     #[cfg(target_os = "linux")]

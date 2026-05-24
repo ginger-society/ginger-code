@@ -39,7 +39,7 @@ pub fn draw_titlebar(state: &AppState, ui: &mut egui::Ui, ctx: &egui::Context) {
         painter.circle_filled(*center, 6.0, *color);
     }
     let svc   = &state.services[state.selected_idx];
-    let title = format!("GingerKube  —  {}", svc.meta_name);
+    let title = format!("Ginger Code  —  {}", svc.meta_name);
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, title,
         egui::FontId::proportional(12.0), egui::Color32::from_rgb(160, 160, 160));
     drop(painter);
