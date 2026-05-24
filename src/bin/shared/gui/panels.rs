@@ -179,41 +179,77 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
     }
 
     // ── Terminal tabs ─────────────────────────────────────────────────────────
+    const CLOSE_W: f32 = 30.0;   // right-side zone reserved exclusively for ×
+    const LABEL_PAD_L: f32 = 10.0;
+    const LABEL_PAD_R: f32 = CLOSE_W + 6.0; // keep text at least this far from right edge
+
     for (i, tab) in state.term_tabs.iter().enumerate() {
-        let tab_rect  = egui::Rect::from_min_size(egui::pos2(x, bar_rect.min.y), egui::vec2(TERM_W, TAB_H));
-        let active    = state.right_pane == RightPane::TerminalTab(i);
-
-        // Close button "×" — allocate first so it takes priority over the tab click.
-        let close_size = 14.0_f32;
-        let close_rect = egui::Rect::from_center_size(
-            egui::pos2(tab_rect.max.x - 10.0, tab_rect.center().y),
-            egui::vec2(close_size, close_size),
+        let tab_rect = egui::Rect::from_min_size(
+            egui::pos2(x, bar_rect.min.y),
+            egui::vec2(TERM_W, TAB_H),
         );
-        let close_clicked = ui.allocate_rect(close_rect, egui::Sense::click()).clicked();
-        let tab_clicked   = ui.allocate_rect(tab_rect,   egui::Sense::click()).clicked();
+        let active = state.right_pane == RightPane::TerminalTab(i);
 
-        if close_clicked { action = Some(TabBarAction::CloseTerm(i)); }
-        else if tab_clicked && !active { action = Some(TabBarAction::SwitchToTerm(i)); }
+        // ── Non-overlapping hit zones ─────────────────────────────────────────
+        // close_zone is the rightmost CLOSE_W pixels of the tab.
+        // label_zone is everything to the left of it.
+        // Allocate close_zone FIRST so it wins the hit-test race.
+        let close_zone = egui::Rect::from_min_max(
+            egui::pos2(tab_rect.max.x - CLOSE_W, tab_rect.min.y),
+            tab_rect.max,
+        );
+        let label_zone = egui::Rect::from_min_max(
+            tab_rect.min,
+            egui::pos2(tab_rect.max.x - CLOSE_W, tab_rect.max.y),
+        );
 
-        let painter = ui.painter();
-        painter.rect_filled(tab_rect, 0.0, if active { egui::Color32::from_rgb(28,28,28) } else { COLOR_TAB_BAR });
-        if active {
-            painter.line_segment([tab_rect.left_bottom(), tab_rect.right_bottom()], egui::Stroke::new(2.0, COLOR_TAB_ACTIVE));
+        let close_resp = ui.allocate_rect(close_zone, egui::Sense::click());
+        let label_resp = ui.allocate_rect(label_zone, egui::Sense::click());
+
+        if close_resp.clicked() {
+            action = Some(TabBarAction::CloseTerm(i));
+        } else if label_resp.clicked() && !active {
+            action = Some(TabBarAction::SwitchToTerm(i));
         }
-        // Label — truncate if needed
-        let label_rect = egui::Rect::from_min_size(
-            tab_rect.min, egui::vec2(TERM_W - close_size - 8.0, TAB_H),
+
+        // ── Paint ─────────────────────────────────────────────────────────────
+        let painter = ui.painter();
+        let bg = if active { egui::Color32::from_rgb(28, 28, 28) } else { COLOR_TAB_BAR };
+        painter.rect_filled(tab_rect, 0.0, bg);
+
+        if active {
+            painter.line_segment(
+                [tab_rect.left_bottom(), tab_rect.right_bottom()],
+                egui::Stroke::new(2.0, COLOR_TAB_ACTIVE),
+            );
+        }
+
+        // Separator line between label zone and close zone
+        painter.line_segment(
+            [close_zone.left_top(), close_zone.left_bottom()],
+            egui::Stroke::new(0.5, COLOR_BORDER),
         );
-        painter.text(
-            egui::pos2(label_rect.min.x + 8.0, tab_rect.center().y),
+
+        // Label — truncate with ellipsis so it never reaches the × zone
+        let label_clip = label_zone.shrink2(egui::vec2(0.0, 2.0)); // tiny vertical breathing room
+        let clipped_painter = ui.painter().with_clip_rect(label_clip);
+        clipped_painter.text(
+            egui::pos2(tab_rect.min.x + LABEL_PAD_L, tab_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            &tab.label,
+            &tab.label,                          // raw label, untouched
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
             if active { egui::Color32::WHITE } else { COLOR_TAB_INACTIVE },
         );
-        // Close ×
-        painter.text(close_rect.center(), egui::Align2::CENTER_CENTER, "×",
-            egui::FontId::new(14.0, egui::FontFamily::Monospace), COLOR_DIM);
+
+        // Close × — centred in its own zone
+        let x_color = if close_resp.hovered() { egui::Color32::WHITE } else { COLOR_DIM };
+        painter.text(
+            close_zone.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::new(15.0, egui::FontFamily::Monospace),
+            x_color,
+        );
 
         x += TERM_W;
     }
