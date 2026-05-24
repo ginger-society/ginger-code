@@ -23,6 +23,37 @@ fn send_to_daemon(payload: &str) -> Result<serde_json::Value, Box<dyn std::error
     Ok(serde_json::from_str(&resp)?)
 }
 
+// ── code.toml direct write (used by uneject so cleanup is always guaranteed) ──
+
+/// Remove a deployment entry from ~/.ginger-society/code.toml directly,
+/// without going through the daemon socket. This is called unconditionally
+/// in uneject() so that a dead or unreachable daemon never leaves a stale
+/// port-forward entry that loops forever on the next daemon startup.
+fn remove_from_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let home = dirs::home_dir().ok_or("Could not locate home directory")?;
+    let cfg_path = home.join(".ginger-society").join("code.toml");
+
+    if !cfg_path.exists() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&cfg_path)?;
+    let mut cfg: toml::Value = toml::from_str(&raw)
+        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+
+    if let Some(deps) = cfg.get_mut("deployments").and_then(|d| d.as_array_mut()) {
+        deps.retain(|d| {
+            d.get("deployment_name")
+                .and_then(|v| v.as_str())
+                .map_or(true, |n| n != deployment_name)
+        });
+    }
+
+    fs::write(&cfg_path, toml::to_string_pretty(&cfg)?)?;
+    println!("✓ Removed '{}' from code.toml", deployment_name);
+    Ok(())
+}
+
 // ── Port discovery ────────────────────────────────────────────────────────────
 
 fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
@@ -514,7 +545,7 @@ spec:
             "template": {
                 "metadata": {
                     "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": null  // ← kills second rollout
+                        "kubectl.kubernetes.io/restartedAt": null
                     }
                 },
                 "spec": {
@@ -555,7 +586,7 @@ spec:
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         println!("⏳ Re-checking current pod after stabilization...");
-        let final_pod = wait_for_pod_scheduled(deployment_name).await?;  // ← new pod name
+        let final_pod = wait_for_pod_scheduled(deployment_name).await?;
 
         tokio::process::Command::new("kubectl")
             .args([
@@ -567,20 +598,19 @@ spec:
             .status()
             .await?;
 
-        println!("✓ Pod ready: {}", final_pod);  // ← print final_pod not pod_name
+        println!("✓ Pod ready: {}", final_pod);
 
-        // Now use final_pod everywhere below, not pod_name
         let principal_cmd = format!(
             "mkdir -p /etc/ssh/auth_principals && echo '{}' > /etc/ssh/auth_principals/dev",
             session_user
         );
 
-        println!("  pod_name = '{}'", final_pod);  // ← final_pod
+        println!("  pod_name = '{}'", final_pod);
         println!("  container = '{}'", deployment_name);
 
         let exec_status = tokio::process::Command::new("kubectl")
             .args([
-                "exec", &final_pod,  // ← final_pod
+                "exec", &final_pod,
                 "-c", deployment_name,
                 "--", "sh", "-c", &principal_cmd,
             ])
@@ -589,7 +619,6 @@ spec:
 
         println!("  exec exit status = {:?}", exec_status);
 
-        // verify it was actually written
         let verify_out = tokio::process::Command::new("kubectl")
             .args([
                 "exec", &final_pod,
@@ -657,6 +686,10 @@ spec:
             "forwarding_port": forwarding_port,
         });
 
+        // NOTE: the daemon register call is what writes to code.toml (via
+        // dispatch → Config::save in main.rs). If this fails, the entry is
+        // simply absent — no zombie forward will loop. The user is told how
+        // to register manually.
         match send_to_daemon(&register_payload.to_string()) {
             Ok(resp) if resp["status"] == "ok" => {
                 println!(
@@ -668,10 +701,16 @@ spec:
             Err(e) => {
                 eprintln!(
                     "Warning: could not register with daemon (is ginger-code running?): {e}\n\
-                     You can register manually with:\n  \
-                     ginger-code register --deployment-name {} --deployment-port 22 --forwarding-port {}",
+                     The eject itself succeeded — SSH is ready in the pod.\n\
+                     Register the port-forward manually with:\n  \
+                     ginger-code register --deployment-name {} --deployment-port 22 --forwarding-port {}\n\
+                     Or add the entry directly to ~/.ginger-society/code.toml.",
                     deployment_name, forwarding_port
                 );
+                // Do NOT attempt to write code.toml here — without daemon
+                // acknowledgement we can't guarantee the port isn't already in
+                // use, and writing a stale entry would cause the same retry
+                // loop we're trying to avoid.
             }
         }
 
@@ -745,7 +784,29 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     println!("✓ Unejected {} → restored {}", deployment_name, original_image);
 
-    // ── Deregister from daemon ────────────────────────────────────────────────
+    // ── Always remove from code.toml directly first ───────────────────────────
+    //
+    // This is the critical fix: we write code.toml unconditionally, before
+    // touching the daemon socket. Previously, if send_to_daemon failed (daemon
+    // unreachable, crashed, etc.) the entry was left in code.toml and the next
+    // daemon startup would loop forever trying to port-forward port 22 on a
+    // pod that no longer has an SSH server.
+    //
+    // The watcher in main.rs calls Config::load() on every tick and drops any
+    // deployment absent from the file, so even if the daemon is currently
+    // running, it will stop the forward within ~1 second of this write.
+    if let Err(e) = remove_from_config(deployment_name) {
+        eprintln!("Warning: could not update code.toml directly: {e}");
+        eprintln!(
+            "  Remove the entry manually from ~/.ginger-society/code.toml\n  \
+             or the daemon will retry the port-forward on next startup."
+        );
+    }
+
+    // ── Notify running daemon so it stops the forward immediately ─────────────
+    //
+    // This is now best-effort: code.toml is already clean, so even if this
+    // call fails the forward will be torn down on the next watcher tick.
     let remove_payload = serde_json::json!({
         "cmd":             "remove",
         "deployment_name": deployment_name,
@@ -753,16 +814,13 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     match send_to_daemon(&remove_payload.to_string()) {
         Ok(resp) if resp["status"] == "ok" => {
-            println!("✓ Deregistered '{}' from daemon — port-forward stopped", deployment_name);
+            println!("✓ Notified daemon — port-forward stopped immediately");
         }
         Ok(resp) => eprintln!("Warning: daemon responded unexpectedly: {}", resp),
-        Err(e) => {
-            eprintln!(
-                "Warning: could not deregister from daemon (is ginger-code running?): {e}\n\
-                 You can remove manually with:\n  \
-                 ginger-code remove --deployment-name {}",
-                deployment_name
-            );
+        Err(_) => {
+            // Not an error — code.toml is already clean. The watcher will
+            // pick up the change within ~1 second and kill the child process.
+            println!("  (daemon unreachable — forward will stop on next watcher tick)");
         }
     }
 
@@ -775,6 +833,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 // ── Pod scheduling wait ───────────────────────────────────────────────────────
+
 async fn wait_for_pod_scheduled(
     deployment_name: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
