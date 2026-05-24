@@ -425,7 +425,9 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
 
     // ── Mouse-wheel scroll ────────────────────────────────────────────────────
     let mut scroll_delta = 0.0_f32;
-    ui.input(|i| { scroll_delta = i.raw_scroll_delta.y; });
+    if response.hovered() {
+        ui.input(|i| { scroll_delta = i.raw_scroll_delta.y; });
+    }
     if scroll_delta > 0.0 {
         tab.scroll_offset = (tab.scroll_offset + (scroll_delta / cell_h) as usize + 1).min(max_offset);
     } else if scroll_delta < 0.0 {
