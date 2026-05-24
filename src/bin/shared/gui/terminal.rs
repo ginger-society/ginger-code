@@ -40,6 +40,8 @@ pub struct TermPerformer {
     bold:            bool,
     saved_row:       usize,
     saved_col:       usize,
+    scroll_top:      usize,
+    scroll_bottom:   usize,
     scrollback_sink: Option<ScrollbackSink>,
 }
 
@@ -56,6 +58,8 @@ impl TermPerformer {
             bold:            false,
             saved_row:       0,
             saved_col:       0,
+            scroll_top:      0,
+            scroll_bottom:   rows - 1,
             scrollback_sink: None,
         }
     }
@@ -70,16 +74,36 @@ impl TermPerformer {
         self.cols = cols;
         self.grid.resize(rows, vec![Cell::default(); cols]);
         for row in &mut self.grid { row.resize(cols, Cell::default()); }
-        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
-        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.cursor_row    = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col    = self.cursor_col.min(cols.saturating_sub(1));
+        // Reset scroll region on resize — apps will re-send CSI r
+        self.scroll_top    = 0;
+        self.scroll_bottom = rows - 1;
     }
 
     fn scroll_up(&mut self) {
-        let evicted = self.grid.remove(0);
-        if let Some(ref sink) = self.scrollback_sink {
-            sink.lock().push(evicted);
+        if self.scroll_top == 0 && self.scroll_bottom == self.rows - 1 {
+            // Full screen — evict top row to scrollback
+            let evicted = self.grid.remove(0);
+            if let Some(ref sink) = self.scrollback_sink {
+                sink.lock().push(evicted);
+            }
+            self.grid.push(vec![Cell::default(); self.cols]);
+        } else {
+            // Partial region — shift within region only, no scrollback
+            self.grid.remove(self.scroll_top);
+            self.grid.insert(self.scroll_bottom, vec![Cell::default(); self.cols]);
+            self.grid.truncate(self.rows);
         }
-        self.grid.push(vec![Cell::default(); self.cols]);
+    }
+
+    fn scroll_down(&mut self) {
+        // Remove bottom line of region, insert blank at top of region
+        if self.scroll_bottom < self.grid.len() {
+            self.grid.remove(self.scroll_bottom);
+        }
+        self.grid.insert(self.scroll_top, vec![Cell::default(); self.cols]);
+        self.grid.truncate(self.rows);
     }
 
     fn write_char(&mut self, ch: char) {
@@ -87,7 +111,10 @@ impl TermPerformer {
             self.cursor_col  = 0;
             self.cursor_row += 1;
         }
-        if self.cursor_row >= self.rows {
+        if self.cursor_row > self.scroll_bottom {
+            self.scroll_up();
+            self.cursor_row = self.scroll_bottom;
+        } else if self.cursor_row >= self.rows {
             self.scroll_up();
             self.cursor_row = self.rows - 1;
         }
@@ -140,8 +167,12 @@ impl vte::Perform for TermPerformer {
         match byte {
             b'\r' => self.cursor_col = 0,
             b'\n' => {
-                self.cursor_row += 1;
-                if self.cursor_row >= self.rows { self.scroll_up(); self.cursor_row = self.rows - 1; }
+                if self.cursor_row == self.scroll_bottom {
+                    // At bottom of scroll region — scroll up within region
+                    self.scroll_up();
+                } else {
+                    self.cursor_row = (self.cursor_row + 1).min(self.rows - 1);
+                }
             }
             8  => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
             7  => {}
@@ -154,47 +185,168 @@ impl vte::Perform for TermPerformer {
             .map(|sub| sub.first().copied().unwrap_or(0) as i64)
             .collect();
         match action {
-            'A' => { let n = p.first().copied().unwrap_or(1).max(1) as usize; self.cursor_row = self.cursor_row.saturating_sub(n); }
-            'B' => { let n = p.first().copied().unwrap_or(1).max(1) as usize; self.cursor_row = (self.cursor_row + n).min(self.rows - 1); }
-            'C' => { let n = p.first().copied().unwrap_or(1).max(1) as usize; self.cursor_col = (self.cursor_col + n).min(self.cols - 1); }
-            'D' => { let n = p.first().copied().unwrap_or(1).max(1) as usize; self.cursor_col = self.cursor_col.saturating_sub(n); }
+            // ── Cursor movement ───────────────────────────────────────────────
+            'A' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                self.cursor_row = self.cursor_row.saturating_sub(n);
+            }
+            'B' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
+            }
+            'C' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
+            }
+            'D' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+            }
             'H' | 'f' => {
                 let row = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
                 let col = (p.get(1).copied().unwrap_or(1).max(1) - 1) as usize;
                 self.cursor_row = row.min(self.rows - 1);
                 self.cursor_col = col.min(self.cols - 1);
             }
-            'G' => { let col = (p.first().copied().unwrap_or(1).max(1) - 1) as usize; self.cursor_col = col.min(self.cols - 1); }
-            'd' => { let row = (p.first().copied().unwrap_or(1).max(1) - 1) as usize; self.cursor_row = row.min(self.rows - 1); }
+            'G' => {
+                let col = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
+                self.cursor_col = col.min(self.cols - 1);
+            }
+            'd' => {
+                let row = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
+                self.cursor_row = row.min(self.rows - 1);
+            }
+
+            // ── Erase ─────────────────────────────────────────────────────────
             'J' => match p.first().copied().unwrap_or(0) {
                 0 => {
-                    for col in self.cursor_col..self.cols { self.grid[self.cursor_row][col] = Cell::default(); }
-                    for row in (self.cursor_row+1)..self.rows { self.grid[row] = vec![Cell::default(); self.cols]; }
+                    for col in self.cursor_col..self.cols {
+                        self.grid[self.cursor_row][col] = Cell::default();
+                    }
+                    for row in (self.cursor_row + 1)..self.rows {
+                        self.grid[row] = vec![Cell::default(); self.cols];
+                    }
                 }
                 1 => {
-                    for col in 0..=self.cursor_col { self.grid[self.cursor_row][col] = Cell::default(); }
-                    for row in 0..self.cursor_row { self.grid[row] = vec![Cell::default(); self.cols]; }
+                    for col in 0..=self.cursor_col {
+                        self.grid[self.cursor_row][col] = Cell::default();
+                    }
+                    for row in 0..self.cursor_row {
+                        self.grid[row] = vec![Cell::default(); self.cols];
+                    }
                 }
-                2 | 3 => { for row in &mut self.grid { *row = vec![Cell::default(); self.cols]; } }
+                2 | 3 => {
+                    for row in &mut self.grid {
+                        *row = vec![Cell::default(); self.cols];
+                    }
+                }
                 _ => {}
             },
             'K' => match p.first().copied().unwrap_or(0) {
-                0 => { for col in self.cursor_col..self.cols { self.grid[self.cursor_row][col] = Cell::default(); } }
-                1 => { for col in 0..=self.cursor_col { self.grid[self.cursor_row][col] = Cell::default(); } }
-                2 => { self.grid[self.cursor_row] = vec![Cell::default(); self.cols]; }
+                0 => {
+                    for col in self.cursor_col..self.cols {
+                        self.grid[self.cursor_row][col] = Cell::default();
+                    }
+                }
+                1 => {
+                    for col in 0..=self.cursor_col {
+                        self.grid[self.cursor_row][col] = Cell::default();
+                    }
+                }
+                2 => {
+                    self.grid[self.cursor_row] = vec![Cell::default(); self.cols];
+                }
                 _ => {}
             },
+            // Erase P characters in place (no shift)
+            'X' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                let row = &mut self.grid[self.cursor_row];
+                for col in self.cursor_col..(self.cursor_col + n).min(self.cols) {
+                    row[col] = Cell::default();
+                }
+            }
+
+            // ── SGR ───────────────────────────────────────────────────────────
             'm' => self.apply_sgr(&p),
+
+            // ── Cursor save/restore ───────────────────────────────────────────
             's' => { self.saved_row = self.cursor_row; self.saved_col = self.cursor_col; }
             'u' => { self.cursor_row = self.saved_row; self.cursor_col = self.saved_col; }
-            'S' => { let n = p.first().copied().unwrap_or(1).max(1) as usize; for _ in 0..n { self.scroll_up(); } }
+
+            // ── Scroll region (DECSTBM) — the key fix for nano/vim/htop ───────
+            'r' => {
+                let top    = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
+                let bottom = (p.get(1).copied().unwrap_or(self.rows as i64).max(1) - 1) as usize;
+                self.scroll_top    = top.min(self.rows - 1);
+                self.scroll_bottom = bottom.min(self.rows - 1);
+                // DECSTBM homes the cursor to (0,0)
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+            }
+
+            // ── Region scroll ─────────────────────────────────────────────────
+            'S' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n { self.scroll_up(); }
+            }
             'T' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n { self.scroll_down(); }
+            }
+
+            // ── Line insert/delete ────────────────────────────────────────────
+            'L' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
-                    self.grid.insert(0, vec![Cell::default(); self.cols]);
+                    self.grid.insert(self.cursor_row, vec![Cell::default(); self.cols]);
                     self.grid.truncate(self.rows);
                 }
             }
+            'M' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                for _ in 0..n {
+                    if self.cursor_row < self.grid.len() {
+                        self.grid.remove(self.cursor_row);
+                    }
+                    self.grid.push(vec![Cell::default(); self.cols]);
+                }
+            }
+
+            // ── Character insert/delete ───────────────────────────────────────
+            '@' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                let row = &mut self.grid[self.cursor_row];
+                for _ in 0..n {
+                    if row.len() > self.cursor_col {
+                        row.insert(self.cursor_col, Cell::default());
+                        row.truncate(self.cols);
+                    }
+                }
+            }
+            'P' => {
+                let n = p.first().copied().unwrap_or(1).max(1) as usize;
+                let row = &mut self.grid[self.cursor_row];
+                for _ in 0..n {
+                    if self.cursor_col < row.len() {
+                        row.remove(self.cursor_col);
+                        row.push(Cell::default());
+                    }
+                }
+            }
+
+            // ── Repeat last char (REP) ────────────────────────────────────────
+            'b' => {
+                // Some apps use this; safe to ignore for now
+            }
+
+            // ── Private mode sets (cursor hide/show, alt screen, etc.) ────────
+            'h' | 'l' => {
+                // e.g. ?25h = show cursor, ?1049h = alt screen
+                // We don't maintain alt screen but silently ignore to avoid
+                // corrupting the match
+            }
+
             _ => {}
         }
     }
@@ -203,10 +355,19 @@ impl vte::Perform for TermPerformer {
     fn hook(&mut self, _: &vte::Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
     fn unhook(&mut self) {}
+
     fn esc_dispatch(&mut self, _: &[u8], _: bool, byte: u8) {
         match byte {
             b'7' => { self.saved_row = self.cursor_row; self.saved_col = self.cursor_col; }
             b'8' => { self.cursor_row = self.saved_row; self.cursor_col = self.saved_col; }
+            b'M' => {
+                // Reverse index — scroll down if at top of scroll region
+                if self.cursor_row == self.scroll_top {
+                    self.scroll_down();
+                } else {
+                    self.cursor_row = self.cursor_row.saturating_sub(1);
+                }
+            }
             _ => {}
         }
     }
