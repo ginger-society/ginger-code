@@ -323,6 +323,51 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
 
 // ── Terminal pane (single tab) ────────────────────────────────────────────────
 
+fn extract_selection(
+    scrollback: &[Vec<Cell>],
+    live_grid:  &[Vec<Cell>],
+    scrollback_len: usize,
+    term_cols:  usize,
+    start:      (usize, usize),
+    end:        (usize, usize),
+) -> String {
+    let (mut r1, mut c1) = start;
+    let (mut r2, mut c2) = end;
+    if (r1, c1) > (r2, c2) {
+        std::mem::swap(&mut r1, &mut r2);
+        std::mem::swap(&mut c1, &mut c2);
+    }
+
+    let get_row = |abs_row: usize| -> Option<&[Cell]> {
+        if abs_row < scrollback_len {
+            scrollback.get(abs_row).map(|r| r.as_slice())
+        } else {
+            live_grid.get(abs_row - scrollback_len).map(|r| r.as_slice())
+        }
+    };
+
+    let mut out = String::new();
+    for abs_row in r1..=r2 {
+        let col_start = if abs_row == r1 { c1 } else { 0 };
+        let col_end   = if abs_row == r2 { c2 } else { term_cols.saturating_sub(1) };
+
+        if let Some(row) = get_row(abs_row) {
+            let line: String = row.iter()
+                .skip(col_start)
+                .take(col_end - col_start + 1)
+                .map(|c| c.ch)
+                .collect();
+            // Trim trailing spaces from each line
+            out.push_str(line.trim_end());
+        }
+
+        if abs_row < r2 {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Draw one terminal tab.  `tab_idx` is the index into `state.term_tabs`.
 /// Must only be called when `state.right_pane == RightPane::TerminalTab(tab_idx)`.
 pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usize) {
@@ -356,7 +401,7 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
     // ── Resize grid if panel changed size ─────────────────────────────────────
     let available = ui.available_size();
     let new_cols  = (available.x / cell_w).floor() as usize;
-    let new_rows  = ((available.y - 20.0) / cell_h).floor() as usize; // leave room for scroll hint
+    let new_rows  = (available.y  / cell_h).floor() as usize; // leave room for scroll hint
     if new_cols != tab.term_cols || new_rows != tab.term_rows {
         tab.term_cols = new_cols.max(1);
         tab.term_rows = new_rows.max(1);
@@ -466,6 +511,37 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
 
     drop(painter);
 
+    // Re-acquire the painter with an explicit clip to the full response rect
+    let sb_painter = ui.painter_at(response.rect);
+
+    if max_offset > 0 {
+        let sb_w   = 6.0;
+        let sb_x   = response.rect.max.x - sb_w - 2.0;
+        let sb_top = response.rect.min.y;
+        let sb_h   = response.rect.height();
+
+        // Use a fixed virtual depth so the thumb is always a reasonable size
+        // and moves meaningfully even with shallow scrollback
+        let virtual_depth = (max_offset as f32).max(200.0);
+        let thumb_h = (sb_h * (term_rows as f32 / (virtual_depth + term_rows as f32)))
+            .max(20.0)
+            .min(sb_h * 0.3); // never more than 30% of track
+
+        let frac    = scroll_offset as f32 / max_offset as f32;
+        let thumb_y = sb_top + (1.0 - frac) * (sb_h - thumb_h);
+
+        let sb_painter = ui.painter_at(response.rect);
+
+        sb_painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(sb_x, sb_top), egui::vec2(sb_w, sb_h)),
+            3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 12),
+        );
+        sb_painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(sb_x, thumb_y), egui::vec2(sb_w, thumb_h)),
+            3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 80),
+        );
+    }
+
     // ── Keyboard: scroll hotkeys + PTY input ─────────────────────────────────
     let mut to_send: Vec<Vec<u8>> = Vec::new();
 
@@ -545,6 +621,87 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
             let _ = session.writer.write_all(&bytes);
         }
     }
+
+    // ── Selection: mouse drag to select ──────────────────────────────────────
+    // Convert a screen position to (abs_row, col)
+    let pos_to_cell = |pos: egui::Pos2| -> (usize, usize) {
+        let col = ((pos.x - origin.x) / cell_w).floor() as isize;
+        let row = ((pos.y - origin.y) / cell_h).floor() as isize;
+        let col = col.clamp(0, term_cols as isize - 1) as usize;
+        let row = row.clamp(0, term_rows as isize - 1) as usize;
+        let abs_row = window_start + row;
+        (abs_row, col)
+    };
+
+    // Read mouse state
+    let pointer = ui.input(|i| i.pointer.clone());
+
+    if response.hovered() {
+        // Drag start
+        if pointer.button_pressed(egui::PointerButton::Primary) {
+            if let Some(pos) = pointer.interact_pos() {
+                let cell = pos_to_cell(pos);
+                tab.sel_start = Some(cell);
+                tab.sel_end   = Some(cell);
+                tab.dragging  = true;
+            }
+        }
+    }
+
+    // Drag move — update end even if pointer left the rect
+    if tab.dragging {
+        if pointer.button_down(egui::PointerButton::Primary) {
+            if let Some(pos) = pointer.interact_pos() {
+                tab.sel_end = Some(pos_to_cell(pos));
+            }
+        } else {
+            // Button released — copy to clipboard
+            tab.dragging = false;
+            if let (Some(start), Some(end)) = (tab.sel_start, tab.sel_end) {
+                let text = extract_selection(
+                    &scrollback_snap, &live_grid, scrollback_len,
+                    term_cols, start, end,
+                );
+                if !text.is_empty() {
+                    ui.output_mut(|o| o.copied_text = text);
+                }
+            }
+        }
+    }
+
+    // Draw selection highlight
+    if let (Some(start), Some(end)) = (tab.sel_start, tab.sel_end) {
+        let (mut r1, mut c1) = start;
+        let (mut r2, mut c2) = end;
+        // Normalise so r1/c1 is always before r2/c2
+        if (r1, c1) > (r2, c2) {
+            std::mem::swap(&mut r1, &mut r2);
+            std::mem::swap(&mut c1, &mut c2);
+        }
+
+        let sel_color = egui::Color32::from_rgba_premultiplied(80, 120, 200, 80);
+        let painter   = ui.painter_at(response.rect);
+
+        for abs_row in r1..=r2 {
+            // Is this abs_row visible in the current window?
+            if abs_row < window_start || abs_row >= window_start + term_rows {
+                continue;
+            }
+            let screen_row = abs_row - window_start;
+            let col_start  = if abs_row == r1 { c1 } else { 0 };
+            let col_end    = if abs_row == r2 { c2 } else { term_cols.saturating_sub(1) };
+
+            let x1 = origin.x + col_start as f32 * cell_w;
+            let x2 = origin.x + (col_end + 1) as f32 * cell_w;
+            let y1 = origin.y + screen_row as f32 * cell_h;
+
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x1, y1), egui::pos2(x2, y1 + cell_h)),
+                0.0, sel_color,
+            );
+        }
+    }
+
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────

@@ -81,6 +81,9 @@ pub struct TermTab {
     pub scroll_offset:  usize,
     pub term_rows:      usize,
     pub term_cols:      usize,
+    pub sel_start:      Option<(usize, usize)>,
+    pub sel_end:        Option<(usize, usize)>,
+    pub dragging:       bool,
 }
 
 impl TermTab {
@@ -95,6 +98,9 @@ impl TermTab {
             scroll_offset:  0,
             term_rows:      rows,
             term_cols:      cols,
+            sel_start:      None,
+            sel_end:        None,
+            dragging:       false,
         }
     }
 }
