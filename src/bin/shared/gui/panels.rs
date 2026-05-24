@@ -489,33 +489,32 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         );
     }
 
-    // ── Scrollbar ─────────────────────────────────────────────────────────────
+   // ── Scrollbar ─────────────────────────────────────────────────────────────
     if max_offset > 0 {
-        let sb_w      = 6.0;
-        let sb_x      = response.rect.max.x - sb_w - 2.0;
-        let sb_top    = response.rect.min.y;
-        let sb_h      = response.rect.height();
+        let sb_w       = 6.0;
+        let sb_x       = response.rect.max.x - sb_w - 2.0;
+        let sb_top     = response.rect.min.y;
+        let sb_h       = response.rect.height();
         let sb_painter = ui.painter_at(response.rect);
 
-        // Track
+        // Track — dark green tint to match the theme, clearly visible
         sb_painter.rect_filled(
             egui::Rect::from_min_size(egui::pos2(sb_x, sb_top), egui::vec2(sb_w, sb_h)),
-            3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 12),
+            3.0, egui::Color32::from_rgb(30, 45, 30),
         );
 
-        // Thumb: virtual_depth normalises shallow scrollback so thumb is always visible
+        // Thumb
         let virtual_depth = (max_offset as f32).max(200.0);
         let thumb_h = (sb_h * (term_rows as f32 / (virtual_depth + term_rows as f32)))
             .max(20.0)
             .min(sb_h * 0.3);
 
-        // frac=0 → live/bottom → thumb at bottom; frac=1 → top of scrollback → thumb at top
         let frac    = scroll_offset as f32 / max_offset as f32;
         let thumb_y = sb_top + (1.0 - frac) * (sb_h - thumb_h);
 
         sb_painter.rect_filled(
             egui::Rect::from_min_size(egui::pos2(sb_x, thumb_y), egui::vec2(sb_w, thumb_h)),
-            3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 80),
+            3.0, egui::Color32::from_rgb(0, 180, 50),
         );
     }
 
