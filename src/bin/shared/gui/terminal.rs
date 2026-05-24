@@ -1,6 +1,6 @@
 use eframe::egui;
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
@@ -24,7 +24,6 @@ impl Default for Cell {
 }
 
 // ── Scrollback sink ───────────────────────────────────────────────────────────
-// The performer hands evicted rows to this; the tab stores them.
 
 pub type ScrollbackSink = Arc<Mutex<Vec<Vec<Cell>>>>;
 
@@ -41,7 +40,6 @@ pub struct TermPerformer {
     bold:            bool,
     saved_row:       usize,
     saved_col:       usize,
-    /// Shared with the owning `TermTab` so scroll-off rows accumulate there.
     scrollback_sink: Option<ScrollbackSink>,
 }
 
@@ -78,7 +76,6 @@ impl TermPerformer {
 
     fn scroll_up(&mut self) {
         let evicted = self.grid.remove(0);
-        // Push evicted row into scrollback before creating new blank row.
         if let Some(ref sink) = self.scrollback_sink {
             sink.lock().push(evicted);
         }
@@ -218,8 +215,19 @@ impl vte::Perform for TermPerformer {
 // ── SSH session ───────────────────────────────────────────────────────────────
 
 pub struct SshSession {
-    pub writer: Box<dyn Write + Send>,
-    _pty_pair:  portable_pty::PtyPair,
+    pub writer:   Box<dyn Write + Send>,
+    _pty_pair:    portable_pty::PtyPair,
+}
+
+impl SshSession {
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let _ = self._pty_pair.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width:  0,
+            pixel_height: 0,
+        });
+    }
 }
 
 pub fn spawn_ssh(
@@ -237,9 +245,9 @@ pub fn spawn_ssh(
     cmd.arg("StrictHostKeyChecking=accept-new");
     cmd.arg(host);
 
-    let _child       = pair.slave.spawn_command(cmd)?;
-    let writer       = pair.master.take_writer()?;
-    let mut reader   = pair.master.try_clone_reader()?;
+    let _child     = pair.slave.spawn_command(cmd)?;
+    let writer     = pair.master.take_writer()?;
+    let mut reader = pair.master.try_clone_reader()?;
 
     thread::spawn(move || {
         let mut parser = vte::Parser::new();

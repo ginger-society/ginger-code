@@ -135,23 +135,20 @@ pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) {
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
-/// What the user did this frame. Returned to app.rs for processing.
 pub enum TabBarAction {
     SwitchToLogs,
     SwitchToTerm(usize),
-    /// "+" button: open new terminal for current service.
     NewTerm,
-    /// "×" on a terminal tab.
     CloseTerm(usize),
 }
 
-/// Draw the Logs tab + all terminal tabs + optional "+" button.
-/// Returns an action if the user clicked something.
 pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction> {
-    const TAB_H:    f32 = 28.0;
-    const LOGS_W:   f32 = 70.0;
-    const TERM_W:   f32 = 120.0;  // wider to fit label + ×
-    const PLUS_W:   f32 = 28.0;
+    const TAB_H:  f32 = 28.0;
+    const LOGS_W: f32 = 70.0;
+    const TERM_W: f32 = 150.0;
+    const PLUS_W: f32 = 28.0;
+    const CLOSE_W:     f32 = 30.0;
+    const LABEL_PAD_L: f32 = 10.0;
 
     let (bar_rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), TAB_H), egui::Sense::hover(),
@@ -168,9 +165,13 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
         if clicked && !active { action = Some(TabBarAction::SwitchToLogs); }
 
         let painter = ui.painter();
-        painter.rect_filled(tab_rect, 0.0, if active { egui::Color32::from_rgb(28,28,28) } else { COLOR_TAB_BAR });
+        painter.rect_filled(tab_rect, 0.0,
+            if active { egui::Color32::from_rgb(28, 28, 28) } else { COLOR_TAB_BAR });
         if active {
-            painter.line_segment([tab_rect.left_bottom(), tab_rect.right_bottom()], egui::Stroke::new(2.0, COLOR_TAB_ACTIVE));
+            painter.line_segment(
+                [tab_rect.left_bottom(), tab_rect.right_bottom()],
+                egui::Stroke::new(2.0, COLOR_TAB_ACTIVE),
+            );
         }
         painter.text(tab_rect.center(), egui::Align2::CENTER_CENTER, "Logs",
             egui::FontId::new(12.0, egui::FontFamily::Monospace),
@@ -179,10 +180,6 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
     }
 
     // ── Terminal tabs ─────────────────────────────────────────────────────────
-    const CLOSE_W: f32 = 30.0;   // right-side zone reserved exclusively for ×
-    const LABEL_PAD_L: f32 = 10.0;
-    const LABEL_PAD_R: f32 = CLOSE_W + 6.0; // keep text at least this far from right edge
-
     for (i, tab) in state.term_tabs.iter().enumerate() {
         let tab_rect = egui::Rect::from_min_size(
             egui::pos2(x, bar_rect.min.y),
@@ -190,10 +187,7 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
         );
         let active = state.right_pane == RightPane::TerminalTab(i);
 
-        // ── Non-overlapping hit zones ─────────────────────────────────────────
-        // close_zone is the rightmost CLOSE_W pixels of the tab.
-        // label_zone is everything to the left of it.
-        // Allocate close_zone FIRST so it wins the hit-test race.
+        // close_zone allocated FIRST to win hit-test priority
         let close_zone = egui::Rect::from_min_max(
             egui::pos2(tab_rect.max.x - CLOSE_W, tab_rect.min.y),
             tab_rect.max,
@@ -212,7 +206,6 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
             action = Some(TabBarAction::SwitchToTerm(i));
         }
 
-        // ── Paint ─────────────────────────────────────────────────────────────
         let painter = ui.painter();
         let bg = if active { egui::Color32::from_rgb(28, 28, 28) } else { COLOR_TAB_BAR };
         painter.rect_filled(tab_rect, 0.0, bg);
@@ -224,24 +217,23 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
             );
         }
 
-        // Separator line between label zone and close zone
+        // Separator between label and close zone
         painter.line_segment(
             [close_zone.left_top(), close_zone.left_bottom()],
             egui::Stroke::new(0.5, COLOR_BORDER),
         );
 
-        // Label — truncate with ellipsis so it never reaches the × zone
-        let label_clip = label_zone.shrink2(egui::vec2(0.0, 2.0)); // tiny vertical breathing room
-        let clipped_painter = ui.painter().with_clip_rect(label_clip);
-        clipped_painter.text(
+        // Label clipped to label_zone — no truncation needed
+        let label_clip = label_zone.shrink2(egui::vec2(0.0, 2.0));
+        ui.painter().with_clip_rect(label_clip).text(
             egui::pos2(tab_rect.min.x + LABEL_PAD_L, tab_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            &tab.label,                          // raw label, untouched
+            &tab.label,
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
             if active { egui::Color32::WHITE } else { COLOR_TAB_INACTIVE },
         );
 
-        // Close × — centred in its own zone
+        // Close ×
         let x_color = if close_resp.hovered() { egui::Color32::WHITE } else { COLOR_DIM };
         painter.text(
             close_zone.center(),
@@ -254,29 +246,33 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
         x += TERM_W;
     }
 
-    // ── "+" button (only if under cap) ───────────────────────────────────────
+    // ── "+" button ────────────────────────────────────────────────────────────
     let svc_has_host = state.services[state.selected_idx].ssh_host.is_some();
     if state.term_tabs.len() < MAX_TERM_TABS && svc_has_host {
-        let plus_rect = egui::Rect::from_min_size(egui::pos2(x, bar_rect.min.y), egui::vec2(PLUS_W, TAB_H));
-        let clicked   = ui.allocate_rect(plus_rect, egui::Sense::click()).clicked();
+        let plus_rect = egui::Rect::from_min_size(
+            egui::pos2(x, bar_rect.min.y), egui::vec2(PLUS_W, TAB_H),
+        );
+        let clicked = ui.allocate_rect(plus_rect, egui::Sense::click()).clicked();
         if clicked { action = Some(TabBarAction::NewTerm); }
 
         let painter = ui.painter();
         painter.rect_filled(plus_rect, 0.0, COLOR_TAB_BAR);
         painter.text(plus_rect.center(), egui::Align2::CENTER_CENTER, "+",
             egui::FontId::new(16.0, egui::FontFamily::Monospace), COLOR_MUTED);
+        x += PLUS_W;
     }
 
-    // ── Background fill + bottom border for bar ───────────────────────────────
+    // ── Fill remaining bar + bottom border ────────────────────────────────────
     {
         let painter = ui.painter();
-        // Fill gap to the right of all tabs
-        let remaining = egui::Rect::from_min_max(egui::pos2(x + PLUS_W, bar_rect.min.y), bar_rect.max);
+        let remaining = egui::Rect::from_min_max(egui::pos2(x, bar_rect.min.y), bar_rect.max);
         if remaining.width() > 0.0 {
             painter.rect_filled(remaining, 0.0, COLOR_TAB_BAR);
         }
-        painter.line_segment([bar_rect.left_bottom(), bar_rect.right_bottom()],
-            egui::Stroke::new(0.5, COLOR_BORDER));
+        painter.line_segment(
+            [bar_rect.left_bottom(), bar_rect.right_bottom()],
+            egui::Stroke::new(0.5, COLOR_BORDER),
+        );
     }
 
     action
@@ -321,15 +317,15 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
         });
 }
 
-// ── Terminal pane (single tab) ────────────────────────────────────────────────
+// ── Selection helper ──────────────────────────────────────────────────────────
 
 fn extract_selection(
-    scrollback: &[Vec<Cell>],
-    live_grid:  &[Vec<Cell>],
+    scrollback:     &[Vec<Cell>],
+    live_grid:      &[Vec<Cell>],
     scrollback_len: usize,
-    term_cols:  usize,
-    start:      (usize, usize),
-    end:        (usize, usize),
+    term_cols:      usize,
+    start:          (usize, usize),
+    end:            (usize, usize),
 ) -> String {
     let (mut r1, mut c1) = start;
     let (mut r2, mut c2) = end;
@@ -357,19 +353,15 @@ fn extract_selection(
                 .take(col_end - col_start + 1)
                 .map(|c| c.ch)
                 .collect();
-            // Trim trailing spaces from each line
             out.push_str(line.trim_end());
         }
-
-        if abs_row < r2 {
-            out.push('\n');
-        }
+        if abs_row < r2 { out.push('\n'); }
     }
     out
 }
 
-/// Draw one terminal tab.  `tab_idx` is the index into `state.term_tabs`.
-/// Must only be called when `state.right_pane == RightPane::TerminalTab(tab_idx)`.
+// ── Terminal pane ─────────────────────────────────────────────────────────────
+
 pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usize) {
     let font_size = state.font_size;
     let cell_w    = state.cell_w;
@@ -398,67 +390,51 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         TermState::Connected(_) => {}
     }
 
-    // ── Resize grid if panel changed size ─────────────────────────────────────
-    let available = ui.available_size();
-    let new_cols  = (available.x / cell_w).floor() as usize;
-    let new_rows  = (available.y  / cell_h).floor() as usize; // leave room for scroll hint
+    // ── Allocate painter first — derive grid from actual rect ─────────────────
+    let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+    let origin = response.rect.min;
+
+    let new_cols = (response.rect.width()  / cell_w).floor() as usize;
+    let new_rows = (response.rect.height() / cell_h).floor() as usize;
     if new_cols != tab.term_cols || new_rows != tab.term_rows {
         tab.term_cols = new_cols.max(1);
         tab.term_rows = new_rows.max(1);
         tab.performer.lock().resize(tab.term_rows, tab.term_cols);
+        if let TermState::Connected(ref session) = tab.state {
+            session.resize(tab.term_rows as u16, tab.term_cols as u16);
+        }
     }
 
-    let term_cols  = tab.term_cols;
-    let term_rows  = tab.term_rows;
+    let term_cols = tab.term_cols;
+    let term_rows = tab.term_rows;
 
-    // ── Build the combined scrollback + live view ─────────────────────────────
-    // We snapshot both while the performer is locked.
+    painter.rect_filled(response.rect, 0.0, COLOR_BG);
+
+    // ── Snapshot grid + scrollback ────────────────────────────────────────────
     let (live_grid, cursor_row, cursor_col, scrollback_len) = {
         let p = tab.performer.lock();
         (p.grid.clone(), p.cursor_row, p.cursor_col, tab.scrollback.len())
     };
     let scrollback_snap = tab.scrollback.clone();
 
-    let total_rows  = scrollback_len + term_rows;
-    // scroll_offset = 0 means "at bottom"; max = scrollback_len
-    let max_offset  = scrollback_len;
-    // Clamp current offset
+    let total_rows    = scrollback_len + term_rows;
+    let max_offset    = scrollback_len;
     if tab.scroll_offset > max_offset { tab.scroll_offset = max_offset; }
-    let scroll_offset = tab.scroll_offset;
-    let at_bottom     = scroll_offset == 0;
+    let at_bottom     = tab.scroll_offset == 0;
+    let window_start  = total_rows.saturating_sub(term_rows + tab.scroll_offset);
 
-    // The window of rows we will render (term_rows tall):
-    //   row 0 of the window = total_rows - term_rows - scroll_offset
-    let window_start = (total_rows).saturating_sub(term_rows + scroll_offset);
-
-    // ── Scroll area (mouse-wheel + vertical scrollbar) ────────────────────────
-    // We manage scroll_offset ourselves; egui::ScrollArea just captures wheel.
-    let scroll_area_id = egui::Id::new(("term_scroll", tab_idx));
+    // ── Mouse-wheel scroll ────────────────────────────────────────────────────
     let mut scroll_delta = 0.0_f32;
-    ui.input(|i| {
-        // Only capture if the pointer is over our future painter rect.
-        // We check globally here; the painter check below will also guard input.
-        scroll_delta = i.raw_scroll_delta.y;
-    });
+    ui.input(|i| { scroll_delta = i.raw_scroll_delta.y; });
     if scroll_delta > 0.0 {
-        // Scroll up (into scrollback)
-        tab.scroll_offset = (tab.scroll_offset + (scroll_delta / cell_h) as usize + 1)
-            .min(max_offset);
+        tab.scroll_offset = (tab.scroll_offset + (scroll_delta / cell_h) as usize + 1).min(max_offset);
     } else if scroll_delta < 0.0 {
-        // Scroll down (towards live)
         let steps = (-scroll_delta / cell_h) as usize + 1;
         tab.scroll_offset = tab.scroll_offset.saturating_sub(steps);
     }
-    let scroll_offset = tab.scroll_offset; // re-read after update
+    let scroll_offset = tab.scroll_offset;
 
-    // ── Allocate painter ──────────────────────────────────────────────────────
-    let term_size = egui::vec2(term_cols as f32 * cell_w, term_rows as f32 * cell_h);
-    let (response, painter) = ui.allocate_painter(term_size, egui::Sense::click_and_drag());
-    painter.rect_filled(response.rect, 0.0, COLOR_BG);
-
-    let origin = response.rect.min;
-
-    // ── Render rows ───────────────────────────────────────────────────────────
+    // ── Render cells ──────────────────────────────────────────────────────────
     for r in 0..term_rows {
         let abs_row = window_start + r;
         let row: &[Cell] = if abs_row < scrollback_len {
@@ -477,7 +453,6 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
                 painter.rect_filled(cell_rect, 0.0, cell.bg);
             }
 
-            // Show cursor only when at bottom (live view)
             let is_cursor = at_bottom
                 && abs_row == scrollback_len + cursor_row
                 && c == cursor_col
@@ -498,51 +473,55 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         }
     }
 
-    // ── Scrollback indicator (top-right corner overlay) ───────────────────────
+    // ── Scrollback indicator overlay ──────────────────────────────────────────
     if scroll_offset > 0 {
-        let label = format!("↑ {}↑ scroll — PgDn / End to return", scroll_offset);
+        let label = format!("↑ {} rows — PgDn / Shift+End to return", scroll_offset);
         painter.rect_filled(
             egui::Rect::from_min_size(origin, egui::vec2(label.len() as f32 * cell_w * 0.65 + 8.0, cell_h + 2.0)),
             2.0, egui::Color32::from_rgba_premultiplied(40, 40, 40, 200),
         );
-        painter.text(egui::pos2(origin.x + 4.0, origin.y + 1.0), egui::Align2::LEFT_TOP,
-            &label, egui::FontId::new(font_size * 0.85, egui::FontFamily::Monospace), COLOR_YELLOW);
+        painter.text(
+            egui::pos2(origin.x + 4.0, origin.y + 1.0),
+            egui::Align2::LEFT_TOP,
+            &label,
+            egui::FontId::new(font_size * 0.85, egui::FontFamily::Monospace),
+            COLOR_YELLOW,
+        );
     }
 
-    drop(painter);
-
-    // Re-acquire the painter with an explicit clip to the full response rect
-    let sb_painter = ui.painter_at(response.rect);
-
+    // ── Scrollbar ─────────────────────────────────────────────────────────────
     if max_offset > 0 {
-        let sb_w   = 6.0;
-        let sb_x   = response.rect.max.x - sb_w - 2.0;
-        let sb_top = response.rect.min.y;
-        let sb_h   = response.rect.height();
-
-        // Use a fixed virtual depth so the thumb is always a reasonable size
-        // and moves meaningfully even with shallow scrollback
-        let virtual_depth = (max_offset as f32).max(200.0);
-        let thumb_h = (sb_h * (term_rows as f32 / (virtual_depth + term_rows as f32)))
-            .max(20.0)
-            .min(sb_h * 0.3); // never more than 30% of track
-
-        let frac    = scroll_offset as f32 / max_offset as f32;
-        let thumb_y = sb_top + (1.0 - frac) * (sb_h - thumb_h);
-
+        let sb_w      = 6.0;
+        let sb_x      = response.rect.max.x - sb_w - 2.0;
+        let sb_top    = response.rect.min.y;
+        let sb_h      = response.rect.height();
         let sb_painter = ui.painter_at(response.rect);
 
+        // Track
         sb_painter.rect_filled(
             egui::Rect::from_min_size(egui::pos2(sb_x, sb_top), egui::vec2(sb_w, sb_h)),
             3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 12),
         );
+
+        // Thumb: virtual_depth normalises shallow scrollback so thumb is always visible
+        let virtual_depth = (max_offset as f32).max(200.0);
+        let thumb_h = (sb_h * (term_rows as f32 / (virtual_depth + term_rows as f32)))
+            .max(20.0)
+            .min(sb_h * 0.3);
+
+        // frac=0 → live/bottom → thumb at bottom; frac=1 → top of scrollback → thumb at top
+        let frac    = scroll_offset as f32 / max_offset as f32;
+        let thumb_y = sb_top + (1.0 - frac) * (sb_h - thumb_h);
+
         sb_painter.rect_filled(
             egui::Rect::from_min_size(egui::pos2(sb_x, thumb_y), egui::vec2(sb_w, thumb_h)),
             3.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 80),
         );
     }
 
-    // ── Keyboard: scroll hotkeys + PTY input ─────────────────────────────────
+    drop(painter);
+
+    // ── Keyboard input ────────────────────────────────────────────────────────
     let mut to_send: Vec<Vec<u8>> = Vec::new();
 
     if response.hovered() {
@@ -550,17 +529,17 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
-                        // Any text input jumps back to live
                         tab.scroll_offset = 0;
+                        // Clear selection on any input
+                        tab.sel_start = None;
+                        tab.sel_end   = None;
                         to_send.push(text.as_bytes().to_vec());
                     }
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                        // Scroll keys (don't send to PTY)
                         match key {
                             egui::Key::PageUp => {
-                                tab.scroll_offset =
-                                    (tab.scroll_offset + term_rows).min(max_offset);
-                                return; // don't forward
+                                tab.scroll_offset = (tab.scroll_offset + term_rows).min(max_offset);
+                                return;
                             }
                             egui::Key::PageDown => {
                                 tab.scroll_offset = tab.scroll_offset.saturating_sub(term_rows);
@@ -577,8 +556,11 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
                             _ => {}
                         }
 
-                        // PTY keys
-                        tab.scroll_offset = 0; // any PTY key → snap to live
+                        // Clear selection on PTY key
+                        tab.sel_start = None;
+                        tab.sel_end   = None;
+                        tab.scroll_offset = 0;
+
                         let bytes: Option<&[u8]> = match key {
                             egui::Key::Enter      => Some(b"\r"),
                             egui::Key::Backspace  => Some(b"\x7f"),
@@ -622,22 +604,18 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         }
     }
 
-    // ── Selection: mouse drag to select ──────────────────────────────────────
-    // Convert a screen position to (abs_row, col)
+    // ── Mouse selection ───────────────────────────────────────────────────────
     let pos_to_cell = |pos: egui::Pos2| -> (usize, usize) {
         let col = ((pos.x - origin.x) / cell_w).floor() as isize;
         let row = ((pos.y - origin.y) / cell_h).floor() as isize;
         let col = col.clamp(0, term_cols as isize - 1) as usize;
         let row = row.clamp(0, term_rows as isize - 1) as usize;
-        let abs_row = window_start + row;
-        (abs_row, col)
+        (window_start + row, col)
     };
 
-    // Read mouse state
     let pointer = ui.input(|i| i.pointer.clone());
 
     if response.hovered() {
-        // Drag start
         if pointer.button_pressed(egui::PointerButton::Primary) {
             if let Some(pos) = pointer.interact_pos() {
                 let cell = pos_to_cell(pos);
@@ -648,14 +626,12 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         }
     }
 
-    // Drag move — update end even if pointer left the rect
     if tab.dragging {
         if pointer.button_down(egui::PointerButton::Primary) {
             if let Some(pos) = pointer.interact_pos() {
                 tab.sel_end = Some(pos_to_cell(pos));
             }
         } else {
-            // Button released — copy to clipboard
             tab.dragging = false;
             if let (Some(start), Some(end)) = (tab.sel_start, tab.sel_end) {
                 let text = extract_selection(
@@ -673,20 +649,16 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
     if let (Some(start), Some(end)) = (tab.sel_start, tab.sel_end) {
         let (mut r1, mut c1) = start;
         let (mut r2, mut c2) = end;
-        // Normalise so r1/c1 is always before r2/c2
         if (r1, c1) > (r2, c2) {
             std::mem::swap(&mut r1, &mut r2);
             std::mem::swap(&mut c1, &mut c2);
         }
 
-        let sel_color = egui::Color32::from_rgba_premultiplied(80, 120, 200, 80);
-        let painter   = ui.painter_at(response.rect);
+        let sel_color  = egui::Color32::from_rgba_premultiplied(80, 120, 200, 80);
+        let sel_painter = ui.painter_at(response.rect);
 
         for abs_row in r1..=r2 {
-            // Is this abs_row visible in the current window?
-            if abs_row < window_start || abs_row >= window_start + term_rows {
-                continue;
-            }
+            if abs_row < window_start || abs_row >= window_start + term_rows { continue; }
             let screen_row = abs_row - window_start;
             let col_start  = if abs_row == r1 { c1 } else { 0 };
             let col_end    = if abs_row == r2 { c2 } else { term_cols.saturating_sub(1) };
@@ -695,13 +667,12 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
             let x2 = origin.x + (col_end + 1) as f32 * cell_w;
             let y1 = origin.y + screen_row as f32 * cell_h;
 
-            painter.rect_filled(
+            sel_painter.rect_filled(
                 egui::Rect::from_min_max(egui::pos2(x1, y1), egui::pos2(x2, y1 + cell_h)),
                 0.0, sel_color,
             );
         }
     }
-
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -720,7 +691,7 @@ pub fn draw_statusbar(state: &AppState, ui: &mut egui::Ui) {
                     format!("  ● {}  {}×{}", tab.label, tab.term_cols, tab.term_rows),
                     COLOR_TAB_ACTIVE,
                 ),
-                TermState::Error(e)     => (format!("  ✗ {}", e), COLOR_RED),
+                TermState::Error(e) => (format!("  ✗ {}", e), COLOR_RED),
             }
         } else {
             ("".to_string(), COLOR_DIM)
