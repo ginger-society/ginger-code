@@ -1,11 +1,11 @@
 // src/tray.rs
-use crate::{Config, ForwardStatus, StateMap};
+use crate::{Config, DeploymentEntry, ForwardStatus, StateMap};
 use resvg::{tiny_skia, usvg};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tray_icon::{
-    menu::{Menu, MenuItem, MenuEvent},
+    menu::{Menu, MenuItem, MenuEvent, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
 use winit::{
@@ -56,12 +56,144 @@ fn make_icon(svg: &str) -> Icon {
     Icon::from_rgba(pixmap.take(), 22, 22).expect("icon")
 }
 
-// Count connected vs total using config as the source of truth for total,
-// and state_map for live status. This ensures the tray tooltip and the
-// List response always agree, since both are now driven by config order.
+// ── Dashboard launcher ────────────────────────────────────────────────────────
+
+const DASHBOARD_BIN: &str =
+    "/Users/pradeepyadav/Documents/ginger-society/ginger-code/target/debug/ginger-code-cli";
+
+fn open_dashboard() {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                DASHBOARD_BIN
+            ),
+        ])
+        .spawn();
+
+    #[cfg(target_os = "linux")]
+    let result = {
+        // Try common terminal emulators in order of preference
+        let terminals: &[(&str, &[&str])] = &[
+            ("gnome-terminal", &["--", DASHBOARD_BIN] as &[&str]),
+            ("xterm",          &["-e", DASHBOARD_BIN]),
+            ("konsole",        &["-e", DASHBOARD_BIN]),
+            ("xfce4-terminal", &["-e", DASHBOARD_BIN]),
+        ];
+
+        let mut res = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no terminal found"));
+        for (term, args) in terminals {
+            match std::process::Command::new(term).args(*args).spawn() {
+                Ok(child) => { res = Ok(child); break; }
+                Err(_)    => continue,
+            }
+        }
+        res
+    };
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/c", "start", "cmd", "/k", DASHBOARD_BIN])
+        .spawn();
+
+    match result {
+        Ok(_)  => println!("[ginger-code] launched dashboard in new terminal"),
+        Err(e) => eprintln!("[ginger-code] failed to launch dashboard: {e}"),
+    }
+}
+
+// ── VS Code launcher (placeholder) ────────────────────────────────────────────
+
+fn open_vscode(deployment_name: &str, forwarding_port: u16) {
+    // TODO: open VS Code connected to localhost:{forwarding_port} via Remote-SSH
+    println!("[ginger-code] open_vscode called for '{}' on port {}", deployment_name, forwarding_port);
+}
+
+// ── Menu snapshot — used to detect when a rebuild is needed ──────────────────
+
+#[derive(PartialEq, Clone)]
+struct MenuSnapshot {
+    // Each entry is (name, is_connected) so we rebuild whenever
+    // the deployment list changes OR any connection status changes.
+    entries: Vec<(String, bool)>,
+}
+
+impl MenuSnapshot {
+    fn from(
+        cfg: &[DeploymentEntry],
+        map: &std::collections::HashMap<String, crate::ForwardState>,
+    ) -> Self {
+        let entries = cfg.iter().map(|e| {
+            let connected = map.get(&e.deployment_name)
+                .map_or(false, |fw| fw.status == ForwardStatus::Connected);
+            (e.deployment_name.clone(), connected)
+        }).collect();
+        Self { entries }
+    }
+}
+
+// ── Menu builder ─────────────────────────────────────────────────────────────
+
+struct BuiltMenu {
+    menu:            Menu,
+    dashboard_id:    tray_icon::menu::MenuId,
+    // (MenuId, deployment_name, forwarding_port) for each deployment item
+    deployment_ids:  Vec<(tray_icon::menu::MenuId, String, u16)>,
+    quit_id:         tray_icon::menu::MenuId,
+}
+
+fn build_menu(
+    cfg: &[DeploymentEntry],
+    map: &std::collections::HashMap<String, crate::ForwardState>,
+) -> BuiltMenu {
+    let menu = Menu::new();
+
+    // ── Static top item ───────────────────────────────────────────────────────
+    let dashboard_item = MenuItem::new("  Open Dashboard  ", true, None);
+    let dashboard_id   = dashboard_item.id().clone();
+    menu.append(&dashboard_item).unwrap();
+
+    // Separator between dashboard and deployments (always shown)
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+
+    // ── Dynamic deployment items ──────────────────────────────────────────────
+    let mut deployment_ids = Vec::new();
+
+    for entry in cfg {
+        let connected = map.get(&entry.deployment_name)
+            .map_or(false, |fw| fw.status == ForwardStatus::Connected);
+
+        // Label: "  ● deployment-name  " with padding on each side.
+        // The bullet gives a quick visual status cue alongside the
+        // enabled state which mutes disconnected items automatically.
+        let bullet = if connected { "●" } else { "○" };
+        let label  = format!("  {}  {}  ", bullet, entry.deployment_name);
+
+        // enabled=true only when connected — on macOS this grays out the
+        // text and prevents clicks when the tunnel is not up.
+        let item = MenuItem::new(&label, connected, None);
+        let id   = item.id().clone();
+        menu.append(&item).unwrap();
+        deployment_ids.push((id, entry.deployment_name.clone(), entry.forwarding_port));
+    }
+
+    // Separator above Quit
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+
+    let quit_item = MenuItem::new("Quit ginger-code", true, None);
+    let quit_id   = quit_item.id().clone();
+    menu.append(&quit_item).unwrap();
+
+    BuiltMenu { menu, dashboard_id, deployment_ids, quit_id }
+}
+
+// ── Tray state helpers ────────────────────────────────────────────────────────
+
 fn compute_tray_state(
     map: &std::collections::HashMap<String, crate::ForwardState>,
-    cfg_deployments: &[crate::DeploymentEntry],
+    cfg_deployments: &[DeploymentEntry],
 ) -> (TrayState, usize, usize) {
     let total = cfg_deployments.len();
     if total == 0 { return (TrayState::AllConnected, 0, 0); }
@@ -89,18 +221,24 @@ fn tooltip(connected: usize, total: usize) -> String {
     format!("ginger-code — {}/{} connected", connected, total)
 }
 
+// ── TrayApp ───────────────────────────────────────────────────────────────────
+
 struct TrayApp {
-    state_map:  StateMap,
-    shutdown:   Arc<AtomicBool>,
-    sock_path:  PathBuf,
-    cfg_path:   PathBuf,
-    quit_id:    tray_icon::menu::MenuId,
-    _tray:      tray_icon::TrayIcon,
-    icon_green: Icon,
-    icon_amber: Icon,
-    icon_red:   Icon,
-    last_state: TrayState,
-    last_tick:  std::time::Instant,
+    state_map:       StateMap,
+    shutdown:        Arc<AtomicBool>,
+    sock_path:       PathBuf,
+    cfg_path:        PathBuf,
+    _tray:           tray_icon::TrayIcon,
+    icon_green:      Icon,
+    icon_amber:      Icon,
+    icon_red:        Icon,
+    last_state:      TrayState,
+    last_tick:       std::time::Instant,
+    // Live menu bookkeeping — rebuilt whenever snapshot changes
+    dashboard_id:    tray_icon::menu::MenuId,
+    deployment_ids:  Vec<(tray_icon::menu::MenuId, String, u16)>,
+    quit_id:         tray_icon::menu::MenuId,
+    last_snapshot:   MenuSnapshot,
 }
 
 impl TrayApp {
@@ -114,17 +252,22 @@ impl TrayApp {
         let icon_amber = make_icon(ICON_AMBER);
         let icon_red   = make_icon(ICON_RED);
 
-        let quit_item = MenuItem::new("Quit ginger-code", true, None);
-        let quit_id   = quit_item.id().clone();
-        let menu = Menu::new();
-        menu.append(&quit_item).unwrap();
-
-        // Evaluate real state before building the tray so the initial icon is correct
+        let cfg = Config::load(&cfg_path);
         let (init_state, connected, total) = {
             let map = state_map.lock().unwrap();
-            let cfg = Config::load(&cfg_path);
             compute_tray_state(&map, &cfg.deployments)
         };
+
+        let snapshot = {
+            let map = state_map.lock().unwrap();
+            MenuSnapshot::from(&cfg.deployments, &map)
+        };
+
+        let built = {
+            let map = state_map.lock().unwrap();
+            build_menu(&cfg.deployments, &map)
+        };
+
         let init_icon = match init_state {
             TrayState::AllConnected => icon_green.clone(),
             TrayState::Partial      => icon_amber.clone(),
@@ -132,17 +275,22 @@ impl TrayApp {
         };
 
         let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(built.menu))
             .with_icon(init_icon)
             .with_tooltip(tooltip(connected, total))
             .build()
             .expect("tray icon");
 
         Self {
-            state_map, shutdown, sock_path, cfg_path, quit_id, _tray: tray,
+            state_map, shutdown, sock_path, cfg_path,
+            _tray: tray,
             icon_green, icon_amber, icon_red,
             last_state: init_state,
             last_tick: std::time::Instant::now(),
+            dashboard_id: built.dashboard_id,
+            deployment_ids: built.deployment_ids,
+            quit_id: built.quit_id,
+            last_snapshot: snapshot,
         }
     }
 }
@@ -167,19 +315,49 @@ impl ApplicationHandler for TrayApp {
                 event_loop.exit();
                 return;
             }
+
+            if ev.id == self.dashboard_id {
+                open_dashboard();
+                continue;
+            }
+
+            // Check if it's a deployment item click
+            for (id, name, port) in &self.deployment_ids {
+                if ev.id == *id {
+                    open_vscode(name, *port);
+                    break;
+                }
+            }
         }
 
-        // Update icon/tooltip once per second
+        // Update icon, tooltip and menu once per second
         if self.last_tick.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tick = std::time::Instant::now();
 
-            // Load config here so tooltip total matches List response total exactly
             let cfg = Config::load(&self.cfg_path);
-            let (state, connected, total) = {
+            let (state, connected, total, snapshot) = {
                 let map = self.state_map.lock().unwrap();
-                compute_tray_state(&map, &cfg.deployments)
+                let (state, connected, total) = compute_tray_state(&map, &cfg.deployments);
+                let snapshot = MenuSnapshot::from(&cfg.deployments, &map);
+                (state, connected, total, snapshot)
             };
 
+            // Rebuild menu only when something actually changed — avoids
+            // unnecessary flicker on macOS where menu rebuilds can cause
+            // brief visual artifacts.
+            if snapshot != self.last_snapshot {
+                let built = {
+                    let map = self.state_map.lock().unwrap();
+                    build_menu(&cfg.deployments, &map)
+                };
+                self._tray.set_menu(Some(Box::new(built.menu)));
+                self.dashboard_id   = built.dashboard_id;
+                self.deployment_ids = built.deployment_ids;
+                self.quit_id        = built.quit_id;
+                self.last_snapshot  = snapshot;
+            }
+
+            // Update icon
             if state != self.last_state {
                 let icon = match state {
                     TrayState::AllConnected => self.icon_green.clone(),
@@ -189,6 +367,7 @@ impl ApplicationHandler for TrayApp {
                 self._tray.set_icon(Some(icon)).ok();
                 self.last_state = state;
             }
+
             self._tray.set_tooltip(Some(&tooltip(connected, total))).ok();
         }
 
