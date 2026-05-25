@@ -41,9 +41,24 @@ fn make_icon(svg: &str) -> Icon {
 // ── Dashboard launcher ────────────────────────────────────────────────────────
 
 fn open_dashboard() {
+    {
+        let mut guard = GUI_CHILD.lock().unwrap();
+        if let Some(child) = guard.as_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                // Still running — just return, egui window will already
+                // be visible (user may need to unminimize manually)
+                // Optionally: send a signal / write to a pipe to raise it
+                println!("[ginger-code] dashboard already running, skipping spawn");
+                return;
+            }
+            *guard = None;
+        }
+    }
+
     #[cfg(target_os = "macos")]
     let result = std::env::current_exe()
         .and_then(|exe| std::process::Command::new(exe).arg("--gui").spawn());
+
 
     #[cfg(target_os = "linux")]
     let result = {
