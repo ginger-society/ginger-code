@@ -316,6 +316,7 @@ impl ApplicationHandler for TrayApp {
                 println!("[ginger-code] quit via tray");
                 self.shutdown.store(true, Ordering::Relaxed);
                 let _ = std::fs::remove_file(&self.sock_path);
+                quit_app();
                 event_loop.exit();
                 return;
             }
