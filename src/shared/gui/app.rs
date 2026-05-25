@@ -290,7 +290,12 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
                     // 1. Deployment details strip
-                    draw_info_strip(&self.state, ui);
+                    let eject_clicked = draw_info_strip(&self.state, ui);
+                    if eject_clicked {
+                        let svc = &self.state.services[self.state.selected_idx];
+                        println!("[eject] dummy callback — would eject: {}", svc.meta_name);
+                        // TODO: wire up real eject logic here
+                    }
 
                     // 2. Tab bar (Logs + terminal tabs + "+" button)
                     let action = draw_tab_bar(&self.state, ui);
