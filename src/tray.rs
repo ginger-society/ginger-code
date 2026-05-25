@@ -2,6 +2,7 @@
 use crate::{Config, DeploymentEntry, ForwardStatus, StateMap};
 use resvg::{tiny_skia, usvg};
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tray_icon::{
@@ -12,9 +13,20 @@ use winit::{
     application::ApplicationHandler,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
 };
+use std::sync::{Mutex};
 
 #[derive(PartialEq, Clone, Copy)]
 enum TrayState { AllConnected, Partial, Offline }
+
+static GUI_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
+fn quit_app() {
+    // Kill the GUI child if it's running
+    if let Some(mut child) = GUI_CHILD.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+    std::process::exit(0);
+}
 
 const ICON_GREEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22">
   <circle cx="6"  cy="11" r="3.5" fill="none" stroke="#1D9E75" stroke-width="2"/>
@@ -60,13 +72,11 @@ fn make_icon(svg: &str) -> Icon {
 
 fn open_dashboard() {
     #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open")
-        .arg("/Applications/ginger-code-gui.app")
-        .spawn();
+    let result = std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).arg("--gui").spawn());
 
     #[cfg(target_os = "linux")]
     let result = {
-        // Try common terminal emulators in order of preference
         let terminals: &[(&str, &[&str])] = &[
             ("gnome-terminal", &["--", DASHBOARD_BIN] as &[&str]),
             ("xterm",          &["-e", DASHBOARD_BIN]),
@@ -90,7 +100,10 @@ fn open_dashboard() {
         .spawn();
 
     match result {
-        Ok(_)  => println!("[ginger-code] launched dashboard in new terminal"),
+        Ok(child) => {
+            *GUI_CHILD.lock().unwrap() = Some(child);
+            println!("[ginger-code] launched dashboard");
+        }
         Err(e) => eprintln!("[ginger-code] failed to launch dashboard: {e}"),
     }
 }

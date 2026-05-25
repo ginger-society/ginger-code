@@ -19,7 +19,7 @@ impl App {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "mono".to_owned(),
-            egui::FontData::from_static(include_bytes!("../../../../assets/JetBrainsMono-Regular.ttf")),
+            egui::FontData::from_static(include_bytes!("../../../assets/JetBrainsMono-Regular.ttf")),
         );
         fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "mono".to_owned());
         cc.egui_ctx.set_fonts(fonts);

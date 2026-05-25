@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use ginger_code::shared;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -9,10 +10,8 @@ use IAMService::apis::default_api::identity_validate_api_token;
 use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::apis::configuration::Configuration as MetadataConfiguration;
 use MetadataService::get_configuration as get_metadata_configuration;
+use shared::ui::fetch_metadata_and_process;
 
-use crate::shared::ui::fetch_metadata_and_process;
-
-pub mod shared;
 
 
 // ── ANSI colours (only when stdout is a tty) ──────────────────────────────────

@@ -7,7 +7,7 @@ pub mod types;
 use eframe::egui;
 use app::App;
 
-const ICON_BYTES: &[u8] = include_bytes!("../../../../assets/ginger-code.png");
+const ICON_BYTES: &[u8] = include_bytes!("../../../assets/ginger-code.png");
 
 pub fn run_gui() -> eframe::Result<()> {
     let icon = {

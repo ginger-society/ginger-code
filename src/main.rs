@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 mod tray;
+mod shared;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -455,6 +456,15 @@ fn find_kubectl() -> Option<std::path::PathBuf> {
 }
 
 fn main() {
+
+
+    // ── GUI mode (spawned by tray on click) ───────────────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--gui".to_string()) {
+        shared::gui::run_gui().unwrap();
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     {
         let current = std::env::var("PATH").unwrap_or_default();
