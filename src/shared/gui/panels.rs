@@ -19,6 +19,17 @@ pub fn draw_titlebar(state: &AppState, ui: &mut egui::Ui, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
+    // ── Double-click to toggle maximise/restore ────────────────────────────
+    if response.double_clicked() {
+        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if is_maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
+
     let dot_y      = rect.center().y;
     let dot_colors = [
         egui::Color32::from_rgb(255, 95,  86),
@@ -57,8 +68,6 @@ pub fn draw_titlebar(state: &AppState, ui: &mut egui::Ui, ctx: &egui::Context) {
 }
 
 // ── Sidebar service list ──────────────────────────────────────────────────────
-
-/// Returns `Some(idx)` when a different service row is clicked.
 pub fn draw_service_list(state: &AppState, ui: &mut egui::Ui) -> Option<usize> {
     let mut clicked_idx = None;
     egui::ScrollArea::vertical()
@@ -72,14 +81,22 @@ pub fn draw_service_list(state: &AppState, ui: &mut egui::Ui) -> Option<usize> {
                 let dot_color  = svc.status_color();
                 let short_name = svc.meta_name.split('/').last().unwrap_or(&svc.meta_name).to_owned();
                 let ejected    = svc.ejected;
-                let sub        = format!("ready: {}  status: {}", svc.ready, svc.status);
+                let sub        = format!("status: {}", svc.status);
                 let selected   = i == state.selected_idx;
-                let bg         = if selected { COLOR_SELECTED_BG } else { COLOR_SIDEBAR_BG };
 
                 let (row_rect, row_resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 42.0), egui::Sense::click(),
                 );
                 if row_resp.clicked() && !selected { clicked_idx = Some(i); }
+
+                // ── Background with hover effect ──────────────────────────────
+                let bg = if selected {
+                    COLOR_SELECTED_BG
+                } else if row_resp.hovered() {
+                    egui::Color32::from_rgb(40, 40, 40)  // slightly lighter than sidebar
+                } else {
+                    COLOR_SIDEBAR_BG
+                };
 
                 let painter = ui.painter();
                 painter.rect_filled(row_rect, 0.0, bg);
@@ -114,66 +131,113 @@ pub fn draw_service_list(state: &AppState, ui: &mut egui::Ui) -> Option<usize> {
     clicked_idx
 }
 
-// ── Deployment info strip ─────────────────────────────────────────────────────
+pub struct InfoStripAction {
+    pub eject_clicked:      bool,
+    pub open_editor_clicked: bool,
+}
 
-pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) -> bool {
+pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) -> InfoStripAction {
     let svc = &state.services[state.selected_idx];
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
-    
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+
+    let pad_y = 8.0;
+    let content_center_y = rect.min.y + pad_y + (rect.height() - pad_y * 2.0) / 2.0;
+
     let deploy = svc.deployment_name.as_deref().unwrap_or("—");
     let lang   = svc.lang.as_deref().unwrap_or("—");
-    let text   = format!(
-        "  deploy: {}   lang: {}   status: {}{}",
-        deploy, lang, svc.status,
+    let detail = format!(
+        "   lang: {}   status: {}{}",
+        lang, svc.status,
         if svc.ejected { "   [EJECTED]" } else { "" },
     );
 
-    // ── Eject button (only when not ejected) ──────────────────────────────────
-    let mut eject_clicked = false;
-    let btn_rect = if !svc.ejected {
+    let btn_h = 18.0;
+    let btn_y = content_center_y - btn_h / 2.0;
+
+    let eject_btn_rect = if !svc.ejected {
         let btn_w = 58.0;
-        let btn_h = 16.0;
         Some(egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - btn_w - 6.0, rect.center().y - btn_h / 2.0),
+            egui::pos2(rect.max.x - btn_w - 8.0, btn_y),
             egui::vec2(btn_w, btn_h),
         ))
     } else {
         None
     };
 
-    // Allocate button response BEFORE taking painter
-    let btn_resp = btn_rect.map(|r| ui.allocate_rect(r, egui::Sense::click()));
-    if btn_resp.as_ref().map_or(false, |r| r.clicked()) {
-        eject_clicked = true;
-        println!("[eject] clicked for service: {}", svc.meta_name);
-    }
+    let editor_btn_rect = if svc.ejected {
+        let btn_w = 100.0;
+        Some(egui::Rect::from_min_size(
+            egui::pos2(rect.max.x - btn_w - 8.0, btn_y),
+            egui::vec2(btn_w, btn_h),
+        ))
+    } else {
+        None
+    };
 
-    // Now safe to take painter — no more mutable borrows needed
+    let eject_resp  = eject_btn_rect.map(|r| ui.allocate_rect(r, egui::Sense::click()));
+    let editor_resp = editor_btn_rect.map(|r| ui.allocate_rect(r, egui::Sense::click()));
+
+    let eject_clicked       = eject_resp.as_ref().map_or(false, |r| r.clicked());
+    let open_editor_clicked = editor_resp.as_ref().map_or(false, |r| r.clicked());
+
+    if eject_clicked       { println!("[eject]  clicked for: {}", svc.meta_name); }
+    if open_editor_clicked { println!("[editor] clicked for: {}", svc.meta_name); }
+
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(22, 22, 22));
-    painter.line_segment([egui::pos2(rect.min.x, rect.max.y), rect.max], egui::Stroke::new(0.5, COLOR_BORDER));
-    painter.text(egui::pos2(rect.min.x, rect.center().y), egui::Align2::LEFT_CENTER,
-        &text, egui::FontId::new(10.5, egui::FontFamily::Monospace), COLOR_MUTED);
+    painter.line_segment(
+        [
+            egui::pos2(rect.min.x, rect.max.y - 0.5),
+            egui::pos2(rect.max.x, rect.max.y - 0.5),
+        ],
+        egui::Stroke::new(0.5, COLOR_BORDER),
+    );
 
-    if let (Some(r), Some(resp)) = (btn_rect, btn_resp) {
-        let btn_color = if resp.hovered() {
+    // ── Deploy name — larger, no label ────────────────────────────────────────
+    let deploy_x = rect.min.x + 8.0;
+    painter.text(
+        egui::pos2(deploy_x, content_center_y),
+        egui::Align2::LEFT_CENTER,
+        deploy,
+        egui::FontId::new(13.0, egui::FontFamily::Monospace),
+        egui::Color32::WHITE,
+    );
+
+    // ── Measure deploy name width to position detail text right after it ──────
+    // Approximate character width at 13px monospace ≈ 7.8px per char
+    let deploy_w = deploy.len() as f32 * 7.8;
+    painter.text(
+        egui::pos2(deploy_x + deploy_w, content_center_y),
+        egui::Align2::LEFT_CENTER,
+        &detail,
+        egui::FontId::new(10.5, egui::FontFamily::Monospace),
+        COLOR_MUTED,
+    );
+
+    if let (Some(r), Some(resp)) = (eject_btn_rect, eject_resp) {
+        let color = if resp.hovered() {
             egui::Color32::from_rgb(220, 80, 40)
         } else {
             egui::Color32::from_rgb(160, 60, 30)
         };
-        painter.rect_filled(r, 3.0, btn_color);
-        painter.text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            "⏏ Eject",
-            egui::FontId::new(10.0, egui::FontFamily::Monospace),
-            egui::Color32::WHITE,
-        );
+        painter.rect_filled(r, 3.0, color);
+        painter.text(r.center(), egui::Align2::CENTER_CENTER, "⏏ Eject",
+            egui::FontId::new(10.0, egui::FontFamily::Monospace), egui::Color32::WHITE);
     }
 
-    eject_clicked
-}
+    if let (Some(r), Some(resp)) = (editor_btn_rect, editor_resp) {
+        let color = if resp.hovered() {
+            egui::Color32::from_rgb(30, 100, 180)
+        } else {
+            egui::Color32::from_rgb(20, 75, 140)
+        };
+        painter.rect_filled(r, 3.0, color);
+        painter.text(r.center(), egui::Align2::CENTER_CENTER, "[>] Open Editor",
+            egui::FontId::new(10.0, egui::FontFamily::Monospace), egui::Color32::WHITE);
+    }
 
+    InfoStripAction { eject_clicked, open_editor_clicked }
+}
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
 pub enum TabBarAction {
@@ -720,7 +784,7 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
 // ── Status bar ────────────────────────────────────────────────────────────────
 
 pub fn draw_statusbar(state: &AppState, ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 50.0), egui::Sense::hover());
     let painter   = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 18));
     painter.line_segment([rect.left_top(), rect.right_top()], egui::Stroke::new(0.5, COLOR_BORDER));

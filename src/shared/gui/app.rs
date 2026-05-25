@@ -289,12 +289,16 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(COLOR_BG))
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    // 1. Deployment details strip
-                    let eject_clicked = draw_info_strip(&self.state, ui);
-                    if eject_clicked {
+                    let strip_action = draw_info_strip(&self.state, ui);
+                    if strip_action.eject_clicked {
                         let svc = &self.state.services[self.state.selected_idx];
                         println!("[eject] dummy callback — would eject: {}", svc.meta_name);
                         // TODO: wire up real eject logic here
+                    }
+                    if strip_action.open_editor_clicked {
+                        let svc = &self.state.services[self.state.selected_idx];
+                        println!("[editor] dummy callback — would open editor for: {}", svc.meta_name);
+                        // TODO: spawn `code <path>` or `codium <path>`
                     }
 
                     // 2. Tab bar (Logs + terminal tabs + "+" button)
