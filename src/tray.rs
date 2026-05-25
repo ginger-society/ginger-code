@@ -20,10 +20,15 @@ use std::sync::{Mutex};
 enum TrayState { AllConnected, Partial, Offline }
 
 static GUI_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+static CLI_CHILD: Mutex<Option<Child>> = Mutex::new(None);  // ← add
+
 
 fn quit_app() {
     // Kill the GUI child if it's running
     if let Some(mut child) = GUI_CHILD.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+    if let Some(mut child) = CLI_CHILD.lock().unwrap().take() {
         let _ = child.kill();
     }
     std::process::exit(0);
@@ -128,7 +133,7 @@ impl MenuSnapshot {
 struct BuiltMenu {
     menu:            Menu,
     dashboard_id:    tray_icon::menu::MenuId,
-    // (MenuId, deployment_name, forwarding_port) for each deployment item
+    cli_id:          tray_icon::menu::MenuId,           // ← new
     deployment_ids:  Vec<(tray_icon::menu::MenuId, String, u16)>,
     quit_id:         tray_icon::menu::MenuId,
 }
@@ -139,46 +144,107 @@ fn build_menu(
 ) -> BuiltMenu {
     let menu = Menu::new();
 
-    // ── Static top item ───────────────────────────────────────────────────────
     let dashboard_item = MenuItem::new("  Open Dashboard  ", true, None);
     let dashboard_id   = dashboard_item.id().clone();
     menu.append(&dashboard_item).unwrap();
 
-    // Separator between dashboard and deployments (always shown)
+    // ── Open CLI ──────────────────────────────────────────────────────────────
+    let cli_item = MenuItem::new("  Open CLI  ", true, None);
+    let cli_id   = cli_item.id().clone();
+    menu.append(&cli_item).unwrap();
+
     menu.append(&PredefinedMenuItem::separator()).unwrap();
 
-    // ── Dynamic deployment items ──────────────────────────────────────────────
+    // ... rest of deployment items unchanged ...
     let mut deployment_ids = Vec::new();
-
     for entry in cfg {
         let connected = map.get(&entry.deployment_name)
             .map_or(false, |fw| fw.status == ForwardStatus::Connected);
-
-        // Label: "  ● deployment-name  " with padding on each side.
-        // The bullet gives a quick visual status cue alongside the
-        // enabled state which mutes disconnected items automatically.
         let bullet = if connected { "●" } else { "○" };
         let label  = format!("  {}  {}  ", bullet, entry.deployment_name);
-
-        // enabled=true only when connected — on macOS this grays out the
-        // text and prevents clicks when the tunnel is not up.
-        let item = MenuItem::new(&label, connected, None);
-        let id   = item.id().clone();
+        let item   = MenuItem::new(&label, connected, None);
+        let id     = item.id().clone();
         menu.append(&item).unwrap();
         deployment_ids.push((id, entry.deployment_name.clone(), entry.forwarding_port));
     }
 
-    // Separator above Quit
     menu.append(&PredefinedMenuItem::separator()).unwrap();
 
     let quit_item = MenuItem::new("Quit ginger-code", true, None);
     let quit_id   = quit_item.id().clone();
     menu.append(&quit_item).unwrap();
 
-    BuiltMenu { menu, dashboard_id, deployment_ids, quit_id }
+    BuiltMenu { menu, dashboard_id, cli_id, deployment_ids, quit_id }
 }
 
 // ── Tray state helpers ────────────────────────────────────────────────────────
+
+// ── CLI launcher ──────────────────────────────────────────────────────────────
+fn open_cli() {
+    {
+        let mut guard = CLI_CHILD.lock().unwrap();
+        if let Some(child) = guard.as_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                println!("[ginger-code] CLI already running, skipping spawn");
+                return;
+            }
+            *guard = None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    let result = std::env::current_exe()
+        .map(|exe| exe.parent().unwrap_or(std::path::Path::new(".")).join("ginger-code-cli"))
+        .and_then(|cli_bin| {
+            std::process::Command::new("osascript")
+                .args([
+                    "-e",
+                    &format!(
+                        r#"tell application "Terminal" to do script "{}" & activate"#,
+                        cli_bin.display()
+                    ),
+                ])
+                .spawn()
+        });
+    #[cfg(target_os = "linux")]
+    let result = {
+        let cli_bin = std::env::current_exe()
+            .map(|exe| exe.parent().unwrap_or(std::path::Path::new(".")).join("ginger-code-cli"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("ginger-code-cli"));
+
+        let terminals: &[(&str, Vec<String>)] = &[
+            ("gnome-terminal", vec!["--".into(), cli_bin.display().to_string()]),
+            ("xterm",          vec!["-e".into(), cli_bin.display().to_string()]),
+            ("konsole",        vec!["-e".into(), cli_bin.display().to_string()]),
+            ("xfce4-terminal", vec!["-e".into(), cli_bin.display().to_string()]),
+        ];
+
+        let mut res = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no terminal found"));
+        for (term, args) in terminals {
+            match std::process::Command::new(term).args(args).spawn() {
+                Ok(child) => { res = Ok(child); break; }
+                Err(_)    => continue,
+            }
+        }
+        res
+    };
+
+    #[cfg(target_os = "windows")]
+    let result = {
+        let cli_bin = std::env::current_exe()
+            .map(|exe| exe.parent().unwrap_or(std::path::Path::new(".")).join("ginger-code-cli.exe"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("ginger-code-cli.exe"));
+
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "cmd", "/k", &cli_bin.display().to_string()])
+            .spawn()
+    };
+
+    match result {
+        Ok(_)  => println!("[ginger-code] launched CLI"),
+        Err(e) => eprintln!("[ginger-code] failed to launch CLI: {e}"),
+    }
+}
 
 fn compute_tray_state(
     map: &std::collections::HashMap<String, crate::ForwardState>,
@@ -225,6 +291,7 @@ struct TrayApp {
     last_tick:       std::time::Instant,
     // Live menu bookkeeping — rebuilt whenever snapshot changes
     dashboard_id:    tray_icon::menu::MenuId,
+    cli_id:          tray_icon::menu::MenuId,  
     deployment_ids:  Vec<(tray_icon::menu::MenuId, String, u16)>,
     quit_id:         tray_icon::menu::MenuId,
     last_snapshot:   MenuSnapshot,
@@ -280,6 +347,7 @@ impl TrayApp {
             deployment_ids: built.deployment_ids,
             quit_id: built.quit_id,
             last_snapshot: snapshot,
+            cli_id: built.cli_id,
         }
     }
 }
@@ -308,6 +376,10 @@ impl ApplicationHandler for TrayApp {
 
             if ev.id == self.dashboard_id {
                 open_dashboard();
+                continue;
+            }
+            if ev.id == self.cli_id {
+                open_cli();
                 continue;
             }
 
@@ -345,6 +417,7 @@ impl ApplicationHandler for TrayApp {
                 self.deployment_ids = built.deployment_ids;
                 self.quit_id        = built.quit_id;
                 self.last_snapshot  = snapshot;
+                self.cli_id = built.cli_id;
             }
 
             // Update icon
