@@ -1,6 +1,9 @@
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::{mpsc, Arc};
+use std::collections::HashMap;
+use tokio::time::sleep;
+use std::time::Duration;
 
 use MetadataService::{
     apis::{
@@ -18,21 +21,35 @@ use super::panels::{
 };
 use super::terminal::{spawn_ssh, TermPerformer};
 use super::types::{AppState, K8sService, RightPane, TermState};
-use crate::shared::ui::kubernetes::meta_to_deployment_name;
+use crate::shared::ui::kubernetes::{
+    get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name,
+};
 
 // ── Background channel messages ───────────────────────────────────────────────
 
 enum BgMsg {
+    /// Initial metadata fetch completed — full service list.
     Services(Vec<K8sService>),
+    /// Periodic k8s status poll — map of deployment_name → (status, ready).
+    K8sStatuses(HashMap<String, (String, String)>),
+    /// Ejected flag update for one service by index.
+    EjectedFlag { idx: usize, ejected: bool },
+    /// Fresh log lines for the currently-selected service.
+    Logs(Vec<String>),
+    /// Metadata fetch failed.
     Error(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    state:   AppState,
-    rx:      mpsc::Receiver<BgMsg>,
-    loading: bool,
+    state:           AppState,
+    rx:              mpsc::Receiver<BgMsg>,
+    /// Sender kept so we can hand clones to new background tasks.
+    tx:              mpsc::Sender<BgMsg>,
+    loading:         bool,
+    /// egui context — needed to spawn per-selection log tasks.
+    ctx:             egui::Context,
 }
 
 impl App {
@@ -52,46 +69,42 @@ impl App {
             .insert(0, "mono".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
-        // ── Kick off background metadata fetch ────────────────────────────────
         let (tx, rx) = mpsc::channel::<BgMsg>();
         let ctx      = cc.egui_ctx.clone();
 
-        std::thread::spawn(move || {
-            // eframe's App::new has no tokio context, so we create our own
-            // single-threaded runtime inside this OS thread.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime");
+        // ── 1. Metadata fetch (one-shot) ──────────────────────────────────────
+        {
+            let tx  = tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio rt");
 
-            rt.block_on(async move {
-                let token           = get_token_from_file_storage();
-                let metadata_config = get_metadata_configuration(Some(token));
+                rt.block_on(async move {
+                    let token           = get_token_from_file_storage();
+                    let metadata_config = get_metadata_configuration(Some(token));
 
-                match metadata_get_services_and_envs(
-                    &metadata_config,
-                    MetadataGetServicesAndEnvsParams {
-                        page_number: Some("1".to_string()),
-                        page_size:   Some("100".to_string()),
-                        org_id:      "ginger-society".to_string(),
-                    },
-                )
-                .await
-                {
-                    Err(e) => {
-                        let _ = tx.send(BgMsg::Error(format!("{e:?}")));
-                    }
-                    Ok(raw) => {
-                        let services = raw
-                            .iter()
-                            .map(|s| {
+                    match metadata_get_services_and_envs(
+                        &metadata_config,
+                        MetadataGetServicesAndEnvsParams {
+                            page_number: Some("1".to_string()),
+                            page_size:   Some("100".to_string()),
+                            org_id:      "ginger-society".to_string(),
+                        },
+                    )
+                    .await
+                    {
+                        Err(e) => { let _ = tx.send(BgMsg::Error(format!("{e:?}"))); }
+                        Ok(raw) => {
+                            let services = raw.iter().map(|s| {
                                 let meta_name       = s.identifier.to_string();
                                 let deployment_name = meta_to_deployment_name(&meta_name);
-                                let lang = s
-                                    .lang
+                                let lang = s.lang
                                     .as_ref()
                                     .and_then(|l| l.as_ref())
-                                    .map(|l| l.clone());
+                                    .cloned();
                                 let ssh_host = Some(format!(
                                     "dev@{}-local",
                                     deployment_name.to_lowercase().replace('_', "-"),
@@ -100,29 +113,120 @@ impl App {
                                     meta_name,
                                     organization_id: s.organization_id.clone(),
                                     deployment_name: Some(deployment_name),
-                                    status:   "Unknown".into(),
-                                    ready:    "–".into(),
+                                    status:  "Unknown".into(),
+                                    ready:   "–".into(),
                                     lang,
-                                    ejected:  false,
+                                    ejected: false,
                                     ssh_host,
                                 }
-                            })
-                            .collect();
-
-                        let _ = tx.send(BgMsg::Services(services));
+                            }).collect();
+                            let _ = tx.send(BgMsg::Services(services));
+                        }
                     }
-                }
-
-                // Wake egui so the new data is picked up on the very next frame.
-                ctx.request_repaint();
+                    ctx.request_repaint();
+                });
             });
-        });
+        }
+
+        // ── 2. k8s status poller (every 5 s) ─────────────────────────────────
+        {
+            let tx  = tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio rt");
+
+                rt.block_on(async move {
+                    loop {
+                        let deployments = get_k8s_deployments().await;
+                        let _ = tx.send(BgMsg::K8sStatuses(deployments));
+                        ctx.request_repaint();
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            });
+        }
 
         App {
             state:   AppState::new(13.0, vec![]),
             rx,
+            tx,
             loading: true,
+            ctx,
         }
+    }
+
+    // ── Spawn a one-shot log fetch + ejected-flag check for service `idx` ─────
+
+    fn spawn_service_refresh(&self, idx: usize, deployment_name: String) {
+        let tx  = self.tx.clone();
+        let ctx = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                let ejected = is_ejected(&deployment_name).await;
+                let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+
+                // Only fetch logs if not ejected.
+                if !ejected {
+                    let logs = get_pod_logs(&deployment_name).await;
+                    let _ = tx.send(BgMsg::Logs(logs));
+                }
+
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    // ── Ejected-only check (no log fetch) ─────────────────────────────────────
+
+    fn spawn_ejected_check(&self, idx: usize, deployment_name: String) {
+        let tx  = self.tx.clone();
+        let ctx = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                let ejected = is_ejected(&deployment_name).await;
+                let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    // ── Recurring log poller — only called for non-ejected services ───────────
+
+    fn spawn_log_poller(&self, deployment_name: String) {
+        let tx  = self.tx.clone();
+        let ctx = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                loop {
+                    let logs = get_pod_logs(&deployment_name).await;
+                    // If the receiver is gone (app closed / service changed) stop.
+                    if tx.send(BgMsg::Logs(logs)).is_err() { break; }
+                    ctx.request_repaint();
+                    sleep(Duration::from_secs(2)).await;
+                }
+            });
+        });
     }
 
     // ── Open a new terminal tab and connect it ────────────────────────────────
@@ -136,7 +240,7 @@ impl App {
             None    => return,
         };
 
-        self.state.right_pane = RightPane::TerminalTab(tab_idx);
+        self.state.right_pane  = RightPane::TerminalTab(tab_idx);
         self.state.active_term = tab_idx;
         self.connect_tab(tab_idx, ctx);
     }
@@ -167,7 +271,7 @@ impl App {
                 .with_sink(Arc::clone(&sink)),
         ));
 
-        let tab = &mut self.state.term_tabs[tab_idx];
+        let tab            = &mut self.state.term_tabs[tab_idx];
         tab.performer      = Arc::clone(&performer);
         tab.scrollback_arc = Some(Arc::clone(&sink));
 
@@ -180,28 +284,103 @@ impl App {
     // ── Service selection ─────────────────────────────────────────────────────
 
     fn select_service(&mut self, idx: usize) {
-        let meta_name = self.state.services[idx].meta_name.clone();
+        let svc             = &self.state.services[idx];
+        let meta_name       = svc.meta_name.clone();
+        let deployment_name = svc.deployment_name.clone();
+        let ejected         = svc.ejected;
+
         self.state.selected_idx = idx;
         self.state.right_pane   = RightPane::Logs;
-        self.state.logs         = vec![format!("Fetching logs for {}…", meta_name)];
-        // TODO: kick off async log fetch here
+
+        if ejected {
+            self.state.logs = vec![
+                format!("⚡ {} is ejected — running in dev mode.", meta_name),
+                "No application logs available.".into(),
+                "Use a Terminal tab to interact with the container.".into(),
+            ];
+            // Still check the ejected flag in case it changed, but skip logs.
+            if let Some(dep) = deployment_name {
+                self.spawn_ejected_check(idx, dep);
+            }
+        } else {
+            self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
+            if let Some(dep) = deployment_name {
+                self.spawn_service_refresh(idx, dep.clone());
+                self.spawn_log_poller(dep);
+            }
+        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Drain the background channel ──────────────────────────────────────
-        match self.rx.try_recv() {
-            Ok(BgMsg::Services(svcs)) => {
-                self.state.services     = svcs;
-                self.state.selected_idx = 0;
-                self.loading            = false;
+        // ── Drain the background channel (process ALL pending messages) ───────
+        loop {
+            match self.rx.try_recv() {
+                Ok(BgMsg::Services(svcs)) => {
+                    self.state.services     = svcs;
+                    self.state.selected_idx = 0;
+                    self.loading            = false;
+
+                    // Kick off refresh for service 0, respecting ejected state.
+                    if let Some(svc) = self.state.services.first() {
+                        let dep     = svc.deployment_name.clone();
+                        let ejected = svc.ejected;
+                        if let Some(dep) = dep {
+                            self.spawn_service_refresh(0, dep.clone());
+                            if !ejected {
+                                self.spawn_log_poller(dep);
+                            }
+                        }
+                    }
+                }
+                Ok(BgMsg::K8sStatuses(deployments)) => {
+                    for svc in &mut self.state.services {
+                        if let Some(ref dep) = svc.deployment_name {
+                            if let Some((status, ready)) = deployments.get(dep) {
+                                svc.status = status.clone();
+                                svc.ready  = ready.clone();
+                            } else {
+                                svc.status = "Not deployed".into();
+                                svc.ready  = "–".into();
+                            }
+                        }
+                    }
+                }
+                Ok(BgMsg::EjectedFlag { idx, ejected }) => {
+                    if let Some(svc) = self.state.services.get_mut(idx) {
+                        svc.ejected = ejected;
+                    }
+                    // If this is the selected service and it's ejected, replace
+                    // any stale "Fetching…" or real log lines with the dev-mode notice.
+                    if idx == self.state.selected_idx && ejected
+                        && self.state.right_pane == RightPane::Logs
+                    {
+                        let name = self.state.services
+                            .get(idx)
+                            .map(|s| s.meta_name.as_str())
+                            .unwrap_or("this service");
+                        self.state.logs = vec![
+                            format!("⚡ {} is ejected — running in dev mode.", name),
+                            "No application logs available.".into(),
+                            "Use a Terminal tab to interact with the container.".into(),
+                        ];
+                    }
+                }
+                Ok(BgMsg::Logs(lines)) => {
+                    // Only apply if we're still showing the Logs pane —
+                    // avoids clobbering logs with stale results from a
+                    // previous selection's poller.
+                    if self.state.right_pane == RightPane::Logs {
+                        self.state.logs = lines;
+                    }
+                }
+                Ok(BgMsg::Error(e)) => {
+                    self.loading    = false;
+                    self.state.logs = vec![format!("Failed to load services: {e}")];
+                }
+                Err(_) => break, // channel empty (or closed)
             }
-            Ok(BgMsg::Error(e)) => {
-                self.loading      = false;
-                self.state.logs   = vec![format!("Failed to load services: {e}")];
-            }
-            Err(_) => {} // nothing yet, or channel already closed
         }
 
         // ── Raise window on first frame (tray launch) ─────────────────────────
@@ -219,7 +398,7 @@ impl eframe::App for App {
             ));
         }
 
-        // ── Cursor blink (only when a terminal tab is visible) ────────────────
+        // ── Cursor blink ──────────────────────────────────────────────────────
         let t = ctx.input(|i| i.time);
         if t - self.state.blink_timer > 0.5 {
             self.state.blink       = !self.state.blink;
@@ -229,7 +408,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
-        // ── Sync scrollback from Arc sinks into tab.scrollback each frame ─────
+        // ── Sync terminal scrollback ──────────────────────────────────────────
         for tab in &mut self.state.term_tabs {
             if let Some(ref sink) = tab.scrollback_arc {
                 let mut s = sink.lock();
@@ -273,7 +452,6 @@ impl eframe::App for App {
                 );
 
                 if self.loading {
-                    // Show a simple loading message while the fetch is in flight.
                     ui.add_space(8.0);
                     ui.colored_label(COLOR_CYAN, "Loading services…");
                 } else if self.state.services.is_empty() {
@@ -288,25 +466,28 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(COLOR_BG))
             .show(ctx, |ui| {
+                if self.loading || self.state.services.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.colored_label(COLOR_CYAN, "Loading services…");
+                    });
+                    return;
+                }
+
                 ui.vertical(|ui| {
                     let strip_action = draw_info_strip(&self.state, ui);
                     if strip_action.eject_clicked {
                         if let Some(svc) = self.state.services.get(self.state.selected_idx) {
-                            println!("[eject] dummy callback — would eject: {}", svc.meta_name);
-                            // TODO: wire up real eject logic here
+                            println!("[eject] would eject: {}", svc.meta_name);
+                            // TODO: wire up real eject logic
                         }
                     }
                     if strip_action.open_editor_clicked {
                         if let Some(svc) = self.state.services.get(self.state.selected_idx) {
-                            println!(
-                                "[editor] dummy callback — would open editor for: {}",
-                                svc.meta_name
-                            );
-                            // TODO: spawn `code <path>` or `codium <path>`
+                            println!("[editor] would open editor for: {}", svc.meta_name);
+                            // TODO: spawn `code <path>`
                         }
                     }
 
-                    // Tab bar (Logs + terminal tabs + "+" button)
                     let action = draw_tab_bar(&self.state, ui);
 
                     match action {
@@ -326,7 +507,6 @@ impl eframe::App for App {
                         None => {}
                     }
 
-                    // Pane content
                     match self.state.right_pane {
                         RightPane::Logs           => draw_logs_pane(&self.state, ui),
                         RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),

@@ -359,8 +359,8 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
     // ── "+" button ────────────────────────────────────────────────────────────
     let svc_has_host = state.services
         .get(state.selected_idx)
-        .and_then(|s| s.ssh_host.as_ref())
-        .is_some();
+        .map(|s| s.ssh_host.is_some() && !s.ejected)  // ← ejected blocks terminal
+        .unwrap_or(false);
     if state.term_tabs.len() < MAX_TERM_TABS && svc_has_host {
         let plus_rect = egui::Rect::from_min_size(
             egui::pos2(x, bar_rect.min.y), egui::vec2(PLUS_W, TAB_H),
