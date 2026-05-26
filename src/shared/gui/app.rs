@@ -24,6 +24,7 @@ use super::types::{AppState, K8sService, RightPane, TermState};
 use crate::shared::ui::kubernetes::{
     get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name,
 };
+use crate::shared::ui::eject::{eject, uneject};
 
 // ── Background channel messages ───────────────────────────────────────────────
 
@@ -40,6 +41,8 @@ enum BgMsg {
     Logs { lines: Vec<String>, generation: u64 },
     /// Metadata fetch failed.
     Error(String),
+    /// Result of an eject or uneject operation.
+    EjectResult { success: bool, message: String, idx: usize },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -324,6 +327,132 @@ impl App {
             self.spawn_service_refresh(new_idx, dep, generation);
         }
     }
+
+    // ── Eject the currently-selected service ──────────────────────────────────
+    //
+    // Guards:
+    //   • service must have a deployment_name (i.e. is known to k8s)
+    //   • service must have a lang (required by the eject script)
+    //   • service must NOT already be ejected
+    //
+    // Runs in a background thread with its own single-thread Tokio runtime,
+    // matching the pattern used everywhere else in this file.
+    // On completion, sends BgMsg::EjectResult so the log pane shows feedback
+    // and spawn_service_refresh is re-triggered to update the ejected badge.
+
+    fn run_eject(&self, ctx: &egui::Context) {
+        let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
+
+        // Guard: already ejected — button should be hidden by panels.rs but
+        // defend here too so we never double-eject.
+        if svc.ejected { return; }
+
+        let Some(dep)  = svc.deployment_name.clone() else { return };
+        let Some(lang) = svc.lang.clone()            else { return };
+
+        let meta_name = svc.meta_name.clone();
+        let tx        = self.tx.clone();
+        let ctx       = ctx.clone();
+        let idx       = self.state.selected_idx;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                let result = eject(&dep, &lang, &meta_name).await;
+                let (success, message) = match result {
+                    Ok(())  => (true,  format!("✓ Ejected {}", meta_name)),
+                    Err(e)  => (false, format!("✗ Eject failed for {}: {}", meta_name, e)),
+                };
+                let _ = tx.send(BgMsg::EjectResult { success, message, idx });
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    // ── Un-eject the currently-selected service ───────────────────────────────
+    //
+    // Guards:
+    //   • service must have a deployment_name
+    //   • service must currently be ejected
+    //
+    // Same threading pattern as run_eject.
+
+    fn run_uneject(&self, ctx: &egui::Context) {
+        let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
+
+        // Guard: not ejected — nothing to do.
+        if !svc.ejected { return; }
+
+        let Some(dep) = svc.deployment_name.clone() else { return };
+
+        let meta_name = svc.meta_name.clone();
+        let tx        = self.tx.clone();
+        let ctx       = ctx.clone();
+        let idx       = self.state.selected_idx;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                let result = uneject(&dep).await;
+                let (success, message) = match result {
+                    Ok(())  => (true,  format!("✓ Un-ejected {}", meta_name)),
+                    Err(e)  => (false, format!("✗ Un-eject failed for {}: {}", meta_name, e)),
+                };
+                let _ = tx.send(BgMsg::EjectResult { success, message, idx });
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    // ── Open VS Code remote for the currently-selected service ────────────────
+    //
+    // Mirrors the ratatui version's 'c' keybind logic exactly.
+    // Guards:
+    //   • service must have a deployment_name
+    //   • service must currently be ejected (dev mode — local code is live)
+    //
+    // Spawns a detached OS thread with a plain std::process::Command because
+    // `code --folder-uri` hands off to the running VS Code instance immediately
+    // and exits; no async work needed.
+
+    fn open_editor(&self) {
+        let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
+
+        // Editor only makes sense when ejected (local code is mounted into the pod).
+        if !svc.ejected { return; }
+
+        let Some(dep) = svc.deployment_name.as_ref() else { return };
+
+        let host_alias = format!("{}-local", dep);
+        let remote_uri = format!(
+            "vscode-remote://ssh-remote+{}/workspace/{}-{}",
+            host_alias,
+            svc.organization_id,
+            dep,
+        );
+
+        println!("Opening VS Code: {}", remote_uri);
+
+        std::thread::spawn(move || {
+            match std::process::Command::new("code")
+                .arg("--folder-uri")
+                .arg(&remote_uri)
+                .status()
+            {
+                Ok(s) if s.success() => println!("✓ VS Code launched"),
+                Ok(s)                => eprintln!("VS Code exited with status: {}", s),
+                Err(e)               => eprintln!("Failed to launch VS Code (`code` in PATH?): {e}"),
+            }
+        });
+    }
 }
 
 impl eframe::App for App {
@@ -407,6 +536,39 @@ impl eframe::App for App {
                 Ok(BgMsg::Error(e)) => {
                     self.loading    = false;
                     self.state.logs = vec![format!("Failed to load services: {e}")];
+                }
+
+                // ── Eject / uneject result ────────────────────────────────────
+                //
+                // On success: re-run spawn_service_refresh for the affected service
+                // so the ejected badge and log pane update without requiring the
+                // user to click elsewhere and back.
+                //
+                // On failure: the error message is appended to the log pane so it
+                // is visible in context without a modal dialog.
+                Ok(BgMsg::EjectResult { success, message, idx }) => {
+                    // Always show the result line in the log pane.
+                    self.state.logs.push(message);
+
+                    if success {
+                        // Re-check ejected flag + restart (or suppress) log poller.
+                        // We re-fetch even if idx != selected_idx so the sidebar
+                        // badge updates correctly for background services.
+                        if let Some(dep) = self.state.services
+                            .get(idx)
+                            .and_then(|s| s.deployment_name.clone())
+                        {
+                            // Use current log_generation only for the selected service;
+                            // background services get a dummy generation that will never
+                            // match so their Logs messages are silently dropped.
+                            let generation = if idx == self.state.selected_idx {
+                                self.state.log_generation
+                            } else {
+                                u64::MAX
+                            };
+                            self.spawn_service_refresh(idx, dep, generation);
+                        }
+                    }
                 }
 
                 Err(_) => break, // channel empty (or closed)
@@ -505,17 +667,20 @@ impl eframe::App for App {
 
                 ui.vertical(|ui| {
                     let strip_action = draw_info_strip(&self.state, ui);
+
+                    // ── Eject ─────────────────────────────────────────────────
                     if strip_action.eject_clicked {
-                        if let Some(svc) = self.state.services.get(self.state.selected_idx) {
-                            println!("[eject] would eject: {}", svc.meta_name);
-                            // TODO: wire up real eject logic
-                        }
+                        self.run_eject(ctx);
                     }
+
+                    // ── Un-eject ──────────────────────────────────────────────
+                    if strip_action.uneject_clicked {
+                        self.run_uneject(ctx);
+                    }
+
+                    // ── Open Editor ───────────────────────────────────────────
                     if strip_action.open_editor_clicked {
-                        if let Some(svc) = self.state.services.get(self.state.selected_idx) {
-                            println!("[editor] would open editor for: {}", svc.meta_name);
-                            // TODO: spawn `code <path>`
-                        }
+                        self.open_editor();
                     }
 
                     let action = draw_tab_bar(&self.state, ui);
