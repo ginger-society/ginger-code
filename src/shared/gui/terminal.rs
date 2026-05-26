@@ -391,20 +391,41 @@ impl SshSession {
     }
 }
 
-pub fn spawn_ssh(
-    host:      &str,
+pub fn spawn_kubectl(
+    deployment_name: &str,
     rows:      u16,
     cols:      u16,
     performer: Arc<Mutex<TermPerformer>>,
     ctx:       egui::Context,
 ) -> Result<SshSession, Box<dyn std::error::Error>> {
-    let pty_system = native_pty_system();
-    let pair       = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
-    let mut cmd = CommandBuilder::new("ssh");
-    cmd.arg("-o");
-    cmd.arg("StrictHostKeyChecking=accept-new");
-    cmd.arg(host);
+    // ── List all pods and find first Running one matching the deployment prefix
+    let pod_output = std::process::Command::new("kubectl")
+        .args(["get", "pods",
+               "--field-selector=status.phase=Running",
+               "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"])
+        .output()?;
+
+    let stdout = String::from_utf8(pod_output.stdout)?;
+    let prefix = deployment_name.to_lowercase().replace('_', "-");
+
+    let pod_name = stdout
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| format!("No running pod found with prefix '{}'", prefix))?
+        .to_string();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+
+    let mut cmd = CommandBuilder::new("kubectl");
+        cmd.arg("exec");
+        cmd.arg("-i");          // stdin only — PTY provides the TTY
+        cmd.arg(&pod_name);
+        cmd.arg("-c");
+        cmd.arg(&prefix);       // explicitly name the container, skip the init container
+        cmd.arg("--");
+        cmd.arg("/bin/sh");
 
     let _child     = pair.slave.spawn_command(cmd)?;
     let writer     = pair.master.take_writer()?;

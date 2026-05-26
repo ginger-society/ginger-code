@@ -19,7 +19,7 @@ use super::panels::{
     draw_info_strip, draw_logs_pane, draw_service_list, draw_statusbar, draw_tab_bar,
     draw_terminal_pane, draw_titlebar, TabBarAction,
 };
-use super::terminal::{spawn_ssh, TermPerformer};
+use super::terminal::{spawn_kubectl, TermPerformer};
 use super::types::{AppState, K8sService, RightPane, TermState};
 use crate::shared::ui::kubernetes::{
     get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name,
@@ -113,10 +113,8 @@ impl App {
                                     .as_ref()
                                     .and_then(|l| l.as_ref())
                                     .cloned();
-                                let ssh_host = Some(format!(
-                                    "dev@{}-local",
-                                    deployment_name.to_lowercase().replace('_', "-"),
-                                ));
+                                let pod_name = Some(deployment_name.to_lowercase().replace('_', "-"));
+
                                 K8sService {
                                     meta_name,
                                     organization_id: s.organization_id.clone(),
@@ -125,7 +123,7 @@ impl App {
                                     ready:   "–".into(),
                                     lang,
                                     ejected: false,
-                                    ssh_host,
+                                    ssh_host: pod_name,
                                 }
                             }).collect();
                             let _ = tx.send(BgMsg::Services(services));
@@ -291,7 +289,20 @@ impl App {
         tab.performer      = Arc::clone(&performer);
         tab.scrollback_arc = Some(Arc::clone(&sink));
 
-        match spawn_ssh(&host, rows, cols, performer, ctx.clone()) {
+
+        let dep_name = match self.state.services.get(svc_idx)
+            .and_then(|s| s.deployment_name.as_ref())
+        {
+            Some(d) => d.clone(),
+            None => {
+                if let Some(t) = self.state.term_tabs.get_mut(tab_idx) {
+                    t.state = TermState::Error("No deployment name for this service".into());
+                }
+                return;
+            }
+        };
+
+        match spawn_kubectl(&dep_name, rows, cols, performer, ctx.clone()) {
             Ok(session) => tab.state = TermState::Connected(session),
             Err(e)      => tab.state = TermState::Error(e.to_string()),
         }
