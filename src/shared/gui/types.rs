@@ -1,5 +1,6 @@
 use eframe::egui;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::colors::{COLOR_DIM, COLOR_RED, COLOR_YELLOW};
@@ -108,38 +109,45 @@ impl TermTab {
 // ── App-wide state ────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub services:       Vec<K8sService>,
-    pub selected_idx:   usize,
-    pub right_pane:     RightPane,
+    pub services:        Vec<K8sService>,
+    pub selected_idx:    usize,
+    pub right_pane:      RightPane,
     /// Log lines for the selected service.
-    pub logs:           Vec<String>,
-    /// All open terminal tabs (capped at `MAX_TERM_TABS`).
-    pub term_tabs:      Vec<TermTab>,
+    pub logs:            Vec<String>,
+    /// Terminal tabs for the *currently selected* service.
+    /// Swapped in/out of `tabs_by_service` on every service switch.
+    pub term_tabs:       Vec<TermTab>,
+    /// Saved terminal tabs for every service index that has ever had tabs opened.
+    pub tabs_by_service: HashMap<usize, Vec<TermTab>>,
     /// Index of the currently active terminal tab.
-    pub active_term:    usize,
-    pub font_size:      f32,
-    pub cell_w:         f32,
-    pub cell_h:         f32,
-    pub blink:          bool,
-    pub blink_timer:    f64,
-    pub raised_on_open: bool,
+    pub active_term:     usize,
+    /// Incremented on every service switch so stale log pollers can be ignored.
+    pub log_generation:  u64,
+    pub font_size:       f32,
+    pub cell_w:          f32,
+    pub cell_h:          f32,
+    pub blink:           bool,
+    pub blink_timer:     f64,
+    pub raised_on_open:  bool,
 }
 
 impl AppState {
     pub fn new(font_size: f32, services: Vec<K8sService>) -> Self {
         AppState {
             services,
-            selected_idx:   0,
-            right_pane:     RightPane::Logs,
-            logs:           vec!["Fetching logs…".into()],
-            term_tabs:      Vec::new(),
-            active_term:    0,
+            selected_idx:    0,
+            right_pane:      RightPane::Logs,
+            logs:            vec!["Fetching logs…".into()],
+            term_tabs:       Vec::new(),
+            tabs_by_service: HashMap::new(),
+            active_term:     0,
+            log_generation:  0,
             font_size,
-            cell_w:         font_size * 0.601,
-            cell_h:         font_size * 1.4,
-            blink:          true,
-            blink_timer:    0.0,
-            raised_on_open: false,
+            cell_w:          font_size * 0.601,
+            cell_h:          font_size * 1.4,
+            blink:           true,
+            blink_timer:     0.0,
+            raised_on_open:  false,
         }
     }
 
@@ -169,7 +177,6 @@ impl AppState {
             self.right_pane  = RightPane::Logs;
             self.active_term = 0;
         } else {
-            // Tabs that were after `idx` shift left by one; fix the active pane.
             self.active_term = self.active_term.min(self.term_tabs.len() - 1);
             if let RightPane::TerminalTab(ref mut i) = self.right_pane {
                 if *i >= self.term_tabs.len() {
@@ -180,5 +187,37 @@ impl AppState {
                 self.active_term = *i;
             }
         }
+    }
+
+    /// Swap out the current service's tabs and swap in `new_idx`'s tabs.
+    /// Returns the generation number that log pollers should use for `new_idx`.
+    pub fn switch_service(&mut self, new_idx: usize) -> u64 {
+        // Save the current service's tab list.
+        let old_idx  = self.selected_idx;
+        let old_tabs = std::mem::take(&mut self.term_tabs);
+        if !old_tabs.is_empty() {
+            self.tabs_by_service.insert(old_idx, old_tabs);
+        } else {
+            // Remove stale empty entry if it existed.
+            self.tabs_by_service.remove(&old_idx);
+        }
+
+        // Restore the new service's tab list (or start fresh).
+        self.term_tabs = self.tabs_by_service.remove(&new_idx).unwrap_or_default();
+
+        self.selected_idx  = new_idx;
+        self.log_generation += 1;
+
+        // Decide which pane to show.
+        if self.term_tabs.is_empty() {
+            self.right_pane  = RightPane::Logs;
+            self.active_term = 0;
+        } else {
+            // Restore to the last active tab (clamp in case tabs were closed).
+            self.active_term = self.active_term.min(self.term_tabs.len() - 1);
+            self.right_pane  = RightPane::TerminalTab(self.active_term);
+        }
+
+        self.log_generation
     }
 }

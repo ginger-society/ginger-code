@@ -35,7 +35,9 @@ enum BgMsg {
     /// Ejected flag update for one service by index.
     EjectedFlag { idx: usize, ejected: bool },
     /// Fresh log lines for the currently-selected service.
-    Logs(Vec<String>),
+    /// `generation` must match `AppState::log_generation` to be applied;
+    /// stale results from old pollers are silently dropped.
+    Logs { lines: Vec<String>, generation: u64 },
     /// Metadata fetch failed.
     Error(String),
 }
@@ -43,13 +45,13 @@ enum BgMsg {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    state:           AppState,
-    rx:              mpsc::Receiver<BgMsg>,
+    state:   AppState,
+    rx:      mpsc::Receiver<BgMsg>,
     /// Sender kept so we can hand clones to new background tasks.
-    tx:              mpsc::Sender<BgMsg>,
-    loading:         bool,
+    tx:      mpsc::Sender<BgMsg>,
+    loading: bool,
     /// egui context — needed to spawn per-selection log tasks.
-    ctx:             egui::Context,
+    ctx:     egui::Context,
 }
 
 impl App {
@@ -158,9 +160,18 @@ impl App {
         }
     }
 
-    // ── Spawn a one-shot log fetch + ejected-flag check for service `idx` ─────
+    // ── Spawn ejected check, then conditionally start log poller ─────────────
+    //
+    // This is the ONLY place a log poller is ever started.  By serialising the
+    // ejected check before the first poll we guarantee that:
+    //   • an ejected service never gets pod-log lines written to the log view, and
+    //   • the poller is never racing the ejected flag message.
+    //
+    // `generation` is captured at spawn time so that if the user switches to a
+    // different service before results arrive, every message from this task is
+    // silently discarded by the receiver.
 
-    fn spawn_service_refresh(&self, idx: usize, deployment_name: String) {
+    fn spawn_service_refresh(&self, idx: usize, deployment_name: String, generation: u64) {
         let tx  = self.tx.clone();
         let ctx = self.ctx.clone();
 
@@ -171,63 +182,34 @@ impl App {
                 .expect("tokio rt");
 
             rt.block_on(async move {
+                // ── Step 1: ejected check (always first, no racing) ───────────
                 let ejected = is_ejected(&deployment_name).await;
                 let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+                ctx.request_repaint();
 
-                // Only fetch logs if not ejected.
-                if !ejected {
-                    let logs = get_pod_logs(&deployment_name).await;
-                    let _ = tx.send(BgMsg::Logs(logs));
+                if ejected {
+                    // Ejected — do not fetch logs at all.  The EjectedFlag
+                    // message above will update the log view with the dev-mode
+                    // notice via the existing handler in update().
+                    return;
                 }
 
+                // ── Step 2: first log fetch ───────────────────────────────────
+                let lines = get_pod_logs(&deployment_name).await;
+                let _ = tx.send(BgMsg::Logs { lines, generation });
                 ctx.request_repaint();
-            });
-        });
-    }
 
-    // ── Ejected-only check (no log fetch) ─────────────────────────────────────
-
-    fn spawn_ejected_check(&self, idx: usize, deployment_name: String) {
-        let tx  = self.tx.clone();
-        let ctx = self.ctx.clone();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio rt");
-
-            rt.block_on(async move {
-                let ejected = is_ejected(&deployment_name).await;
-                let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
-                ctx.request_repaint();
-            });
-        });
-    }
-
-    // ── Recurring log poller — only called for non-ejected services ───────────
-
-    fn spawn_log_poller(&self, deployment_name: String) {
-        let tx  = self.tx.clone();
-        let ctx = self.ctx.clone();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio rt");
-
-            rt.block_on(async move {
+                // ── Step 3: recurring poll (only for non-ejected services) ────
                 loop {
-                    let logs = get_pod_logs(&deployment_name).await;
-                    // If the receiver is gone (app closed / service changed) stop.
-                    if tx.send(BgMsg::Logs(logs)).is_err() { break; }
-                    ctx.request_repaint();
                     sleep(Duration::from_secs(2)).await;
+                    let lines = get_pod_logs(&deployment_name).await;
+                    if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
+                    ctx.request_repaint();
                 }
             });
         });
     }
+
 
     // ── Open a new terminal tab and connect it ────────────────────────────────
 
@@ -282,32 +264,38 @@ impl App {
     }
 
     // ── Service selection ─────────────────────────────────────────────────────
+    //
+    // Uses `AppState::switch_service` to atomically swap tab lists and bump
+    // the log generation, then kicks off the appropriate background tasks.
 
-    fn select_service(&mut self, idx: usize) {
-        let svc             = &self.state.services[idx];
+    fn select_service(&mut self, new_idx: usize) {
+        // switch_service saves/restores per-service tabs, bumps log_generation,
+        // and returns the new generation number.
+        let generation = self.state.switch_service(new_idx);
+
+        let svc             = &self.state.services[new_idx];
         let meta_name       = svc.meta_name.clone();
         let deployment_name = svc.deployment_name.clone();
         let ejected         = svc.ejected;
 
-        self.state.selected_idx = idx;
-        self.state.right_pane   = RightPane::Logs;
-
         if ejected {
+            // Show the dev-mode notice immediately (we know it's ejected from
+            // a previous check).  spawn_service_refresh will re-confirm and
+            // skip starting any log poller.
             self.state.logs = vec![
                 format!("⚡ {} is ejected — running in dev mode.", meta_name),
                 "No application logs available.".into(),
                 "Use a Terminal tab to interact with the container.".into(),
             ];
-            // Still check the ejected flag in case it changed, but skip logs.
-            if let Some(dep) = deployment_name {
-                self.spawn_ejected_check(idx, dep);
-            }
         } else {
             self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
-            if let Some(dep) = deployment_name {
-                self.spawn_service_refresh(idx, dep.clone());
-                self.spawn_log_poller(dep);
-            }
+        }
+
+        // Always run refresh — it checks ejected first, then (only if not
+        // ejected) fetches logs and starts the recurring poller.
+        // This is the single entry-point; no separate spawn_log_poller call.
+        if let Some(dep) = deployment_name {
+            self.spawn_service_refresh(new_idx, dep, generation);
         }
     }
 }
@@ -322,18 +310,23 @@ impl eframe::App for App {
                     self.state.selected_idx = 0;
                     self.loading            = false;
 
-                    // Kick off refresh for service 0, respecting ejected state.
+                    // Kick off a refresh for service 0.
+                    // We need the ejected state before we can decide what to show,
+                    // so spawn_service_refresh does the ejected check first, then
+                    // optionally fetches logs — both tagged with generation 0.
                     if let Some(svc) = self.state.services.first() {
-                        let dep     = svc.deployment_name.clone();
-                        let ejected = svc.ejected;
+                        let dep        = svc.deployment_name.clone();
+                        let generation = self.state.log_generation;
                         if let Some(dep) = dep {
-                            self.spawn_service_refresh(0, dep.clone());
-                            if !ejected {
-                                self.spawn_log_poller(dep);
-                            }
+                            // spawn_service_refresh checks ejected first, then
+                            // conditionally fetches logs and starts the poller —
+                            // so there is no race between the ejected check and
+                            // the first log result.
+                            self.spawn_service_refresh(0, dep, generation);
                         }
                     }
                 }
+
                 Ok(BgMsg::K8sStatuses(deployments)) => {
                     for svc in &mut self.state.services {
                         if let Some(ref dep) = svc.deployment_name {
@@ -347,13 +340,15 @@ impl eframe::App for App {
                         }
                     }
                 }
+
                 Ok(BgMsg::EjectedFlag { idx, ejected }) => {
                     if let Some(svc) = self.state.services.get_mut(idx) {
                         svc.ejected = ejected;
                     }
-                    // If this is the selected service and it's ejected, replace
-                    // any stale "Fetching…" or real log lines with the dev-mode notice.
-                    if idx == self.state.selected_idx && ejected
+                    // If this is the selected service and it just became ejected,
+                    // replace log content with the dev-mode notice.
+                    if idx == self.state.selected_idx
+                        && ejected
                         && self.state.right_pane == RightPane::Logs
                     {
                         let name = self.state.services
@@ -367,18 +362,23 @@ impl eframe::App for App {
                         ];
                     }
                 }
-                Ok(BgMsg::Logs(lines)) => {
-                    // Only apply if we're still showing the Logs pane —
-                    // avoids clobbering logs with stale results from a
-                    // previous selection's poller.
-                    if self.state.right_pane == RightPane::Logs {
+
+                Ok(BgMsg::Logs { lines, generation }) => {
+                    // Only apply if this result belongs to the currently selected
+                    // service (via generation) AND we're showing the Logs pane.
+                    // Stale results from previous service pollers are dropped here.
+                    if generation == self.state.log_generation
+                        && self.state.right_pane == RightPane::Logs
+                    {
                         self.state.logs = lines;
                     }
                 }
+
                 Ok(BgMsg::Error(e)) => {
                     self.loading    = false;
                     self.state.logs = vec![format!("Failed to load services: {e}")];
                 }
+
                 Err(_) => break, // channel empty (or closed)
             }
         }
