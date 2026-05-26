@@ -211,6 +211,33 @@ impl App {
     }
 
 
+    // ── Bulk ejected check for all services (sidebar badges) ─────────────────
+    //
+    // Spawns ONE thread that checks every service sequentially and sends an
+    // EjectedFlag for each.  Called once after the initial metadata fetch so
+    // the sidebar [EJECTED] badges appear without requiring a click.
+    // Service 0 is skipped because spawn_service_refresh already covers it.
+
+    fn spawn_bulk_ejected_check(&self, services: Vec<(usize, String)>) {
+        let tx  = self.tx.clone();
+        let ctx = self.ctx.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio rt");
+
+            rt.block_on(async move {
+                for (idx, deployment_name) in services {
+                    let ejected = is_ejected(&deployment_name).await;
+                    let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+                    ctx.request_repaint();
+                }
+            });
+        });
+    }
+
     // ── Open a new terminal tab and connect it ────────────────────────────────
 
     fn open_and_connect_term(&mut self, ctx: &egui::Context) {
@@ -310,20 +337,25 @@ impl eframe::App for App {
                     self.state.selected_idx = 0;
                     self.loading            = false;
 
-                    // Kick off a refresh for service 0.
-                    // We need the ejected state before we can decide what to show,
-                    // so spawn_service_refresh does the ejected check first, then
-                    // optionally fetches logs — both tagged with generation 0.
+                    // ── Service 0: full refresh (ejected check + logs + poller)
                     if let Some(svc) = self.state.services.first() {
-                        let dep        = svc.deployment_name.clone();
                         let generation = self.state.log_generation;
-                        if let Some(dep) = dep {
-                            // spawn_service_refresh checks ejected first, then
-                            // conditionally fetches logs and starts the poller —
-                            // so there is no race between the ejected check and
-                            // the first log result.
+                        if let Some(dep) = svc.deployment_name.clone() {
                             self.spawn_service_refresh(0, dep, generation);
                         }
+                    }
+
+                    // ── Services 1..N: ejected-only check for sidebar badges
+                    // Runs in a single background thread, sequentially, so we
+                    // don't hammer the k8s API with N parallel requests.
+                    let rest: Vec<(usize, String)> = self.state.services
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .filter_map(|(i, s)| s.deployment_name.clone().map(|d| (i, d)))
+                        .collect();
+                    if !rest.is_empty() {
+                        self.spawn_bulk_ejected_check(rest);
                     }
                 }
 
