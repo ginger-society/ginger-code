@@ -447,15 +447,30 @@ fn supports_ssh(lang: &str) -> bool {
     matches!(lang, "TS" | "Rust")
 }
 
-// ── Eject ─────────────────────────────────────────────────────────────────────
+fn assert_daemon_reachable() -> Result<(), Box<dyn std::error::Error>> {
+    match send_to_daemon(r#"{"cmd":"ping"}"#) {
+        Ok(val) if val["status"] == "ok" => Ok(()),
+        Ok(val) => Err(format!(
+            "Daemon responded unexpectedly to ping: {}\n\
+             Make sure ginger-code is running.",
+            val
+        ).into()),
+        Err(e) => Err(format!(
+            "Cannot reach ginger-code daemon: {e}\n\
+             Start it with: ginger-code\n\
+             Or check that it is running in the system tray."
+        ).into()),
+    }
+}
 
-/// `meta_name` is e.g. "@ginger-society/dev-portal" — used to derive the repo name.
+// ── Eject ─────────────────────────────────────────────────────────────────────
 pub async fn eject(
     deployment_name: &str,
     lang: &str,
     meta_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
+    assert_daemon_reachable()?;
     // ── Read session user ─────────────────────────────────────────────────────
     let user_file = dirs::home_dir()
         .ok_or("Could not locate home directory")?
@@ -491,8 +506,10 @@ pub async fn eject(
         return Err("Could not read current image from deployment".into());
     }
 
-    // ── Create PVC ────────────────────────────────────────────────────────────
-    let pvc_name = format!("{}-eject-pvc", deployment_name);
+    // ── Create workspace PVC ──────────────────────────────────────────────────
+    let pvc_name            = format!("{}-eject-pvc", deployment_name);
+    let principals_pvc_name = format!("{}-ssh-principals-pvc", deployment_name);
+
     let pvc_yaml = format!(
         r#"apiVersion: v1
 kind: PersistentVolumeClaim
@@ -510,11 +527,34 @@ spec:
         .args(["apply", "-f", "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()?;
-
     if let Some(mut stdin) = apply.stdin.take() {
         stdin.write_all(pvc_yaml.as_bytes()).await?;
     }
     apply.wait().await?;
+
+    // ── Create principals PVC ─────────────────────────────────────────────────
+    let principals_pvc_yaml = format!(
+        r#"apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {principals_pvc_name}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 16Mi
+"#
+    );
+
+    let mut apply2 = tokio::process::Command::new("kubectl")
+        .args(["apply", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = apply2.stdin.take() {
+        stdin.write_all(principals_pvc_yaml.as_bytes()).await?;
+    }
+    apply2.wait().await?;
+    println!("✓ SSH principals PVC ready: {}", principals_pvc_name);
 
     // ── Patch deployment ──────────────────────────────────────────────────────
     let command = if ssh {
@@ -524,10 +564,13 @@ spec:
     };
 
     let mut container = serde_json::json!({
-        "name":         deployment_name,
-        "image":        image,
-        "command":      command,
-        "volumeMounts": [{ "name": "workspace", "mountPath": "/workspace" }]
+        "name":    deployment_name,
+        "image":   image,
+        "command": command,
+        "volumeMounts": [
+            { "name": "workspace",      "mountPath": "/workspace" },
+            { "name": "ssh-principals", "mountPath": "/etc/ssh/auth_principals" },
+        ]
     });
 
     if ssh {
@@ -550,10 +593,16 @@ spec:
                 },
                 "spec": {
                     "containers": [container],
-                    "volumes": [{
-                        "name": "workspace",
-                        "persistentVolumeClaim": { "claimName": pvc_name }
-                    }]
+                    "volumes": [
+                        {
+                            "name": "workspace",
+                            "persistentVolumeClaim": { "claimName": pvc_name }
+                        },
+                        {
+                            "name": "ssh-principals",
+                            "persistentVolumeClaim": { "claimName": principals_pvc_name }
+                        },
+                    ]
                 }
             }
         }
@@ -581,7 +630,6 @@ spec:
         println!("  pod scheduled: {}", pod_name);
 
         println!("⏳ Waiting for pod container to be ready...");
-
         println!("\n⏸  Sleeping 5s to allow rollout to stabilize...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
@@ -600,9 +648,16 @@ spec:
 
         println!("✓ Pod ready: {}", final_pod);
 
+        // ── Write principal into PVC-backed mount ─────────────────────────────────────
         let principal_cmd = format!(
-            "mkdir -p /etc/ssh/auth_principals && echo '{}' > /etc/ssh/auth_principals/dev",
-            session_user
+            // sshd requires auth_principals dir to be owned by root, mode 755 or stricter.
+            // The file itself must be owned by root, mode 644 or stricter.
+            "mkdir -p /etc/ssh/auth_principals && \
+            chown root:root /etc/ssh/auth_principals && \
+            chmod 755 /etc/ssh/auth_principals && \
+            echo '{session_user}' > /etc/ssh/auth_principals/dev && \
+            chown root:root /etc/ssh/auth_principals/dev && \
+            chmod 644 /etc/ssh/auth_principals/dev",
         );
 
         println!("  pod_name = '{}'", final_pod);
@@ -624,7 +679,13 @@ spec:
                 "exec", &final_pod,
                 "-c", deployment_name,
                 "--", "sh", "-c",
-                "ls /etc/ssh/auth_principals && cat /etc/ssh/auth_principals/dev",
+                "stat /etc/ssh/auth_principals && \
+                stat /etc/ssh/auth_principals/dev && \
+                echo '--- principal file contents ---' && \
+                cat /etc/ssh/auth_principals/dev && \
+                echo '--- cert principals ---' && \
+                ssh-keygen -L -f /root/.ssh/id_ed25519-cert.pub 2>/dev/null | grep -i principal || \
+                echo '(cert not present in pod)'",
             ])
             .output()
             .await?;
@@ -634,11 +695,12 @@ spec:
 
         if !exec_status.success() {
             return Err(format!(
-                "Failed to write SSH principal '{}' into pod {}", session_user, final_pod
+                "Failed to write SSH principal '{}' into PVC-backed mount on pod {}",
+                session_user, final_pod
             ).into());
         }
 
-        println!("✓ SSH principal '{}' written", session_user);
+        println!("✓ SSH principal '{}' written to persistent volume (survives restarts)", session_user);
 
         // ── Write permanent /home/dev/.ssh/config (agent-forwarded push) ──────
         println!("⏳ Writing pod SSH config for git push...");
@@ -686,10 +748,6 @@ spec:
             "forwarding_port": forwarding_port,
         });
 
-        // NOTE: the daemon register call is what writes to code.toml (via
-        // dispatch → Config::save in main.rs). If this fails, the entry is
-        // simply absent — no zombie forward will loop. The user is told how
-        // to register manually.
         match send_to_daemon(&register_payload.to_string()) {
             Ok(resp) if resp["status"] == "ok" => {
                 println!(
@@ -707,14 +765,10 @@ spec:
                      Or add the entry directly to ~/.ginger-society/code.toml.",
                     deployment_name, forwarding_port
                 );
-                // Do NOT attempt to write code.toml here — without daemon
-                // acknowledgement we can't guarantee the port isn't already in
-                // use, and writing a stale entry would cause the same retry
-                // loop we're trying to avoid.
             }
         }
 
-        // ── Add local SSH config Host block (with ForwardAgent yes) ───────────
+        // ── Add local SSH config Host block ───────────────────────────────────
         if let Err(e) = add_ssh_config(deployment_name, forwarding_port) {
             eprintln!("Warning: could not update local ~/.ssh/config: {e}");
         }
@@ -732,6 +786,9 @@ spec:
 // ── Uneject ───────────────────────────────────────────────────────────────────
 
 pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+
+    assert_daemon_reachable()?;
+
     let img_out = tokio::process::Command::new("kubectl")
         .args([
             "get", "deployment", deployment_name,
@@ -784,17 +841,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     println!("✓ Unejected {} → restored {}", deployment_name, original_image);
 
-    // ── Always remove from code.toml directly first ───────────────────────────
-    //
-    // This is the critical fix: we write code.toml unconditionally, before
-    // touching the daemon socket. Previously, if send_to_daemon failed (daemon
-    // unreachable, crashed, etc.) the entry was left in code.toml and the next
-    // daemon startup would loop forever trying to port-forward port 22 on a
-    // pod that no longer has an SSH server.
-    //
-    // The watcher in main.rs calls Config::load() on every tick and drops any
-    // deployment absent from the file, so even if the daemon is currently
-    // running, it will stop the forward within ~1 second of this write.
+    // ── Remove from code.toml directly first ──────────────────────────────────
     if let Err(e) = remove_from_config(deployment_name) {
         eprintln!("Warning: could not update code.toml directly: {e}");
         eprintln!(
@@ -803,10 +850,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
         );
     }
 
-    // ── Notify running daemon so it stops the forward immediately ─────────────
-    //
-    // This is now best-effort: code.toml is already clean, so even if this
-    // call fails the forward will be torn down on the next watcher tick.
+    // ── Notify running daemon ─────────────────────────────────────────────────
     let remove_payload = serde_json::json!({
         "cmd":             "remove",
         "deployment_name": deployment_name,
@@ -818,8 +862,6 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
         }
         Ok(resp) => eprintln!("Warning: daemon responded unexpectedly: {}", resp),
         Err(_) => {
-            // Not an error — code.toml is already clean. The watcher will
-            // pick up the change within ~1 second and kill the child process.
             println!("  (daemon unreachable — forward will stop on next watcher tick)");
         }
     }
@@ -828,6 +870,10 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
     if let Err(e) = remove_ssh_config(deployment_name) {
         eprintln!("Warning: could not clean up local ~/.ssh/config: {e}");
     }
+
+    // ── PVCs ({name}-eject-pvc, {name}-ssh-principals-pvc) are intentionally ──
+    // left intact — they are cleaned up when the ephemeral environment itself
+    // is torn down, not on uneject.
 
     Ok(())
 }

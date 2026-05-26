@@ -75,7 +75,7 @@ pub async fn fetch_metadata_and_process(
     let initial_services: Vec<K8sService> = raw_services
         .iter()
         .map(|s| {
-            let meta_name       = format!("@{}/{}", s.organization_id, s.identifier);
+            let meta_name       = format!("{}", s.identifier);
             let deployment_name = meta_to_deployment_name(&meta_name);
             let lang            = s.lang
                 .as_ref()
