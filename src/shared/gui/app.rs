@@ -312,7 +312,6 @@ impl App {
             self.state.logs = vec![
                 format!("⚡ {} is ejected — running in dev mode.", meta_name),
                 "No application logs available.".into(),
-                "Use a Terminal tab to interact with the container.".into(),
             ];
         } else {
             self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
@@ -390,7 +389,6 @@ impl eframe::App for App {
                         self.state.logs = vec![
                             format!("⚡ {} is ejected — running in dev mode.", name),
                             "No application logs available.".into(),
-                            "Use a Terminal tab to interact with the container.".into(),
                         ];
                     }
                 }
