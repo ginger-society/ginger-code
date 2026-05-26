@@ -48,13 +48,16 @@ enum BgMsg {
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    state:   AppState,
-    rx:      mpsc::Receiver<BgMsg>,
+    state:    AppState,
+    rx:       mpsc::Receiver<BgMsg>,
     /// Sender kept so we can hand clones to new background tasks.
-    tx:      mpsc::Sender<BgMsg>,
-    loading: bool,
+    tx:       mpsc::Sender<BgMsg>,
+    loading:  bool,
+    /// Set while an eject/uneject operation is in flight.
+    /// Contains a short human-readable description shown in the info strip.
+    ejecting: Option<String>,
     /// egui context — needed to spawn per-selection log tasks.
-    ctx:     egui::Context,
+    ctx:      egui::Context,
 }
 
 impl App {
@@ -155,10 +158,11 @@ impl App {
         }
 
         App {
-            state:   AppState::new(13.0, vec![]),
+            state:    AppState::new(13.0, vec![]),
             rx,
             tx,
-            loading: true,
+            loading:  true,
+            ejecting: None,
             ctx,
         }
     }
@@ -335,16 +339,12 @@ impl App {
     //   • service must have a lang (required by the eject script)
     //   • service must NOT already be ejected
     //
-    // Runs in a background thread with its own single-thread Tokio runtime,
-    // matching the pattern used everywhere else in this file.
-    // On completion, sends BgMsg::EjectResult so the log pane shows feedback
-    // and spawn_service_refresh is re-triggered to update the ejected badge.
+    // Sets self.ejecting so the info strip shows a progress indicator while
+    // the operation runs in the background.
 
-    fn run_eject(&self, ctx: &egui::Context) {
+    fn run_eject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
 
-        // Guard: already ejected — button should be hidden by panels.rs but
-        // defend here too so we never double-eject.
         if svc.ejected { return; }
 
         let Some(dep)  = svc.deployment_name.clone() else { return };
@@ -354,6 +354,8 @@ impl App {
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
         let idx       = self.state.selected_idx;
+
+        self.ejecting = Some(format!("Ejecting {}…", meta_name));
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -379,12 +381,12 @@ impl App {
     //   • service must have a deployment_name
     //   • service must currently be ejected
     //
-    // Same threading pattern as run_eject.
+    // Sets self.ejecting so the info strip shows a progress indicator while
+    // the operation runs in the background.
 
-    fn run_uneject(&self, ctx: &egui::Context) {
+    fn run_uneject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
 
-        // Guard: not ejected — nothing to do.
         if !svc.ejected { return; }
 
         let Some(dep) = svc.deployment_name.clone() else { return };
@@ -393,6 +395,8 @@ impl App {
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
         let idx       = self.state.selected_idx;
+
+        self.ejecting = Some(format!("Un-ejecting {}…", meta_name));
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -413,20 +417,10 @@ impl App {
     }
 
     // ── Open VS Code remote for the currently-selected service ────────────────
-    //
-    // Mirrors the ratatui version's 'c' keybind logic exactly.
-    // Guards:
-    //   • service must have a deployment_name
-    //   • service must currently be ejected (dev mode — local code is live)
-    //
-    // Spawns a detached OS thread with a plain std::process::Command because
-    // `code --folder-uri` hands off to the running VS Code instance immediately
-    // and exits; no async work needed.
 
     fn open_editor(&self) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
 
-        // Editor only makes sense when ejected (local code is mounted into the pod).
         if !svc.ejected { return; }
 
         let Some(dep) = svc.deployment_name.as_ref() else { return };
@@ -474,8 +468,6 @@ impl eframe::App for App {
                     }
 
                     // ── Services 1..N: ejected-only check for sidebar badges
-                    // Runs in a single background thread, sequentially, so we
-                    // don't hammer the k8s API with N parallel requests.
                     let rest: Vec<(usize, String)> = self.state.services
                         .iter()
                         .enumerate()
@@ -505,30 +497,30 @@ impl eframe::App for App {
                     if let Some(svc) = self.state.services.get_mut(idx) {
                         svc.ejected = ejected;
                     }
-                    // If this is the selected service and it just became ejected,
-                    // replace log content with the dev-mode notice.
-                    if idx == self.state.selected_idx
-                        && ejected
-                        && self.state.right_pane == RightPane::Logs
-                    {
-                        let name = self.state.services
-                            .get(idx)
-                            .map(|s| s.meta_name.as_str())
-                            .unwrap_or("this service");
-                        self.state.logs = vec![
-                            format!("⚡ {} is ejected — running in dev mode.", name),
-                            "No application logs available.".into(),
-                        ];
+                    // If this is the selected service, sync the log pane
+                    // regardless of which pane is currently visible so that
+                    // switching back to Logs always shows the correct content.
+                    if idx == self.state.selected_idx {
+                        if ejected {
+                            let name = self.state.services
+                                .get(idx)
+                                .map(|s| s.meta_name.as_str())
+                                .unwrap_or("this service");
+                            self.state.logs = vec![
+                                format!("⚡ {} is ejected — running in dev mode.", name),
+                                "No application logs available.".into(),
+                            ];
+                        }
+                        // If not ejected: leave the existing log content — the
+                        // log poller will replace it with real lines shortly.
                     }
                 }
 
                 Ok(BgMsg::Logs { lines, generation }) => {
                     // Only apply if this result belongs to the currently selected
-                    // service (via generation) AND we're showing the Logs pane.
-                    // Stale results from previous service pollers are dropped here.
-                    if generation == self.state.log_generation
-                        && self.state.right_pane == RightPane::Logs
-                    {
+                    // service (via generation).  Stale results from old pollers
+                    // (including any that were running before an eject) are dropped.
+                    if generation == self.state.log_generation {
                         self.state.logs = lines;
                     }
                 }
@@ -540,27 +532,30 @@ impl eframe::App for App {
 
                 // ── Eject / uneject result ────────────────────────────────────
                 //
-                // On success: re-run spawn_service_refresh for the affected service
-                // so the ejected badge and log pane update without requiring the
-                // user to click elsewhere and back.
+                // Clear the in-progress indicator unconditionally.
                 //
-                // On failure: the error message is appended to the log pane so it
-                // is visible in context without a modal dialog.
+                // On success:
+                //   • Bump log_generation for the affected service so any
+                //     in-flight log poller is invalidated — this prevents stale
+                //     pod-log lines from overwriting the ejected/un-ejected notice.
+                //   • Re-run spawn_service_refresh so the ejected badge and log
+                //     pane update without requiring the user to click elsewhere.
+                //
+                // On failure: the error message is visible in the log pane.
                 Ok(BgMsg::EjectResult { success, message, idx }) => {
-                    // Always show the result line in the log pane.
+                    self.ejecting = None;
                     self.state.logs.push(message);
 
                     if success {
-                        // Re-check ejected flag + restart (or suppress) log poller.
-                        // We re-fetch even if idx != selected_idx so the sidebar
-                        // badge updates correctly for background services.
+                        // Invalidate any running log poller for this service.
+                        if idx == self.state.selected_idx {
+                            self.state.log_generation += 1;
+                        }
+
                         if let Some(dep) = self.state.services
                             .get(idx)
                             .and_then(|s| s.deployment_name.clone())
                         {
-                            // Use current log_generation only for the selected service;
-                            // background services get a dummy generation that will never
-                            // match so their Logs messages are silently dropped.
                             let generation = if idx == self.state.selected_idx {
                                 self.state.log_generation
                             } else {
@@ -571,7 +566,7 @@ impl eframe::App for App {
                     }
                 }
 
-                Err(_) => break, // channel empty (or closed)
+                Err(_) => break,
             }
         }
 
@@ -666,19 +661,16 @@ impl eframe::App for App {
                 }
 
                 ui.vertical(|ui| {
-                    let strip_action = draw_info_strip(&self.state, ui);
+                    let strip_action = draw_info_strip(&self.state, self.ejecting.as_deref(), ui);
 
-                    // ── Eject ─────────────────────────────────────────────────
                     if strip_action.eject_clicked {
                         self.run_eject(ctx);
                     }
 
-                    // ── Un-eject ──────────────────────────────────────────────
                     if strip_action.uneject_clicked {
                         self.run_uneject(ctx);
                     }
 
-                    // ── Open Editor ───────────────────────────────────────────
                     if strip_action.open_editor_clicked {
                         self.open_editor();
                     }

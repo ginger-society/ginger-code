@@ -142,7 +142,8 @@ pub struct InfoStripAction {
     pub open_editor_clicked: bool,
 }
 
-pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) -> InfoStripAction {
+pub fn draw_info_strip(state: &AppState, ejecting: Option<&str>, ui: &mut egui::Ui) -> InfoStripAction {
+
     let Some(svc) = state.services.get(state.selected_idx) else {
         return InfoStripAction {
             eject_clicked:       false,
@@ -167,6 +168,35 @@ pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) -> InfoStripAction {
 
     let btn_h = 18.0;
     let btn_y = content_center_y - btn_h / 2.0;
+
+    // ── In-progress overlay: show spinner text, disable buttons ──────────────
+    if let Some(msg) = ejecting {
+        // ... paint rect and spinner text, return all-false action
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(22, 22, 22));
+        painter.line_segment(
+            [
+                egui::pos2(rect.min.x, rect.max.y - 0.5),
+                egui::pos2(rect.max.x, rect.max.y - 0.5),
+            ],
+            egui::Stroke::new(0.5, COLOR_BORDER),
+        );
+        
+        // Pulsing dots animation using time
+        let t    = ui.input(|i| i.time);
+        let dots = match ((t * 2.0) as usize) % 4 { 0=>"", 1=>".", 2=>"..", _=>"..." };
+        let label = format!("{}{}", msg, dots);
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, content_center_y),
+            egui::Align2::LEFT_CENTER,
+            &label,
+            egui::FontId::new(12.0, egui::FontFamily::Monospace),
+            COLOR_CYAN,
+        );
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        return InfoStripAction { eject_clicked: false, uneject_clicked: false, open_editor_clicked: false };
+    }
+
 
     // ── Button layout (right → left) ─────────────────────────────────────────
     //
