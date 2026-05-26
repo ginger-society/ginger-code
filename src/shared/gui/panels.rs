@@ -49,8 +49,11 @@ pub fn draw_titlebar(state: &AppState, ui: &mut egui::Ui, ctx: &egui::Context) {
     for ((center, _), color) in dot_data.iter().zip(dot_colors.iter()) {
         painter.circle_filled(*center, 6.0, *color);
     }
-    let svc   = &state.services[state.selected_idx];
-    let title = format!("Ginger Code  —  {}", svc.meta_name);
+    // AFTER:
+    let title = state.services
+        .get(state.selected_idx)
+        .map(|s| format!("Ginger Code  —  {}", s.meta_name))
+        .unwrap_or_else(|| "Ginger Code".to_string());
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, title,
         egui::FontId::proportional(12.0), egui::Color32::from_rgb(160, 160, 160));
     drop(painter);
@@ -137,7 +140,9 @@ pub struct InfoStripAction {
 }
 
 pub fn draw_info_strip(state: &AppState, ui: &mut egui::Ui) -> InfoStripAction {
-    let svc = &state.services[state.selected_idx];
+    let Some(svc) = state.services.get(state.selected_idx) else {
+        return InfoStripAction { eject_clicked: false, open_editor_clicked: false };
+    };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
 
     let pad_y = 8.0;
@@ -352,7 +357,10 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
     }
 
     // ── "+" button ────────────────────────────────────────────────────────────
-    let svc_has_host = state.services[state.selected_idx].ssh_host.is_some();
+    let svc_has_host = state.services
+        .get(state.selected_idx)
+        .and_then(|s| s.ssh_host.as_ref())
+        .is_some();
     if state.term_tabs.len() < MAX_TERM_TABS && svc_has_host {
         let plus_rect = egui::Rect::from_min_size(
             egui::pos2(x, bar_rect.min.y), egui::vec2(PLUS_W, TAB_H),
@@ -386,7 +394,8 @@ pub fn draw_tab_bar(state: &AppState, ui: &mut egui::Ui) -> Option<TabBarAction>
 // ── Logs pane ─────────────────────────────────────────────────────────────────
 
 pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
-    let svc       = &state.services[state.selected_idx];
+    let Some(svc) = state.services.get(state.selected_idx) else { return; };
+
     let font_size = state.font_size;
     egui::ScrollArea::vertical()
         .id_source("logs_scroll")

@@ -1,6 +1,15 @@
 use eframe::egui;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+
+use MetadataService::{
+    apis::{
+        configuration::Configuration as MetadataConfiguration,
+        default_api::{metadata_get_services_and_envs, MetadataGetServicesAndEnvsParams},
+    },
+    get_configuration as get_metadata_configuration,
+};
+use ginger_shared_rs::utils::get_token_from_file_storage;
 
 use super::colors::{COLOR_BG, COLOR_BORDER, COLOR_CYAN, COLOR_SIDEBAR_BG, COLOR_TAB_ACTIVE};
 use super::panels::{
@@ -9,149 +18,122 @@ use super::panels::{
 };
 use super::terminal::{spawn_ssh, TermPerformer};
 use super::types::{AppState, K8sService, RightPane, TermState};
+use crate::shared::ui::kubernetes::meta_to_deployment_name;
+
+// ── Background channel messages ───────────────────────────────────────────────
+
+enum BgMsg {
+    Services(Vec<K8sService>),
+    Error(String),
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    state: AppState,
+    state:   AppState,
+    rx:      mpsc::Receiver<BgMsg>,
+    loading: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // ── Fonts ─────────────────────────────────────────────────────────────
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "mono".to_owned(),
-            egui::FontData::from_static(include_bytes!("../../../assets/JetBrainsMono-Regular.ttf")),
+            egui::FontData::from_static(include_bytes!(
+                "../../../assets/JetBrainsMono-Regular.ttf"
+            )),
         );
-        fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "mono".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "mono".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
-        // ── Stub services — replace with real data source ─────────────────────
-        let services = vec![
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-frontend-users".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-frontend-users".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/iam-admin-fe".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("iam-admin-fe".into()),
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/IAMAdminService".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("IAMAdminService".into()),
-                status: "Running".into(), ready: "1/1".into(),
-                lang: Some("Rust".into()), ejected: true,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/dev-portal".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("dev-portal".into()),
-                status: "Running".into(), ready: "1/1".into(),
-                lang: Some("TS".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-            K8sService {
-                meta_name: "@ginger-society/NotificationService".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: None,
-                status: "Not deployed".into(), ready: "–".into(),
-                lang: None, ejected: false, ssh_host: None,
-            },
-            K8sService {
-                meta_name: "@ginger-society/MetadataService".into(),
-                organization_id: "ginger-society".into(),
-                deployment_name: Some("metadata-service".into()),
-                status: "Degraded".into(), ready: "0/1".into(),
-                lang: Some("Rust".into()), ejected: false,
-                ssh_host: Some("dev@iamadminservice-local".into()),
-            },
-        ];
+        // ── Kick off background metadata fetch ────────────────────────────────
+        let (tx, rx) = mpsc::channel::<BgMsg>();
+        let ctx      = cc.egui_ctx.clone();
 
-        App { state: AppState::new(13.0, services) }
+        std::thread::spawn(move || {
+            // eframe's App::new has no tokio context, so we create our own
+            // single-threaded runtime inside this OS thread.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+
+            rt.block_on(async move {
+                let token           = get_token_from_file_storage();
+                let metadata_config = get_metadata_configuration(Some(token));
+
+                match metadata_get_services_and_envs(
+                    &metadata_config,
+                    MetadataGetServicesAndEnvsParams {
+                        page_number: Some("1".to_string()),
+                        page_size:   Some("100".to_string()),
+                        org_id:      "ginger-society".to_string(),
+                    },
+                )
+                .await
+                {
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::Error(format!("{e:?}")));
+                    }
+                    Ok(raw) => {
+                        let services = raw
+                            .iter()
+                            .map(|s| {
+                                let meta_name       = s.identifier.to_string();
+                                let deployment_name = meta_to_deployment_name(&meta_name);
+                                let lang = s
+                                    .lang
+                                    .as_ref()
+                                    .and_then(|l| l.as_ref())
+                                    .map(|l| l.clone());
+                                let ssh_host = Some(format!(
+                                    "dev@{}-local",
+                                    deployment_name.to_lowercase().replace('_', "-"),
+                                ));
+                                K8sService {
+                                    meta_name,
+                                    organization_id: s.organization_id.clone(),
+                                    deployment_name: Some(deployment_name),
+                                    status:   "Unknown".into(),
+                                    ready:    "–".into(),
+                                    lang,
+                                    ejected:  false,
+                                    ssh_host,
+                                }
+                            })
+                            .collect();
+
+                        let _ = tx.send(BgMsg::Services(services));
+                    }
+                }
+
+                // Wake egui so the new data is picked up on the very next frame.
+                ctx.request_repaint();
+            });
+        });
+
+        App {
+            state:   AppState::new(13.0, vec![]),
+            rx,
+            loading: true,
+        }
     }
 
     // ── Open a new terminal tab and connect it ────────────────────────────────
 
     fn open_and_connect_term(&mut self, ctx: &egui::Context) {
-        // Default initial grid size; will resize on first render.
         let rows = 24;
         let cols = 80;
 
         let tab_idx = match self.state.open_term_tab(rows, cols) {
             Some(i) => i,
-            None    => return, // cap reached — button should be hidden, belt-and-suspenders
+            None    => return,
         };
 
         self.state.right_pane = RightPane::TerminalTab(tab_idx);
@@ -166,10 +148,10 @@ impl App {
             Some(t) => t,
             None    => return,
         };
-        let svc_idx  = tab.service_idx;
-        let rows     = tab.term_rows as u16;
-        let cols     = tab.term_cols as u16;
-        let host     = match self.state.services.get(svc_idx).and_then(|s| s.ssh_host.as_ref()) {
+        let svc_idx = tab.service_idx;
+        let rows    = tab.term_rows as u16;
+        let cols    = tab.term_cols as u16;
+        let host    = match self.state.services.get(svc_idx).and_then(|s| s.ssh_host.as_ref()) {
             Some(h) => h.clone(),
             None => {
                 if let Some(t) = self.state.term_tabs.get_mut(tab_idx) {
@@ -179,23 +161,14 @@ impl App {
             }
         };
 
-        // Build a scrollback sink shared between the performer and the tab.
         let sink: super::terminal::ScrollbackSink = Arc::new(Mutex::new(Vec::new()));
         let performer = Arc::new(Mutex::new(
             TermPerformer::new(rows as usize, cols as usize)
                 .with_sink(Arc::clone(&sink)),
         ));
 
-        // Replace the tab's performer with the new one that has the sink wired up.
         let tab = &mut self.state.term_tabs[tab_idx];
-        tab.performer = Arc::clone(&performer);
-
-        // Share the same Vec as the tab's scrollback so the sink writes directly
-        // into tab.scrollback.  We do this by cloning the Arc into the tab — both
-        // sides point at the same Mutex<Vec<…>>.
-        // (We store a separate Arc on the tab for read access from the render thread.)
-        // Since TermPerformer already holds the Arc, we just need our tab to hold
-        // a reference to the same data.  We achieve this by handing the tab the Arc.
+        tab.performer      = Arc::clone(&performer);
         tab.scrollback_arc = Some(Arc::clone(&sink));
 
         match spawn_ssh(&host, rows, cols, performer, ctx.clone()) {
@@ -209,25 +182,41 @@ impl App {
     fn select_service(&mut self, idx: usize) {
         let meta_name = self.state.services[idx].meta_name.clone();
         self.state.selected_idx = idx;
-        // Don't kill existing terminal tabs — they belong to whatever service
-        // opened them.  Just switch the pane view to Logs for the new service.
-        self.state.right_pane = RightPane::Logs;
-        self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
+        self.state.right_pane   = RightPane::Logs;
+        self.state.logs         = vec![format!("Fetching logs for {}…", meta_name)];
         // TODO: kick off async log fetch here
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Drain the background channel ──────────────────────────────────────
+        match self.rx.try_recv() {
+            Ok(BgMsg::Services(svcs)) => {
+                self.state.services     = svcs;
+                self.state.selected_idx = 0;
+                self.loading            = false;
+            }
+            Ok(BgMsg::Error(e)) => {
+                self.loading      = false;
+                self.state.logs   = vec![format!("Failed to load services: {e}")];
+            }
+            Err(_) => {} // nothing yet, or channel already closed
+        }
+
         // ── Raise window on first frame (tray launch) ─────────────────────────
         if !self.state.raised_on_open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
             self.state.raised_on_open = true;
             ctx.request_repaint();
         } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
         }
 
         // ── Cursor blink (only when a terminal tab is visible) ────────────────
@@ -240,7 +229,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
-        // Sync scrollback from Arc sinks into tab.scrollback each frame.
+        // ── Sync scrollback from Arc sinks into tab.scrollback each frame ─────
         for tab in &mut self.state.term_tabs {
             if let Some(ref sink) = tab.scrollback_arc {
                 let mut s = sink.lock();
@@ -267,19 +256,30 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(COLOR_SIDEBAR_BG))
             .show(ctx, |ui| {
                 let (hdr, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 22.0), egui::Sense::hover(),
+                    egui::vec2(ui.available_width(), 22.0),
+                    egui::Sense::hover(),
                 );
                 ui.painter().rect_filled(hdr, 0.0, COLOR_SIDEBAR_BG);
                 ui.painter().text(
                     egui::pos2(hdr.min.x + 8.0, hdr.center().y),
-                    egui::Align2::LEFT_CENTER, "Services",
-                    egui::FontId::new(11.0, egui::FontFamily::Monospace), COLOR_CYAN,
+                    egui::Align2::LEFT_CENTER,
+                    "Services",
+                    egui::FontId::new(11.0, egui::FontFamily::Monospace),
+                    COLOR_CYAN,
                 );
                 ui.painter().line_segment(
                     [hdr.left_bottom(), hdr.right_bottom()],
                     egui::Stroke::new(0.5, COLOR_BORDER),
                 );
-                if let Some(new_idx) = draw_service_list(&self.state, ui) {
+
+                if self.loading {
+                    // Show a simple loading message while the fetch is in flight.
+                    ui.add_space(8.0);
+                    ui.colored_label(COLOR_CYAN, "Loading services…");
+                } else if self.state.services.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(COLOR_CYAN, "No services found.");
+                } else if let Some(new_idx) = draw_service_list(&self.state, ui) {
                     self.select_service(new_idx);
                 }
             });
@@ -291,20 +291,24 @@ impl eframe::App for App {
                 ui.vertical(|ui| {
                     let strip_action = draw_info_strip(&self.state, ui);
                     if strip_action.eject_clicked {
-                        let svc = &self.state.services[self.state.selected_idx];
-                        println!("[eject] dummy callback — would eject: {}", svc.meta_name);
-                        // TODO: wire up real eject logic here
+                        if let Some(svc) = self.state.services.get(self.state.selected_idx) {
+                            println!("[eject] dummy callback — would eject: {}", svc.meta_name);
+                            // TODO: wire up real eject logic here
+                        }
                     }
                     if strip_action.open_editor_clicked {
-                        let svc = &self.state.services[self.state.selected_idx];
-                        println!("[editor] dummy callback — would open editor for: {}", svc.meta_name);
-                        // TODO: spawn `code <path>` or `codium <path>`
+                        if let Some(svc) = self.state.services.get(self.state.selected_idx) {
+                            println!(
+                                "[editor] dummy callback — would open editor for: {}",
+                                svc.meta_name
+                            );
+                            // TODO: spawn `code <path>` or `codium <path>`
+                        }
                     }
 
-                    // 2. Tab bar (Logs + terminal tabs + "+" button)
+                    // Tab bar (Logs + terminal tabs + "+" button)
                     let action = draw_tab_bar(&self.state, ui);
 
-                    // Process tab bar actions after the immutable borrow ends.
                     match action {
                         Some(TabBarAction::SwitchToLogs) => {
                             self.state.right_pane = RightPane::Logs;
@@ -322,9 +326,9 @@ impl eframe::App for App {
                         None => {}
                     }
 
-                    // 3. Pane content
+                    // Pane content
                     match self.state.right_pane {
-                        RightPane::Logs => draw_logs_pane(&self.state, ui),
+                        RightPane::Logs           => draw_logs_pane(&self.state, ui),
                         RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
                     }
                 });
