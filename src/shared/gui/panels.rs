@@ -478,7 +478,7 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
     let Some(svc) = state.services.get(state.selected_idx) else { return; };
 
     let font_size = state.font_size;
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::both()
         .id_source("logs_scroll")
         .stick_to_bottom(true)
         .show(ui, |ui| {
