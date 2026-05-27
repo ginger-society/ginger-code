@@ -124,13 +124,20 @@ pub type StateMap = Arc<Mutex<HashMap<String, ForwardState>>>;
 
 // ── Probe constants ───────────────────────────────────────────────────────────
 
-/// After this many seconds of failed probes on a "connected" forward,
-/// kill and restart the kubectl process.
-const MAX_PROBE_FAIL_SECS: u64 = 15;
+/// After this many seconds without a successful probe on a previously-connected
+/// forward AND at least MIN_PROBE_FAIL_COUNT consecutive failures, kill and
+/// restart. Raised from 15 s → 60 s so transient VS Code I/O stalls don't
+/// trigger a restart.
+const MAX_PROBE_FAIL_SECS: u64 = 60;
+
+/// Minimum number of consecutive probe failures required (in addition to the
+/// time threshold) before we declare the stream dead. A single slow banner
+/// read resets this counter and won't cause a restart on its own.
+const MIN_PROBE_FAIL_COUNT: u32 = 3;
 
 /// Hard ceiling on kubectl process lifetime — restart regardless of probe
 /// status. Prevents SPDY streams from going stale silently over long sessions.
-const MAX_FORWARD_LIFETIME_SECS: u64 = 600; // 10 minutes
+const MAX_FORWARD_LIFETIME_SECS: u64 = 6000; // 100 minutes
 
 // ── Network reachability ──────────────────────────────────────────────────────
 
@@ -158,13 +165,17 @@ fn probe_port(port: u16) -> bool {
 // reliable way to detect a dead stream is to actually attempt the SSH
 // handshake: the SSH server sends its banner immediately on connect.
 // If we read at least one byte we know the stream end-to-end is alive.
+//
+// Timeouts are intentionally generous (2 s connect, 3 s read) so that
+// VS Code heavy I/O — which can momentarily stall the banner — does not
+// cause false negatives that accumulate toward the kill threshold.
 
 fn probe_ssh(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(2000)) {
         Err(_) => false,
         Ok(mut stream) => {
-            stream.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+            stream.set_read_timeout(Some(Duration::from_millis(3000))).ok();
             let mut buf = [0u8; 8];
             matches!(stream.read(&mut buf), Ok(n) if n > 0)
         }
@@ -265,6 +276,11 @@ fn interruptible_sleep(dur: Duration, stop_flag: &Arc<AtomicBool>) {
 // Owns the kubectl child for its entire lifetime.
 // Detects dead SSH streams via banner probe, not just TCP connect.
 // Enforces a hard process lifetime ceiling to prevent SPDY stream rot.
+//
+// Kill decision requires BOTH:
+//   • No successful probe for MAX_PROBE_FAIL_SECS
+//   • At least MIN_PROBE_FAIL_COUNT consecutive failures
+// This prevents VS Code heavy-I/O stalls from being misread as dead streams.
 
 fn spawn_forward_thread(
     entry:     DeploymentEntry,
@@ -275,13 +291,17 @@ fn spawn_forward_thread(
     std::thread::Builder::new()
         .name(format!("forward-{}", entry.deployment_name))
         .spawn(move || {
-            let name                          = entry.deployment_name.clone();
-            let mut child:      Option<Child> = None;
-            let mut spawned_at: Option<Instant> = None;
-            let mut attempt:    u32           = 0;
-            // Tracks when we last got a successful probe on a connected forward.
-            // Used to detect silently-dead SPDY streams.
-            let mut last_good_probe: Option<Instant> = None;
+            let name                              = entry.deployment_name.clone();
+            let mut child:        Option<Child>   = None;
+            let mut spawned_at:   Option<Instant> = None;
+            let mut attempt:      u32             = 0;
+            /// Tracks when we last got a successful probe on a connected forward.
+            /// Used to detect silently-dead SPDY streams.
+            let mut last_good_probe:      Option<Instant> = None;
+            /// Number of consecutive probe failures since the last success.
+            /// Reset to 0 on any successful probe. Both this AND the elapsed
+            /// time must exceed their thresholds before we restart.
+            let mut consecutive_failures: u32             = 0;
 
             loop {
                 // ── Stop requested ────────────────────────────────────────────
@@ -300,10 +320,11 @@ fn spawn_forward_thread(
                 if offline.load(Ordering::Relaxed) {
                     if child.is_some() {
                         if let Some(ref mut c) = child { kill_child(c); }
-                        child           = None;
-                        spawned_at      = None;
-                        last_good_probe = None;
-                        attempt         = 0;
+                        child                = None;
+                        spawned_at           = None;
+                        last_good_probe      = None;
+                        consecutive_failures = 0;
+                        attempt              = 0;
                         if let Ok(mut map) = state_map.lock() {
                             if let Some(fw) = map.get_mut(&name) {
                                 fw.status = ForwardStatus::Offline;
@@ -323,9 +344,10 @@ fn spawn_forward_thread(
                 if !alive {
                     // ── Process exited — clean up and schedule retry ──────────
                     if let Some(ref mut c) = child { kill_child(c); }
-                    child           = None;
-                    spawned_at      = None;
-                    last_good_probe = None;
+                    child                = None;
+                    spawned_at           = None;
+                    last_good_probe      = None;
+                    consecutive_failures = 0;
 
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) {
@@ -369,10 +391,11 @@ fn spawn_forward_thread(
                             name, MAX_FORWARD_LIFETIME_SECS
                         );
                         if let Some(ref mut c) = child { kill_child(c); }
-                        child           = None;
-                        spawned_at      = None;
-                        last_good_probe = None;
-                        attempt         = 0;
+                        child                = None;
+                        spawned_at           = None;
+                        last_good_probe      = None;
+                        consecutive_failures = 0;
+                        attempt              = 0;
                         continue;
                     }
 
@@ -383,7 +406,8 @@ fn spawn_forward_thread(
                     if settled {
                         if probe(&entry) {
                             // ── Probe succeeded ───────────────────────────────
-                            last_good_probe = Some(Instant::now());
+                            last_good_probe      = Some(Instant::now());
+                            consecutive_failures = 0;
 
                             if let Ok(mut map) = state_map.lock() {
                                 if let Some(fw) = map.get_mut(&name) {
@@ -400,29 +424,49 @@ fn spawn_forward_thread(
                         } else {
                             // ── Probe failed ──────────────────────────────────
                             //
-                            // If we were connected and haven't had a good probe
-                            // for MAX_PROBE_FAIL_SECS, the SPDY stream is dead.
-                            // Kill and restart immediately with no backoff.
+                            // Increment the consecutive-failure counter.
+                            // Only restart when BOTH thresholds are exceeded:
+                            //   1. No good probe for MAX_PROBE_FAIL_SECS
+                            //   2. At least MIN_PROBE_FAIL_COUNT failures in a row
+                            //
+                            // This means a single timeout (VS Code I/O stall,
+                            // brief network hiccup) resets nothing harmful and
+                            // will not cause a restart on its own.
+                            consecutive_failures += 1;
+
                             let was_connected = state_map.lock().ok()
                                 .and_then(|m| m.get(&name)
                                     .map(|fw| fw.status == ForwardStatus::Connected))
                                 .unwrap_or(false);
 
-                            let stream_stale = last_good_probe
+                            let time_exceeded = last_good_probe
                                 .map_or(false, |t| t.elapsed() > Duration::from_secs(MAX_PROBE_FAIL_SECS));
 
-                            if was_connected && stream_stale {
+                            let count_exceeded = consecutive_failures >= MIN_PROBE_FAIL_COUNT;
+
+                            if was_connected && time_exceeded && count_exceeded {
                                 eprintln!(
                                     "[ginger-code] SSH stream dead on '{}' \
-                                     (no good probe for {}s) — restarting now",
-                                    name, MAX_PROBE_FAIL_SECS
+                                     (no good probe for {}s, {} consecutive failures) — restarting now",
+                                    name, MAX_PROBE_FAIL_SECS, consecutive_failures
                                 );
                                 if let Some(ref mut c) = child { kill_child(c); }
-                                child           = None;
-                                spawned_at      = None;
-                                last_good_probe = None;
-                                attempt         = 0; // immediate retry, no backoff
+                                child                = None;
+                                spawned_at           = None;
+                                last_good_probe      = None;
+                                consecutive_failures = 0;
+                                attempt              = 0; // immediate retry, no backoff
                                 continue;
+                            }
+
+                            // Log degraded state without restarting yet
+                            if was_connected {
+                                eprintln!(
+                                    "[ginger-code] probe miss #{} on '{}' ({}s since last good) — watching",
+                                    consecutive_failures,
+                                    name,
+                                    last_good_probe.map_or(0, |t| t.elapsed().as_secs()),
+                                );
                             }
                         }
                     }
