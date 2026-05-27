@@ -14,9 +14,6 @@ path = "src/main.rs"
 name = "ginger-code-cli"
 path = "src/bin/cli.rs"
 
-[[bin]]
-name = "ginger-code-gui"
-path = "src/bin/gui.rs"
 
 [dependencies]
 serde       = { version = "=1.0.193", features = ["derive"] }
