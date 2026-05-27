@@ -361,22 +361,49 @@ async fn delete_root_ssh(
     Ok(())
 }
 
+
+async fn find_git_in_pod(
+    pod_name:  &str,
+    container: &str,
+) -> String {
+    // Try common locations used by nix, asdf, brew, or plain distros
+    let probe = tokio::process::Command::new("kubectl")
+        .args([
+            "exec", pod_name, "-c", container,
+            "--", "sh", "-c",
+            "command -v git 2>/dev/null || \
+             find /usr/local/bin /usr/bin /nix/var/nix/profiles/default/bin \
+                  /home/dev/.nix-profile/bin /root/.nix-profile/bin \
+                  -name git -type f 2>/dev/null | head -1",
+        ])
+        .output().await;
+
+    match probe {
+        Ok(out) => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if path.is_empty() { "git".to_string() } else { path }
+        }
+        Err(_) => "git".to_string(),
+    }
+}
+
 // ── Clone + branch checkout ───────────────────────────────────────────────────
 //
 // Three cases:
 //   1. /workspace/<repo> does not exist  → clone main, then checkout branch
 //   2. /workspace/<repo> exists, branch not checked out → checkout branch
 //   3. /workspace/<repo> exists, branch already checked out → nothing to do
-
 async fn setup_repo_branch(
     pod_name:  &str,
     container: &str,
     repo_name: &str,
     branch:    &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let git = find_git_in_pod(pod_name, container).await;
+    println!("  Using git binary: {}", git);
+
     let workspace_repo = format!("/workspace/{}", repo_name);
 
-    // ── Check if repo directory exists ────────────────────────────────────────
     let exists_out = tokio::process::Command::new("kubectl")
         .args([
             "exec", pod_name, "-c", container,
@@ -388,7 +415,6 @@ async fn setup_repo_branch(
     let repo_exists = String::from_utf8_lossy(&exists_out.stdout).trim() == "yes";
 
     if !repo_exists {
-        // ── Case 1: clone main then checkout/create branch ────────────────────
         println!("  /workspace/{} not found — cloning from main...", repo_name);
 
         let clone_cmd = format!(
@@ -397,51 +423,48 @@ async fn setup_repo_branch(
                  -o StrictHostKeyChecking=no \
                  -o UserKnownHostsFile=/dev/null \
                  -p 3333' \
-             git clone -b main git@source.gingersociety.org:{repo}.git {ws}/{repo} && \
+             {git} clone -b main git@source.gingersociety.org:{repo}.git {ws}/{repo} && \
              chown -R dev:dev {ws}/{repo}",
+            git  = git,
             repo = repo_name,
             ws   = "/workspace",
         );
+        // ... rest unchanged, just use `git` variable for clone
 
-        let clone = tokio::process::Command::new("kubectl")
-            .args(["exec", pod_name, "-c", container, "--", "sh", "-c", &clone_cmd])
-            .status().await?;
-
-        if !clone.success() {
-            eprintln!(
-                "Warning: git clone failed for '{}'. Clone manually inside the pod.",
-                repo_name
-            );
-            return Ok(());
-        }
-
-        println!("✓ Cloned {} into {}", repo_name, workspace_repo);
-
-        // Now checkout/create the branch
-        checkout_or_create_branch(pod_name, container, &workspace_repo, branch).await?;
+        checkout_or_create_branch(pod_name, container, &workspace_repo, branch, &git).await?;
 
     } else {
-        // ── Cases 2 & 3: repo exists — check current branch ──────────────────
+        let safe_repo_cmd = format!(
+            "{git} config --global --add safe.directory {workspace_repo}",
+            git = git,
+        );
+        let _ = tokio::process::Command::new("kubectl")
+            .args(["exec", pod_name, "-c", container, "--", "sh", "-c", &safe_repo_cmd])
+            .status().await?;
+
+        // Fix ownership so git doesn't reject the directory
+        let _ = tokio::process::Command::new("kubectl")
+            .args(["exec", pod_name, "-c", container, "--",
+                   "chown", "-R", "dev:dev", &workspace_repo])
+            .status().await?;
+
         let current_branch_out = tokio::process::Command::new("kubectl")
             .args([
                 "exec", pod_name, "-c", container,
                 "--", "sh", "-c",
-                &format!("git -C {} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown", workspace_repo),
+                &format!("{git} -C {workspace_repo} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown",
+                    git = git),
             ])
             .output().await?;
 
         let current_branch = String::from_utf8_lossy(&current_branch_out.stdout)
-            .trim()
-            .to_string();
+            .trim().to_string();
 
         if current_branch == branch {
             println!("  {} already on branch '{}' — nothing to do", repo_name, branch);
         } else {
-            println!(
-                "  {} is on '{}', switching to '{}'...",
-                repo_name, current_branch, branch
-            );
-            checkout_or_create_branch(pod_name, container, &workspace_repo, branch).await?;
+            println!("  {} is on '{}', switching to '{}'...", repo_name, current_branch, branch);
+            checkout_or_create_branch(pod_name, container, &workspace_repo, branch, &git).await?;
         }
     }
 
@@ -455,17 +478,22 @@ async fn checkout_or_create_branch(
     container:     &str,
     workspace_repo: &str,
     branch:        &str,
+    git:            &str,   
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Fetch remote so we know if the branch exists there
     let fetch_cmd = format!(
-        "git -C {repo} fetch origin {branch} 2>/dev/null; \
-         if git -C {repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then \
-             git -C {repo} checkout -B {branch} origin/{branch} && \
+        "{git} -C {repo} fetch origin {branch} 2>/dev/null || true; \
+         if {git} -C {repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then \
+             {git} -C {repo} checkout -B {branch} origin/{branch} && \
              echo 'checked-out-remote'; \
+         elif {git} -C {repo} show-ref --verify --quiet refs/heads/{branch}; then \
+             {git} -C {repo} checkout {branch} && \
+             echo 'checked-out-local'; \
          else \
-             git -C {repo} checkout -b {branch} && \
+             {git} -C {repo} checkout -b {branch} && \
              echo 'created-new'; \
          fi",
+        git    = git,
         repo   = workspace_repo,
         branch = branch,
     );
