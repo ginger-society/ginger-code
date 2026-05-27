@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -37,7 +37,7 @@ impl Config {
     }
 }
 
-// ── Branch config (branches/<slug>.toml — deployments for one branch) ─────────
+// ── Branch config (branches/<slug>.toml) ──────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct BranchConfig {
@@ -46,7 +46,6 @@ pub struct BranchConfig {
 }
 
 impl BranchConfig {
-    /// "feat/2fa-auth" → branches/feat-2fa-auth.toml
     fn path_for(cfg_path: &PathBuf, branch: &str) -> PathBuf {
         let slug = branch.replace('/', "-");
         cfg_path
@@ -91,9 +90,6 @@ pub enum ForwardStatus {
 }
 
 // ── ForwardState ──────────────────────────────────────────────────────────────
-//
-// The kubectl Child is owned by its thread — not stored here.
-// This struct holds only observable state plus the handles to stop the thread.
 
 #[derive(Debug)]
 pub struct ForwardState {
@@ -126,6 +122,16 @@ impl ForwardState {
 
 pub type StateMap = Arc<Mutex<HashMap<String, ForwardState>>>;
 
+// ── Probe constants ───────────────────────────────────────────────────────────
+
+/// After this many seconds of failed probes on a "connected" forward,
+/// kill and restart the kubectl process.
+const MAX_PROBE_FAIL_SECS: u64 = 15;
+
+/// Hard ceiling on kubectl process lifetime — restart regardless of probe
+/// status. Prevents SPDY streams from going stale silently over long sessions.
+const MAX_FORWARD_LIFETIME_SECS: u64 = 600; // 10 minutes
+
 // ── Network reachability ──────────────────────────────────────────────────────
 
 fn has_network() -> bool {
@@ -135,14 +141,44 @@ fn has_network() -> bool {
         .unwrap_or(false)
 }
 
-// ── TCP probe ─────────────────────────────────────────────────────────────────
+// ── TCP probe — for non-SSH forwards ─────────────────────────────────────────
 
 fn probe_port(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(300),
+        Duration::from_millis(500),
     )
     .is_ok()
+}
+
+// ── SSH banner probe — for SSH forwards ──────────────────────────────────────
+//
+// A plain TCP connect to kubectl port-forward always succeeds even when the
+// internal SPDY streams have died — kubectl is still listening.  The only
+// reliable way to detect a dead stream is to actually attempt the SSH
+// handshake: the SSH server sends its banner immediately on connect.
+// If we read at least one byte we know the stream end-to-end is alive.
+
+fn probe_ssh(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+        Err(_) => false,
+        Ok(mut stream) => {
+            stream.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+            let mut buf = [0u8; 8];
+            matches!(stream.read(&mut buf), Ok(n) if n > 0)
+        }
+    }
+}
+
+// ── Choose probe based on deployment port ─────────────────────────────────────
+
+fn probe(entry: &DeploymentEntry) -> bool {
+    if entry.deployment_port == 22 {
+        probe_ssh(entry.forwarding_port)
+    } else {
+        probe_port(entry.forwarding_port)
+    }
 }
 
 // ── Backoff ───────────────────────────────────────────────────────────────────
@@ -187,7 +223,7 @@ fn spawn_kubectl_child(entry: &DeploymentEntry) -> Option<Child> {
     match Command::new(&kubectl)
         .args(["port-forward", &target, &ports])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null()) // suppress stream timeout noise
         .spawn()
     {
         Ok(child) => {
@@ -225,6 +261,10 @@ fn interruptible_sleep(dur: Duration, stop_flag: &Arc<AtomicBool>) {
 }
 
 // ── Per-deployment supervised thread ─────────────────────────────────────────
+//
+// Owns the kubectl child for its entire lifetime.
+// Detects dead SSH streams via banner probe, not just TCP connect.
+// Enforces a hard process lifetime ceiling to prevent SPDY stream rot.
 
 fn spawn_forward_thread(
     entry:     DeploymentEntry,
@@ -235,17 +275,20 @@ fn spawn_forward_thread(
     std::thread::Builder::new()
         .name(format!("forward-{}", entry.deployment_name))
         .spawn(move || {
-            let name           = entry.deployment_name.clone();
-            let mut child:      Option<Child>   = None;
+            let name                          = entry.deployment_name.clone();
+            let mut child:      Option<Child> = None;
             let mut spawned_at: Option<Instant> = None;
-            let mut attempt:    u32             = 0;
+            let mut attempt:    u32           = 0;
+            // Tracks when we last got a successful probe on a connected forward.
+            // Used to detect silently-dead SPDY streams.
+            let mut last_good_probe: Option<Instant> = None;
 
             loop {
                 // ── Stop requested ────────────────────────────────────────────
                 if stop_flag.load(Ordering::Relaxed) {
                     if let Some(ref mut c) = child {
                         kill_child(c);
-                        println!("[ginger-code] thread stopped, killed child for {}", name);
+                        println!("[ginger-code] stopped forward for {}", name);
                     }
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) { fw.pid = None; }
@@ -255,11 +298,12 @@ fn spawn_forward_thread(
 
                 // ── Network offline — kill child and wait ─────────────────────
                 if offline.load(Ordering::Relaxed) {
-                    if let Some(ref mut c) = child {
-                        kill_child(c);
-                        child      = None;
-                        spawned_at = None;
-                        attempt    = 0;
+                    if child.is_some() {
+                        if let Some(ref mut c) = child { kill_child(c); }
+                        child           = None;
+                        spawned_at      = None;
+                        last_good_probe = None;
+                        attempt         = 0;
                         if let Ok(mut map) = state_map.lock() {
                             if let Some(fw) = map.get_mut(&name) {
                                 fw.status = ForwardStatus::Offline;
@@ -277,14 +321,16 @@ fn spawn_forward_thread(
                     .map_or(false, |c| c.try_wait().ok().flatten().is_none());
 
                 if !alive {
+                    // ── Process exited — clean up and schedule retry ──────────
                     if let Some(ref mut c) = child { kill_child(c); }
-                    child      = None;
-                    spawned_at = None;
+                    child           = None;
+                    spawned_at      = None;
+                    last_good_probe = None;
 
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) {
-                            fw.status   = ForwardStatus::Retrying { attempt };
-                            fw.pid      = None;
+                            fw.status = ForwardStatus::Retrying { attempt };
+                            fw.pid    = None;
                             if attempt > 0 { fw.restarts += 1; }
                         }
                     }
@@ -299,7 +345,7 @@ fn spawn_forward_thread(
                     interruptible_sleep(delay, &stop_flag);
                     if stop_flag.load(Ordering::Relaxed) { continue; }
 
-                    child = spawn_kubectl_child(&entry);
+                    child      = spawn_kubectl_child(&entry);
                     spawned_at = Some(Instant::now());
 
                     if let Some(ref c) = child {
@@ -311,12 +357,34 @@ fn spawn_forward_thread(
                     }
 
                 } else {
-                    // ── Child alive — probe after settle window ────────────────
+                    // ── Child alive — run health checks ───────────────────────
+
+                    // Hard lifetime ceiling — restart before SPDY streams rot
+                    let too_old = spawned_at
+                        .map_or(false, |t| t.elapsed() > Duration::from_secs(MAX_FORWARD_LIFETIME_SECS));
+
+                    if too_old {
+                        eprintln!(
+                            "[ginger-code] refreshing '{}' — max lifetime ({}s) reached",
+                            name, MAX_FORWARD_LIFETIME_SECS
+                        );
+                        if let Some(ref mut c) = child { kill_child(c); }
+                        child           = None;
+                        spawned_at      = None;
+                        last_good_probe = None;
+                        attempt         = 0;
+                        continue;
+                    }
+
+                    // Probe after settle window only
                     let settled = spawned_at
                         .map_or(false, |t| t.elapsed() > Duration::from_secs(3));
 
                     if settled {
-                        if probe_port(entry.forwarding_port) {
+                        if probe(&entry) {
+                            // ── Probe succeeded ───────────────────────────────
+                            last_good_probe = Some(Instant::now());
+
                             if let Ok(mut map) = state_map.lock() {
                                 if let Some(fw) = map.get_mut(&name) {
                                     if fw.status != ForwardStatus::Connected {
@@ -330,36 +398,44 @@ fn spawn_forward_thread(
                                 }
                             }
                         } else {
-                            // Probe failed while supposedly connected — stream died
-                            let was_connected = state_map.lock().ok().and_then(|m| {
-                                m.get(&name).map(|fw| fw.status == ForwardStatus::Connected)
-                            }).unwrap_or(false);
+                            // ── Probe failed ──────────────────────────────────
+                            //
+                            // If we were connected and haven't had a good probe
+                            // for MAX_PROBE_FAIL_SECS, the SPDY stream is dead.
+                            // Kill and restart immediately with no backoff.
+                            let was_connected = state_map.lock().ok()
+                                .and_then(|m| m.get(&name)
+                                    .map(|fw| fw.status == ForwardStatus::Connected))
+                                .unwrap_or(false);
 
-                            if was_connected {
+                            let stream_stale = last_good_probe
+                                .map_or(false, |t| t.elapsed() > Duration::from_secs(MAX_PROBE_FAIL_SECS));
+
+                            if was_connected && stream_stale {
                                 eprintln!(
-                                    "[ginger-code] probe failed on connected '{}' — restarting",
-                                    name
+                                    "[ginger-code] SSH stream dead on '{}' \
+                                     (no good probe for {}s) — restarting now",
+                                    name, MAX_PROBE_FAIL_SECS
                                 );
                                 if let Some(ref mut c) = child { kill_child(c); }
-                                child      = None;
-                                spawned_at = None;
-                                attempt    = 0;
+                                child           = None;
+                                spawned_at      = None;
+                                last_good_probe = None;
+                                attempt         = 0; // immediate retry, no backoff
                                 continue;
                             }
                         }
                     }
 
-                    std::thread::sleep(Duration::from_millis(500));
+                    // Slow poll — reduces stream noise in kubectl logs
+                    std::thread::sleep(Duration::from_millis(1000));
                 }
             }
         })
         .expect("spawn forward thread")
 }
 
-// ── Stop all forward threads and join them ────────────────────────────────────
-//
-// Collects all handles outside the mutex, signals stop, then joins.
-// Safe to call from any thread — does not hold the lock while joining.
+// ── Stop all forward threads and join ─────────────────────────────────────────
 
 pub fn stop_all_forwards(state_map: &StateMap) {
     let handles: Vec<std::thread::JoinHandle<()>> = {
@@ -373,10 +449,14 @@ pub fn stop_all_forwards(state_map: &StateMap) {
     };
     for handle in handles { handle.join().ok(); }
     state_map.lock().unwrap().clear();
-    println!("[ginger-code] all forward threads stopped and map cleared");
+    println!("[ginger-code] all forward threads stopped");
 }
 
-// ── Start forward threads for a branch's deployments ─────────────────────────
+pub fn shutdown_all_threads(state_map: &StateMap) {
+    stop_all_forwards(state_map);
+}
+
+// ── Start forwards for a branch ───────────────────────────────────────────────
 
 fn start_branch_forwards(
     cfg_path:  &PathBuf,
@@ -456,8 +536,8 @@ fn run_watcher(
     offline:   Arc<AtomicBool>,
     shutdown:  Arc<AtomicBool>,
 ) {
-    let mut last_branch:   Option<String>                 = None;
-    let mut last_modified: Option<std::time::SystemTime>  = None;
+    let mut last_branch:   Option<String>                = None;
+    let mut last_modified: Option<std::time::SystemTime> = None;
 
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_secs(2));
@@ -480,7 +560,7 @@ fn run_watcher(
                 last_branch, branch
             );
 
-            // 1. Stop every existing forward thread cleanly
+            // 1. Stop all existing forwards cleanly
             stop_all_forwards(&state_map);
 
             // 2. Kill GUI — dev reopens to see the new branch
@@ -493,12 +573,12 @@ fn run_watcher(
 
             last_branch = branch.clone();
 
-            // 3. Start forwards for new branch (if any)
+            // 3. Start forwards for new branch
             if let Some(ref active) = branch {
                 start_branch_forwards(&cfg_path, active, &state_map, &offline);
             }
 
-            continue; // skip normal reconcile on a branch-switch tick
+            continue; // skip normal reconcile on branch-switch tick
         }
 
         // ── Normal reconcile — same branch ────────────────────────────────────
@@ -554,26 +634,18 @@ fn run_watcher(
     }
 }
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
-
-pub fn shutdown_all_threads(state_map: &StateMap) {
-    stop_all_forwards(state_map);
-}
-
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Request {
     Ping,
-    /// Register a deployment into the active branch toml
     Register {
         deployment_name: String,
         deployment_port: u16,
         forwarding_port: u16,
     },
     List,
-    /// Remove a deployment from the active branch toml
     Remove { deployment_name: String },
 }
 
@@ -611,11 +683,10 @@ fn dispatch(
 
             let Some(ref branch) = cfg.active_branch else {
                 return Response::Error {
-                    message: "No active branch set in code.toml — run `ginger-code -b <branch>` first".into(),
+                    message: "No active branch — run `ginger-code -b <branch>` first".into(),
                 };
             };
 
-            // Update branch toml
             let mut bc = BranchConfig::load(cfg_path, branch);
             bc.deployments.retain(|d| d.deployment_name != deployment_name);
             bc.deployments.push(DeploymentEntry {
@@ -625,7 +696,6 @@ fn dispatch(
             });
             bc.save(cfg_path, branch);
 
-            // Start thread immediately if not already running
             {
                 let mut map = state_map.lock().unwrap();
                 if !map.contains_key(&deployment_name) {
@@ -694,19 +764,20 @@ fn dispatch(
                 };
             };
 
-            // Remove from branch toml
-            let mut bc     = BranchConfig::load(cfg_path, branch);
-            let before     = bc.deployments.len();
+            let mut bc = BranchConfig::load(cfg_path, branch);
+            let before = bc.deployments.len();
             bc.deployments.retain(|d| d.deployment_name != deployment_name);
 
             if bc.deployments.len() == before {
                 return Response::Error {
-                    message: format!("Deployment '{}' not found in branch '{}'", deployment_name, branch),
+                    message: format!(
+                        "Deployment '{}' not found in branch '{}'",
+                        deployment_name, branch
+                    ),
                 };
             }
             bc.save(cfg_path, branch);
 
-            // Stop thread immediately
             let handle_to_join = {
                 let mut map = state_map.lock().unwrap();
                 map.remove(&deployment_name).map(|mut fw| {
@@ -724,7 +795,10 @@ fn dispatch(
             }
 
             Response::Ok {
-                message: format!("Removed '{}' from branch '{}' — forward torn down", deployment_name, branch),
+                message: format!(
+                    "Removed '{}' from branch '{}' — forward torn down",
+                    deployment_name, branch
+                ),
             }
         }
     }
@@ -768,7 +842,7 @@ fn socket_path() -> PathBuf {
     PathBuf::from(runtime).join("ginger-code.sock")
 }
 
-// ── Spawn a background thread, restart on panic ───────────────────────────────
+// ── Spawn resilient background thread ────────────────────────────────────────
 
 fn spawn_resilient<F>(name: &'static str, shutdown: Arc<AtomicBool>, f: F)
 where
@@ -801,7 +875,6 @@ where
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // ── GUI mode ──────────────────────────────────────────────────────────────
     if args.contains(&"--gui".to_string()) {
         shared::gui::run_gui().unwrap();
         return;
@@ -838,14 +911,14 @@ fn main() {
     let shutdown             = Arc::new(AtomicBool::new(false));
     let offline              = Arc::new(AtomicBool::new(!has_network()));
 
-    // ── Seed state: load active branch and start its forwards ─────────────────
+    // ── Seed state from active branch ─────────────────────────────────────────
     {
         let cfg = Config::load(&cfg_path);
         if let Some(ref branch) = cfg.active_branch {
             println!("[ginger-code] active branch: '{}'", branch);
             start_branch_forwards(&cfg_path, branch, &state_map, &offline);
         } else {
-            println!("[ginger-code] no active branch — set one with `ginger-code -b <branch>`");
+            println!("[ginger-code] no active branch — run `ginger-code -b <branch>`");
         }
     }
 
@@ -901,7 +974,7 @@ fn main() {
         }
     });
 
-    // ── Tray — owns the main thread (required by macOS) ──────────────────────
+    // ── Tray — owns the main thread ───────────────────────────────────────────
     tray::run_tray(
         Arc::clone(&state_map),
         Arc::clone(&shutdown),
@@ -910,7 +983,7 @@ fn main() {
         cfg_path.clone(),
     );
 
-    // ── Graceful shutdown after tray exits ────────────────────────────────────
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
     println!("[ginger-code] shutting down...");
     shutdown.store(true, Ordering::Relaxed);
     shutdown_all_threads(&state_map);

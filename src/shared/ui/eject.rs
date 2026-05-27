@@ -23,25 +23,49 @@ fn send_to_daemon(payload: &str) -> Result<serde_json::Value, Box<dyn std::error
     Ok(serde_json::from_str(&resp)?)
 }
 
-// ── code.toml direct write (used by uneject so cleanup is always guaranteed) ──
+// ── Active branch from code.toml ──────────────────────────────────────────────
 
-/// Remove a deployment entry from ~/.ginger-society/code.toml directly,
-/// without going through the daemon socket. This is called unconditionally
-/// in uneject() so that a dead or unreachable daemon never leaves a stale
-/// port-forward entry that loops forever on the next daemon startup.
-fn remove_from_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn active_branch() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".ginger-society").join("code.toml");
+    let raw  = fs::read_to_string(&path).ok()?;
+    let val: toml::Value = toml::from_str(&raw).ok()?;
+    val.get("active_branch")?.as_str().map(|s| s.to_string())
+}
+
+// ── code.toml direct write ────────────────────────────────────────────────────
+
+fn remove_from_branch_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let home = dirs::home_dir().ok_or("Could not locate home directory")?;
-    let cfg_path = home.join(".ginger-society").join("code.toml");
 
-    if !cfg_path.exists() {
+    // Read active branch
+    let cfg_path  = home.join(".ginger-society").join("code.toml");
+    let raw       = fs::read_to_string(&cfg_path).unwrap_or_default();
+    let cfg: toml::Value = toml::from_str(&raw)
+        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
+
+    let branch = match cfg.get("active_branch").and_then(|v| v.as_str()) {
+        Some(b) => b.to_string(),
+        None    => {
+            println!("  No active branch in code.toml, nothing to remove from branch config");
+            return Ok(());
+        }
+    };
+
+    // Remove from branches/<slug>.toml
+    let slug       = branch.replace('/', "-");
+    let branch_path = home.join(".ginger-society").join("branches")
+        .join(format!("{}.toml", slug));
+
+    if !branch_path.exists() {
         return Ok(());
     }
 
-    let raw = fs::read_to_string(&cfg_path)?;
-    let mut cfg: toml::Value = toml::from_str(&raw)
+    let raw = fs::read_to_string(&branch_path)?;
+    let mut bc: toml::Value = toml::from_str(&raw)
         .unwrap_or_else(|_| toml::Value::Table(Default::default()));
 
-    if let Some(deps) = cfg.get_mut("deployments").and_then(|d| d.as_array_mut()) {
+    if let Some(deps) = bc.get_mut("deployments").and_then(|d| d.as_array_mut()) {
         deps.retain(|d| {
             d.get("deployment_name")
                 .and_then(|v| v.as_str())
@@ -49,8 +73,8 @@ fn remove_from_config(deployment_name: &str) -> Result<(), Box<dyn std::error::E
         });
     }
 
-    fs::write(&cfg_path, toml::to_string_pretty(&cfg)?)?;
-    println!("✓ Removed '{}' from code.toml", deployment_name);
+    fs::write(&branch_path, toml::to_string_pretty(&bc)?)?;
+    println!("✓ Removed '{}' from branch config ({})", deployment_name, branch);
     Ok(())
 }
 
@@ -69,9 +93,7 @@ fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
         };
 
     for port in 2200u16..=2299 {
-        if used_ports.contains(&port) {
-            continue;
-        }
+        if used_ports.contains(&port) { continue; }
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return Ok(port);
         }
@@ -84,9 +106,7 @@ fn find_free_22xx_port() -> Result<u16, Box<dyn std::error::Error>> {
 
 /// "@ginger-society/dev-portal" → "ginger-society-dev-portal"
 fn meta_to_repo_name(meta_name: &str) -> String {
-    meta_name
-        .trim_start_matches('@')
-        .replace('/', "-")
+    meta_name.trim_start_matches('@').replace('/', "-")
 }
 
 // ── ~/.ssh/config helpers ─────────────────────────────────────────────────────
@@ -96,15 +116,12 @@ const CONFIG_END_MARKER:   &str = "# END ginger-eject:";
 const SOURCE_HOST_MARKER:  &str = "# BEGIN ginger-source";
 const SOURCE_HOST_END:     &str = "# END ginger-source";
 
-/// Append the `source` git Host block to local ~/.ssh/config (idempotent).
 fn add_source_ssh_config() -> Result<(), Box<dyn std::error::Error>> {
     let home     = dirs::home_dir().ok_or("Could not locate home directory")?;
     let cfg_path = home.join(".ssh").join("config");
 
     let existing = fs::read_to_string(&cfg_path).unwrap_or_default();
-    if existing.contains(SOURCE_HOST_MARKER) {
-        return Ok(());
-    }
+    if existing.contains(SOURCE_HOST_MARKER) { return Ok(()); }
 
     let identity_file = home.join(".ssh").join("id_ed25519");
     let block = format!(
@@ -120,8 +137,6 @@ fn add_source_ssh_config() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Append a Host block for `deployment_name` to ~/.ssh/config.
-/// ForwardAgent yes so git push inside the pod uses the MacBook's ssh-agent.
 fn add_ssh_config(
     deployment_name: &str,
     forwarding_port: u16,
@@ -130,13 +145,10 @@ fn add_ssh_config(
     let ssh_dir  = home.join(".ssh");
     let cfg_path = ssh_dir.join("config");
 
-    if !ssh_dir.exists() {
-        fs::create_dir_all(&ssh_dir)?;
-    }
+    if !ssh_dir.exists() { fs::create_dir_all(&ssh_dir)?; }
     if !cfg_path.exists() {
         fs::File::create(&cfg_path)?;
-        #[cfg(unix)]
-        {
+        #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&cfg_path, fs::Permissions::from_mode(0o600))?;
         }
@@ -181,16 +193,12 @@ fn add_ssh_config(
     Ok(())
 }
 
-/// Remove the Host block for `deployment_name` from ~/.ssh/config.
 fn remove_ssh_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = dirs::home_dir()
         .ok_or("Could not locate home directory")?
-        .join(".ssh")
-        .join("config");
+        .join(".ssh").join("config");
 
-    if !cfg_path.exists() {
-        return Ok(());
-    }
+    if !cfg_path.exists() { return Ok(()); }
 
     let content = fs::read_to_string(&cfg_path)?;
     let begin   = format!("{} {}", CONFIG_BEGIN_MARKER, deployment_name);
@@ -205,14 +213,9 @@ fn remove_ssh_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
     let mut skipping = false;
 
     for line in content.lines() {
-        if line.trim_start().starts_with(&begin) {
-            skipping = true;
-            continue;
-        }
+        if line.trim_start().starts_with(&begin) { skipping = true; continue; }
         if skipping {
-            if line.trim_start().starts_with(&end) {
-                skipping = false;
-            }
+            if line.trim_start().starts_with(&end) { skipping = false; }
             continue;
         }
         out.push_str(line);
@@ -227,42 +230,35 @@ fn remove_ssh_config(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 // ── Workspace helpers ─────────────────────────────────────────────────────────
 
 async fn is_workspace_empty(
-    pod_name: &str,
+    pod_name:  &str,
     container: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let out = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name,
-            "-c", container,
+            "exec", pod_name, "-c", container,
             "--", "sh", "-c",
             "find /workspace -mindepth 1 -maxdepth 1 | head -1",
         ])
-        .output()
-        .await?;
+        .output().await?;
 
     Ok(String::from_utf8_lossy(&out.stdout).trim().is_empty())
 }
 
 // ── SSH key helpers ───────────────────────────────────────────────────────────
 
-/// Write a permanent /home/dev/.ssh/config into the pod for `git push`.
 async fn write_pod_ssh_config(
-    pod_name: &str,
+    pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let setup_status = tokio::process::Command::new("kubectl")
+    let setup = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name,
-            "-c", container,
+            "exec", pod_name, "-c", container,
             "--", "sh", "-c",
-            "mkdir -p /home/dev/.ssh && \
-             chmod 700 /home/dev/.ssh && \
-             chown dev:dev /home/dev/.ssh",
+            "mkdir -p /home/dev/.ssh && chmod 700 /home/dev/.ssh && chown dev:dev /home/dev/.ssh",
         ])
-        .status()
-        .await?;
+        .status().await?;
 
-    if !setup_status.success() {
+    if !setup.success() {
         return Err("Failed to create /home/dev/.ssh in pod".into());
     }
 
@@ -274,10 +270,9 @@ async fn write_pod_ssh_config(
              StrictHostKeyChecking no\n\
              UserKnownHostsFile /dev/null\n";
 
-    let write_status = tokio::process::Command::new("kubectl")
+    let write = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name,
-            "-c", container,
+            "exec", pod_name, "-c", container,
             "--", "sh", "-c",
             &format!(
                 "printf '%s' '{}' > /home/dev/.ssh/config && \
@@ -286,37 +281,32 @@ async fn write_pod_ssh_config(
                 pod_ssh_config
             ),
         ])
-        .status()
-        .await?;
+        .status().await?;
 
-    if write_status.success() {
+    if write.success() {
         println!("  ✓ Permanent git SSH config written into pod (/home/dev/.ssh/config)");
     } else {
         eprintln!("  Warning: failed to write SSH config into pod");
     }
-
     Ok(())
 }
 
-/// Copy SSH keys into /root/.ssh temporarily for the initial git clone.
 async fn copy_ssh_keys_to_root(
-    pod_name: &str,
+    pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let home    = dirs::home_dir().ok_or("Could not locate home directory")?;
     let ssh_dir = home.join(".ssh");
 
-    let mkdir_status = tokio::process::Command::new("kubectl")
+    let mkdir = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name,
-            "-c", container,
+            "exec", pod_name, "-c", container,
             "--", "sh", "-c",
             "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
         ])
-        .status()
-        .await?;
+        .status().await?;
 
-    if !mkdir_status.success() {
+    if !mkdir.success() {
         return Err("Failed to create /root/.ssh in pod".into());
     }
 
@@ -333,49 +323,33 @@ async fn copy_ssh_keys_to_root(
             continue;
         }
 
-        // kubectl cp does not support -c / --container, so we copy to the pod
-        // (which lands in the first running container's filesystem) then chmod.
-        // Since after eject there is only one running container this is fine.
-        let cp_status = tokio::process::Command::new("kubectl")
+        let cp = tokio::process::Command::new("kubectl")
             .args(["cp", local.to_str().unwrap(), &format!("{}:{}", pod_name, remote_path)])
-            .status()
-            .await?;
+            .status().await?;
 
-        if !cp_status.success() {
+        if !cp.success() {
             eprintln!("  Warning: failed to copy {} into pod", filename);
             continue;
         }
 
         tokio::process::Command::new("kubectl")
-            .args([
-                "exec", pod_name,
-                "-c", container,
-                "--", "chmod", perms, remote_path,
-            ])
-            .status()
-            .await?;
+            .args(["exec", pod_name, "-c", container, "--", "chmod", perms, remote_path])
+            .status().await?;
 
         println!("  ✓ Copied {} → pod:{}", filename, remote_path);
     }
-
     Ok(())
 }
 
-/// Delete /root/.ssh entirely — the temporary clone keys live only there.
 async fn delete_root_ssh(
-    pod_name: &str,
+    pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rm_status = tokio::process::Command::new("kubectl")
-        .args([
-            "exec", pod_name,
-            "-c", container,
-            "--", "rm", "-rf", "/root/.ssh",
-        ])
-        .status()
-        .await?;
+    let rm = tokio::process::Command::new("kubectl")
+        .args(["exec", pod_name, "-c", container, "--", "rm", "-rf", "/root/.ssh"])
+        .status().await?;
 
-    if rm_status.success() {
+    if rm.success() {
         println!("✓ Temporary SSH keys removed from pod (/root/.ssh wiped)");
     } else {
         eprintln!(
@@ -384,49 +358,142 @@ async fn delete_root_ssh(
             pod_name, container
         );
     }
+    Ok(())
+}
+
+// ── Clone + branch checkout ───────────────────────────────────────────────────
+//
+// Three cases:
+//   1. /workspace/<repo> does not exist  → clone main, then checkout branch
+//   2. /workspace/<repo> exists, branch not checked out → checkout branch
+//   3. /workspace/<repo> exists, branch already checked out → nothing to do
+
+async fn setup_repo_branch(
+    pod_name:  &str,
+    container: &str,
+    repo_name: &str,
+    branch:    &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_repo = format!("/workspace/{}", repo_name);
+
+    // ── Check if repo directory exists ────────────────────────────────────────
+    let exists_out = tokio::process::Command::new("kubectl")
+        .args([
+            "exec", pod_name, "-c", container,
+            "--", "sh", "-c",
+            &format!("test -d {} && echo yes || echo no", workspace_repo),
+        ])
+        .output().await?;
+
+    let repo_exists = String::from_utf8_lossy(&exists_out.stdout).trim() == "yes";
+
+    if !repo_exists {
+        // ── Case 1: clone main then checkout/create branch ────────────────────
+        println!("  /workspace/{} not found — cloning from main...", repo_name);
+
+        let clone_cmd = format!(
+            "GIT_SSH_COMMAND='ssh \
+                 -i /root/.ssh/id_ed25519 \
+                 -o StrictHostKeyChecking=no \
+                 -o UserKnownHostsFile=/dev/null \
+                 -p 3333' \
+             git clone -b main git@source.gingersociety.org:{repo}.git {ws}/{repo} && \
+             chown -R dev:dev {ws}/{repo}",
+            repo = repo_name,
+            ws   = "/workspace",
+        );
+
+        let clone = tokio::process::Command::new("kubectl")
+            .args(["exec", pod_name, "-c", container, "--", "sh", "-c", &clone_cmd])
+            .status().await?;
+
+        if !clone.success() {
+            eprintln!(
+                "Warning: git clone failed for '{}'. Clone manually inside the pod.",
+                repo_name
+            );
+            return Ok(());
+        }
+
+        println!("✓ Cloned {} into {}", repo_name, workspace_repo);
+
+        // Now checkout/create the branch
+        checkout_or_create_branch(pod_name, container, &workspace_repo, branch).await?;
+
+    } else {
+        // ── Cases 2 & 3: repo exists — check current branch ──────────────────
+        let current_branch_out = tokio::process::Command::new("kubectl")
+            .args([
+                "exec", pod_name, "-c", container,
+                "--", "sh", "-c",
+                &format!("git -C {} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown", workspace_repo),
+            ])
+            .output().await?;
+
+        let current_branch = String::from_utf8_lossy(&current_branch_out.stdout)
+            .trim()
+            .to_string();
+
+        if current_branch == branch {
+            println!("  {} already on branch '{}' — nothing to do", repo_name, branch);
+        } else {
+            println!(
+                "  {} is on '{}', switching to '{}'...",
+                repo_name, current_branch, branch
+            );
+            checkout_or_create_branch(pod_name, container, &workspace_repo, branch).await?;
+        }
+    }
 
     Ok(())
 }
 
-/// Clone the repo into /workspace using GIT_SSH_COMMAND with the temp root key.
-async fn clone_repo(
-    pod_name: &str,
-    container: &str,
-    repo_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("  /workspace is empty — cloning {}...", repo_name);
+// ── Checkout branch if it exists remotely, otherwise create it ────────────────
 
-    let clone_cmd = format!(
-        "GIT_SSH_COMMAND='ssh \
-             -i /root/.ssh/id_ed25519 \
-             -o StrictHostKeyChecking=no \
-             -o UserKnownHostsFile=/dev/null \
-             -p 3333' \
-         git clone -b main git@source.gingersociety.org:{repo}.git /workspace/{repo} && \
-         chown -R dev:dev /workspace/{repo}",
-        repo = repo_name,
+async fn checkout_or_create_branch(
+    pod_name:      &str,
+    container:     &str,
+    workspace_repo: &str,
+    branch:        &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Fetch remote so we know if the branch exists there
+    let fetch_cmd = format!(
+        "git -C {repo} fetch origin {branch} 2>/dev/null; \
+         if git -C {repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then \
+             git -C {repo} checkout -B {branch} origin/{branch} && \
+             echo 'checked-out-remote'; \
+         else \
+             git -C {repo} checkout -b {branch} && \
+             echo 'created-new'; \
+         fi",
+        repo   = workspace_repo,
+        branch = branch,
     );
 
-    let clone_status = tokio::process::Command::new("kubectl")
+    let out = tokio::process::Command::new("kubectl")
         .args([
-            "exec", pod_name,
-            "-c", container,
-            "--", "sh", "-c", &clone_cmd,
+            "exec", pod_name, "-c", container,
+            "--", "sh", "-c", &fetch_cmd,
         ])
-        .status()
-        .await?;
+        .output().await?;
 
-    if clone_status.success() {
-        println!("✓ Cloned {} into /workspace/{}", repo_name, repo_name);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if stdout.contains("checked-out-remote") {
+        println!(
+            "✓ Checked out existing remote branch '{}' in {}",
+            branch, workspace_repo
+        );
+    } else if stdout.contains("created-new") {
+        println!(
+            "✓ Created new branch '{}' in {} (no remote branch existed)",
+            branch, workspace_repo
+        );
     } else {
         eprintln!(
-            "Warning: git clone failed for '{}'. Clone manually inside the pod:\n  \
-             GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519 \
-             -o StrictHostKeyChecking=no \
-             -o UserKnownHostsFile=/dev/null \
-             -p 3333' \
-             git clone git@source.gingersociety.org:{}.git /workspace/{}",
-            repo_name, repo_name, repo_name
+            "Warning: branch checkout may have failed for '{}' in {}\n  stdout: {}\n  stderr: {}",
+            branch, workspace_repo, stdout.trim(), stderr.trim()
         );
     }
 
@@ -435,11 +502,11 @@ async fn clone_repo(
 
 // ── Builder image map ─────────────────────────────────────────────────────────
 
-fn builder_image(lang: &str) -> &'static str {
+fn builder_image(lang: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     match lang {
-        "TS"   => "gingersociety/dev-container-node:5",
-        "Rust" => "gingersociety/dev-container-rust:7",
-        other  => todo!("builder image not yet defined for lang: {}", other),
+        "TS"   => Ok("gingersociety/dev-container-node:5"),
+        "Rust" => Ok("gingersociety/dev-container-rust:7"),
+        other  => Err(format!("builder image not yet defined for lang: {}", other).into()),
     }
 }
 
@@ -464,33 +531,38 @@ fn assert_daemon_reachable() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── Eject ─────────────────────────────────────────────────────────────────────
+
 pub async fn eject(
     deployment_name: &str,
-    lang: &str,
-    meta_name: &str,
+    lang:            &str,
+    meta_name:       &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     assert_daemon_reachable()?;
+
+    // ── Read active branch ────────────────────────────────────────────────────
+    let branch = active_branch().ok_or(
+        "No active branch set — run `ginger-code -b <branch>` first"
+    )?;
+    println!("  Active branch: {}", branch);
+
     // ── Read session user ─────────────────────────────────────────────────────
     let user_file = dirs::home_dir()
         .ok_or("Could not locate home directory")?
-        .join(".ginger-society")
-        .join("user.json");
+        .join(".ginger-society").join("user.json");
 
-    let user_json = fs::read_to_string(&user_file)
+    let user_json    = fs::read_to_string(&user_file)
         .map_err(|e| format!("Could not read {}: {}", user_file.display(), e))?;
-
     let user_details: serde_json::Value = serde_json::from_str(&user_json)
         .map_err(|e| format!("Could not parse user.json: {}", e))?;
-
     let session_user = user_details["sub"]
         .as_str()
         .ok_or("sub missing or not a string in user.json")?
         .to_string();
 
-    let image     = builder_image(lang);
+    let image     = builder_image(lang)?;
     let ssh       = supports_ssh(lang);
-    let repo_name = meta_to_repo_name(meta_name);
+    let repo_name = meta_to_repo_name(meta_name).to_lowercase();
 
     // ── Read current image ────────────────────────────────────────────────────
     let img_out = tokio::process::Command::new("kubectl")
@@ -498,8 +570,7 @@ pub async fn eject(
             "get", "deployment", deployment_name,
             "-o", "jsonpath={.spec.template.spec.containers[0].image}",
         ])
-        .output()
-        .await?;
+        .output().await?;
 
     let original_image = String::from_utf8_lossy(&img_out.stdout).trim().to_string();
     if original_image.is_empty() {
@@ -511,57 +582,29 @@ pub async fn eject(
     let principals_pvc_name = format!("{}-ssh-principals-pvc", deployment_name);
 
     let pvc_yaml = format!(
-        r#"apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {pvc_name}
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 4Gi
-"#
+        "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: {pvc_name}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n      storage: 4Gi\n"
     );
-
     let mut apply = tokio::process::Command::new("kubectl")
         .args(["apply", "-f", "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()?;
-    if let Some(mut stdin) = apply.stdin.take() {
-        stdin.write_all(pvc_yaml.as_bytes()).await?;
-    }
+    if let Some(mut stdin) = apply.stdin.take() { stdin.write_all(pvc_yaml.as_bytes()).await?; }
     apply.wait().await?;
 
-    // ── Create principals PVC ─────────────────────────────────────────────────
     let principals_pvc_yaml = format!(
-        r#"apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {principals_pvc_name}
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 16Mi
-"#
+        "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: {principals_pvc_name}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources:\n    requests:\n      storage: 16Mi\n"
     );
-
     let mut apply2 = tokio::process::Command::new("kubectl")
         .args(["apply", "-f", "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()?;
-    if let Some(mut stdin) = apply2.stdin.take() {
-        stdin.write_all(principals_pvc_yaml.as_bytes()).await?;
-    }
+    if let Some(mut stdin) = apply2.stdin.take() { stdin.write_all(principals_pvc_yaml.as_bytes()).await?; }
     apply2.wait().await?;
     println!("✓ SSH principals PVC ready: {}", principals_pvc_name);
 
     // ── Patch deployment ──────────────────────────────────────────────────────
-    let command = if ssh {
-        serde_json::json!(["/entrypoint.sh"])
-    } else {
-        serde_json::json!(["sleep", "infinity"])
-    };
+    let command = if ssh { serde_json::json!(["/entrypoint.sh"]) }
+                  else   { serde_json::json!(["sleep", "infinity"]) };
 
     let mut container = serde_json::json!({
         "name":    deployment_name,
@@ -572,36 +615,24 @@ spec:
             { "name": "ssh-principals", "mountPath": "/etc/ssh/auth_principals" },
         ]
     });
-
-    if ssh {
-        container["ports"] = serde_json::json!([{ "containerPort": 22 }]);
-    }
+    if ssh { container["ports"] = serde_json::json!([{ "containerPort": 22 }]); }
 
     let patch = serde_json::json!({
         "metadata": {
             "annotations": {
                 "ginger-ejected":        "true",
                 "ginger-original-image": original_image,
+                "ginger-branch":         branch,
             }
         },
         "spec": {
             "template": {
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": null
-                    }
-                },
+                "metadata": { "annotations": { "kubectl.kubernetes.io/restartedAt": null } },
                 "spec": {
                     "containers": [container],
                     "volumes": [
-                        {
-                            "name": "workspace",
-                            "persistentVolumeClaim": { "claimName": pvc_name }
-                        },
-                        {
-                            "name": "ssh-principals",
-                            "persistentVolumeClaim": { "claimName": principals_pvc_name }
-                        },
+                        { "name": "workspace",      "persistentVolumeClaim": { "claimName": pvc_name } },
+                        { "name": "ssh-principals", "persistentVolumeClaim": { "claimName": principals_pvc_name } },
                     ]
                 }
             }
@@ -609,19 +640,13 @@ spec:
     });
 
     let status = tokio::process::Command::new("kubectl")
-        .args([
-            "patch", "deployment", deployment_name,
-            "--type", "strategic",
-            "-p", &patch.to_string(),
-        ])
-        .status()
-        .await?;
+        .args(["patch", "deployment", deployment_name, "--type", "strategic", "-p", &patch.to_string()])
+        .status().await?;
 
     if !status.success() {
         return Err(format!("kubectl patch failed for {}", deployment_name).into());
     }
-
-    println!("✓ Patched {} → {}", deployment_name, image);
+    println!("✓ Patched {} → {} (branch: {})", deployment_name, image, branch);
 
     if ssh {
         // ── Wait for pod ──────────────────────────────────────────────────────
@@ -629,116 +654,75 @@ spec:
         let pod_name = wait_for_pod_scheduled(deployment_name).await?;
         println!("  pod scheduled: {}", pod_name);
 
-        println!("⏳ Waiting for pod container to be ready...");
         println!("\n⏸  Sleeping 5s to allow rollout to stabilize...");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        println!("⏳ Re-checking current pod after stabilization...");
         let final_pod = wait_for_pod_scheduled(deployment_name).await?;
 
         tokio::process::Command::new("kubectl")
-            .args([
-                "wait",
-                &format!("pod/{}", final_pod),
-                "--for=condition=Ready",
-                "--timeout=300s",
-            ])
-            .status()
-            .await?;
+            .args(["wait", &format!("pod/{}", final_pod), "--for=condition=Ready", "--timeout=300s"])
+            .status().await?;
 
         println!("✓ Pod ready: {}", final_pod);
 
-        // ── Write principal into PVC-backed mount ─────────────────────────────────────
+        // ── Write SSH principal ───────────────────────────────────────────────
         let principal_cmd = format!(
-            // sshd requires auth_principals dir to be owned by root, mode 755 or stricter.
-            // The file itself must be owned by root, mode 644 or stricter.
             "mkdir -p /etc/ssh/auth_principals && \
-            chown root:root /etc/ssh/auth_principals && \
-            chmod 755 /etc/ssh/auth_principals && \
-            echo '{session_user}' > /etc/ssh/auth_principals/dev && \
-            chown root:root /etc/ssh/auth_principals/dev && \
-            chmod 644 /etc/ssh/auth_principals/dev",
+             chown root:root /etc/ssh/auth_principals && \
+             chmod 755 /etc/ssh/auth_principals && \
+             echo '{session_user}' > /etc/ssh/auth_principals/dev && \
+             chown root:root /etc/ssh/auth_principals/dev && \
+             chmod 644 /etc/ssh/auth_principals/dev",
         );
 
-        println!("  pod_name = '{}'", final_pod);
-        println!("  container = '{}'", deployment_name);
-
         let exec_status = tokio::process::Command::new("kubectl")
-            .args([
-                "exec", &final_pod,
-                "-c", deployment_name,
-                "--", "sh", "-c", &principal_cmd,
-            ])
-            .status()
-            .await?;
-
-        println!("  exec exit status = {:?}", exec_status);
-
-        let verify_out = tokio::process::Command::new("kubectl")
-            .args([
-                "exec", &final_pod,
-                "-c", deployment_name,
-                "--", "sh", "-c",
-                "stat /etc/ssh/auth_principals && \
-                stat /etc/ssh/auth_principals/dev && \
-                echo '--- principal file contents ---' && \
-                cat /etc/ssh/auth_principals/dev && \
-                echo '--- cert principals ---' && \
-                ssh-keygen -L -f /root/.ssh/id_ed25519-cert.pub 2>/dev/null | grep -i principal || \
-                echo '(cert not present in pod)'",
-            ])
-            .output()
-            .await?;
-
-        println!("  verify stdout = '{}'", String::from_utf8_lossy(&verify_out.stdout));
-        println!("  verify stderr = '{}'", String::from_utf8_lossy(&verify_out.stderr));
+            .args(["exec", &final_pod, "-c", deployment_name, "--", "sh", "-c", &principal_cmd])
+            .status().await?;
 
         if !exec_status.success() {
             return Err(format!(
-                "Failed to write SSH principal '{}' into PVC-backed mount on pod {}",
+                "Failed to write SSH principal '{}' into pod {}",
                 session_user, final_pod
             ).into());
         }
+        println!("✓ SSH principal '{}' written", session_user);
 
-        println!("✓ SSH principal '{}' written to persistent volume (survives restarts)", session_user);
-
-        // ── Write permanent /home/dev/.ssh/config (agent-forwarded push) ──────
+        // ── Write pod SSH config ──────────────────────────────────────────────
         println!("⏳ Writing pod SSH config for git push...");
         if let Err(e) = write_pod_ssh_config(&final_pod, deployment_name).await {
             eprintln!("Warning: {e}");
         }
 
-        // ── Clone if workspace is empty ───────────────────────────────────────
-        println!("⏳ Checking workspace...");
-        match is_workspace_empty(&final_pod, deployment_name).await {
-            Ok(true) => {
-                println!("⏳ Copying SSH keys into pod for initial clone...");
-                match copy_ssh_keys_to_root(&final_pod, deployment_name).await {
-                    Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
-                    Ok(()) => {
-                        if let Err(e) = clone_repo(&final_pod, deployment_name, &repo_name.to_lowercase()).await {
-                            eprintln!("Warning: {e}");
-                        }
-                        if let Err(e) = delete_root_ssh(&final_pod, deployment_name).await {
-                            eprintln!("Warning: {e}");
-                        }
+        // ── Clone / checkout branch ───────────────────────────────────────────
+        println!("⏳ Checking workspace and branch...");
+
+        let workspace_empty = is_workspace_empty(&final_pod, deployment_name).await
+            .unwrap_or(true);
+
+        if workspace_empty {
+            // Copy keys for the initial clone, then clean them up
+            println!("⏳ Copying SSH keys into pod for initial clone...");
+            match copy_ssh_keys_to_root(&final_pod, deployment_name).await {
+                Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
+                Ok(()) => {
+                    setup_repo_branch(&final_pod, deployment_name, &repo_name, &branch).await?;
+                    if let Err(e) = delete_root_ssh(&final_pod, deployment_name).await {
+                        eprintln!("Warning: {e}");
                     }
                 }
             }
-            Ok(false) => {
-                println!("  /workspace is not empty — skipping key copy and clone");
-            }
-            Err(e) => {
-                eprintln!("Warning: could not check workspace: {e}");
-            }
+        } else {
+            // Workspace has content — repo exists, just ensure correct branch
+            // Keys not needed for checkout (no clone required)
+            println!("  /workspace is not empty — checking branch...");
+            setup_repo_branch(&final_pod, deployment_name, &repo_name, &branch).await?;
         }
 
-        // ── Add `source` host to local ~/.ssh/config ──────────────────────────
+        // ── Local SSH config ──────────────────────────────────────────────────
         if let Err(e) = add_source_ssh_config() {
             eprintln!("Warning: could not add source host to local ~/.ssh/config: {e}");
         }
 
-        // ── Pick a free port and register with daemon ─────────────────────────
         let forwarding_port = find_free_22xx_port()?;
 
         let register_payload = serde_json::json!({
@@ -750,25 +734,19 @@ spec:
 
         match send_to_daemon(&register_payload.to_string()) {
             Ok(resp) if resp["status"] == "ok" => {
-                println!(
-                    "✓ Registered '{}' with daemon — port-forward on localhost:{}",
-                    deployment_name, forwarding_port
-                );
+                println!("✓ Registered '{}' with daemon — port-forward on localhost:{}", deployment_name, forwarding_port);
             }
             Ok(resp) => eprintln!("Warning: daemon responded unexpectedly: {}", resp),
             Err(e) => {
                 eprintln!(
-                    "Warning: could not register with daemon (is ginger-code running?): {e}\n\
-                     The eject itself succeeded — SSH is ready in the pod.\n\
-                     Register the port-forward manually with:\n  \
-                     ginger-code register --deployment-name {} --deployment-port 22 --forwarding-port {}\n\
-                     Or add the entry directly to ~/.ginger-society/code.toml.",
+                    "Warning: could not register with daemon: {e}\n\
+                     Register manually:\n  \
+                     ginger-code register --deployment-name {} --deployment-port 22 --forwarding-port {}",
                     deployment_name, forwarding_port
                 );
             }
         }
 
-        // ── Add local SSH config Host block ───────────────────────────────────
         if let Err(e) = add_ssh_config(deployment_name, forwarding_port) {
             eprintln!("Warning: could not update local ~/.ssh/config: {e}");
         }
@@ -777,16 +755,14 @@ spec:
         println!("Then push with: git push  (agent forwarding carries your key)");
     }
 
-    println!("\n⏸  Sleeping 2s — read the logs above, then Ctrl+C to exit early...");
+    println!("\n⏸  Sleeping 2s...");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
     Ok(())
 }
 
 // ── Uneject ───────────────────────────────────────────────────────────────────
 
 pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-
     assert_daemon_reachable()?;
 
     let img_out = tokio::process::Command::new("kubectl")
@@ -794,14 +770,11 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
             "get", "deployment", deployment_name,
             "-o", "jsonpath={.metadata.annotations.ginger-original-image}",
         ])
-        .output()
-        .await?;
+        .output().await?;
 
     let original_image = String::from_utf8_lossy(&img_out.stdout).trim().to_string();
     if original_image.is_empty() {
-        return Err(
-            "No ginger-original-image annotation — was this deployment ejected?".into()
-        );
+        return Err("No ginger-original-image annotation — was this deployment ejected?".into());
     }
 
     let patch = serde_json::json!({
@@ -809,6 +782,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
             "annotations": {
                 "ginger-ejected":        null,
                 "ginger-original-image": null,
+                "ginger-branch":         null,
             }
         },
         "spec": {
@@ -827,30 +801,20 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
     });
 
     let status = tokio::process::Command::new("kubectl")
-        .args([
-            "patch", "deployment", deployment_name,
-            "--type", "strategic",
-            "-p", &patch.to_string(),
-        ])
-        .status()
-        .await?;
+        .args(["patch", "deployment", deployment_name, "--type", "strategic", "-p", &patch.to_string()])
+        .status().await?;
 
     if !status.success() {
         return Err(format!("kubectl patch failed for {}", deployment_name).into());
     }
-
     println!("✓ Unejected {} → restored {}", deployment_name, original_image);
 
-    // ── Remove from code.toml directly first ──────────────────────────────────
-    if let Err(e) = remove_from_config(deployment_name) {
-        eprintln!("Warning: could not update code.toml directly: {e}");
-        eprintln!(
-            "  Remove the entry manually from ~/.ginger-society/code.toml\n  \
-             or the daemon will retry the port-forward on next startup."
-        );
+    // Remove from branch config directly (works even if daemon is down)
+    if let Err(e) = remove_from_branch_config(deployment_name) {
+        eprintln!("Warning: could not update branch config: {e}");
     }
 
-    // ── Notify running daemon ─────────────────────────────────────────────────
+    // Notify daemon to stop the forward immediately
     let remove_payload = serde_json::json!({
         "cmd":             "remove",
         "deployment_name": deployment_name,
@@ -861,19 +825,12 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
             println!("✓ Notified daemon — port-forward stopped immediately");
         }
         Ok(resp) => eprintln!("Warning: daemon responded unexpectedly: {}", resp),
-        Err(_) => {
-            println!("  (daemon unreachable — forward will stop on next watcher tick)");
-        }
+        Err(_)   => println!("  (daemon unreachable — forward will stop on next watcher tick)"),
     }
 
-    // ── Remove local SSH config Host block ────────────────────────────────────
     if let Err(e) = remove_ssh_config(deployment_name) {
         eprintln!("Warning: could not clean up local ~/.ssh/config: {e}");
     }
-
-    // ── PVCs ({name}-eject-pvc, {name}-ssh-principals-pvc) are intentionally ──
-    // left intact — they are cleaned up when the ephemeral environment itself
-    // is torn down, not on uneject.
 
     Ok(())
 }
@@ -887,16 +844,13 @@ async fn wait_for_pod_scheduled(
     for attempt in 1..=40 {
         let out = tokio::process::Command::new("kubectl")
             .args([
-                "get", "pods",
-                "-l", &label,
+                "get", "pods", "-l", &label,
                 "--field-selector=status.phase!=Failed",
                 "--no-headers",
                 "-o", "custom-columns=NAME:.metadata.name,DELETED:.metadata.deletionTimestamp",
             ])
-            .output()
-            .await?;
+            .output().await?;
 
-        // Only pick a pod that has no deletionTimestamp (shows as <none>)
         if let Some(name) = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|l| !l.is_empty() && l.contains("<none>"))
@@ -910,5 +864,5 @@ async fn wait_for_pod_scheduled(
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 
-    Err(format!("Timed out waiting for a pod to be scheduled for '{}'", deployment_name).into())
+    Err(format!("Timed out waiting for a pod for '{}'", deployment_name).into())
 }

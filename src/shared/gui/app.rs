@@ -361,7 +361,7 @@ impl App {
         let Some(dep)  = svc.deployment_name.clone() else { return };
         let Some(lang) = svc.lang.clone()            else { return };
 
-        let meta_name = svc.meta_name.clone();
+        let meta_name = format!("{}-{}" , svc.organization_id, svc.meta_name.clone());
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
         let idx       = self.state.selected_idx;
