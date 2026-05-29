@@ -290,8 +290,7 @@ async fn write_pod_ssh_config(
     }
     Ok(())
 }
-
-async fn copy_ssh_keys_to_root(
+async fn copy_ssh_keys_to_dev(
     pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -302,18 +301,18 @@ async fn copy_ssh_keys_to_root(
         .args([
             "exec", pod_name, "-c", container,
             "--", "sh", "-c",
-            "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+            "mkdir -p /home/dev/.ssh && chmod 700 /home/dev/.ssh && chown dev:dev /home/dev/.ssh",
         ])
         .status().await?;
 
     if !mkdir.success() {
-        return Err("Failed to create /root/.ssh in pod".into());
+        return Err("Failed to create /home/dev/.ssh in pod".into());
     }
 
     let files: &[(&str, &str, &str)] = &[
-        ("id_ed25519",          "/root/.ssh/id_ed25519",          "600"),
-        ("id_ed25519.pub",      "/root/.ssh/id_ed25519.pub",      "644"),
-        ("id_ed25519-cert.pub", "/root/.ssh/id_ed25519-cert.pub", "644"),
+        ("id_ed25519",          "/home/dev/.ssh/id_ed25519",          "600"),
+        ("id_ed25519.pub",      "/home/dev/.ssh/id_ed25519.pub",      "644"),
+        ("id_ed25519-cert.pub", "/home/dev/.ssh/id_ed25519-cert.pub", "644"),
     ];
 
     for (filename, remote_path, perms) in files {
@@ -332,8 +331,13 @@ async fn copy_ssh_keys_to_root(
             continue;
         }
 
+        // Fix ownership and permissions
         tokio::process::Command::new("kubectl")
-            .args(["exec", pod_name, "-c", container, "--", "chmod", perms, remote_path])
+            .args([
+                "exec", pod_name, "-c", container,
+                "--", "sh", "-c",
+                &format!("chmod {perms} {remote_path} && chown dev:dev {remote_path}"),
+            ])
             .status().await?;
 
         println!("  ✓ Copied {} → pod:{}", filename, remote_path);
@@ -341,20 +345,29 @@ async fn copy_ssh_keys_to_root(
     Ok(())
 }
 
-async fn delete_root_ssh(
+async fn delete_dev_ssh_keys(
     pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Only remove the key files, not the entire .ssh dir —
+    // /home/dev/.ssh/config was written by write_pod_ssh_config and should stay
     let rm = tokio::process::Command::new("kubectl")
-        .args(["exec", pod_name, "-c", container, "--", "rm", "-rf", "/root/.ssh"])
+        .args([
+            "exec", pod_name, "-c", container,
+            "--", "sh", "-c",
+            "rm -f /home/dev/.ssh/id_ed25519 \
+                    /home/dev/.ssh/id_ed25519.pub \
+                    /home/dev/.ssh/id_ed25519-cert.pub",
+        ])
         .status().await?;
 
     if rm.success() {
-        println!("✓ Temporary SSH keys removed from pod (/root/.ssh wiped)");
+        println!("✓ Temporary SSH keys removed from pod (/home/dev/.ssh keys wiped)");
     } else {
         eprintln!(
-            "Warning: could not remove /root/.ssh from pod — remove manually:\n  \
-             kubectl exec {} -c {} -- rm -rf /root/.ssh",
+            "Warning: could not remove SSH keys from pod — remove manually:\n  \
+             kubectl exec {} -c {} -- rm -f /home/dev/.ssh/id_ed25519 \
+             /home/dev/.ssh/id_ed25519.pub /home/dev/.ssh/id_ed25519-cert.pub",
             pod_name, container
         );
     }
@@ -404,83 +417,124 @@ async fn setup_repo_branch(
 
     let workspace_repo = format!("/workspace/{}", repo_name);
 
-    let exists_out = tokio::process::Command::new("kubectl")
+    // ── Write a script into the pod and execute it ────────────────────────────
+    // This avoids all stdin/tty/su plumbing issues with kubectl exec.
+    // The script runs as dev user via the entrypoint, with /home/dev/.ssh/config
+    // already set up by write_pod_ssh_config.
+
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+export HOME=/home/dev
+export GIT="{git}"
+
+echo "[clone] checking SSH access..."
+ssh source 2>&1 || true
+
+if [ ! -d "{ws}/{repo}" ]; then
+    echo "[clone] cloning {repo}..."
+    "$GIT" clone -b main source:{repo}.git {ws}/{repo} \
+        || "$GIT" clone -b master source:{repo}.git {ws}/{repo}
+    chown -R dev:dev {ws}/{repo}
+    echo "[clone] done"
+    DEFAULT_BRANCH=$("$GIT" -C {ws}/{repo} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+    echo "[clone] on branch: $DEFAULT_BRANCH"
+else
+    echo "[clone] repo already exists"
+fi
+
+echo "[branch] setting up branch {branch}..."
+"$GIT" -C {ws}/{repo} fetch origin {branch} 2>/dev/null || true
+
+if "$GIT" -C {ws}/{repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then
+    "$GIT" -C {ws}/{repo} checkout -B {branch} origin/{branch}
+    echo "checked-out-remote"
+elif "$GIT" -C {ws}/{repo} show-ref --verify --quiet refs/heads/{branch}; then
+    "$GIT" -C {ws}/{repo} checkout {branch}
+    echo "checked-out-local"
+else
+    echo "[branch] {branch} not on remote — creating fresh"
+    "$GIT" -C {ws}/{repo} checkout -b {branch}
+    echo "created-new"
+fi
+"#,
+        git    = git,
+        ws     = "/workspace",
+        repo   = repo_name,
+        branch = branch,
+    );
+
+    // Write script into pod
+    let write_cmd = format!(
+        "cat > /tmp/ginger_setup.sh << 'GINGER_EOF'\n{}\nGINGER_EOF\nchmod +x /tmp/ginger_setup.sh",
+        script
+    );
+
+    let write_out = tokio::process::Command::new("kubectl")
         .args([
             "exec", pod_name, "-c", container,
-            "--", "sh", "-c",
-            &format!("test -d {} && echo yes || echo no", workspace_repo),
+            "--", "sh", "-c", &write_cmd,
         ])
         .output().await?;
 
-    let repo_exists = String::from_utf8_lossy(&exists_out.stdout).trim() == "yes";
+    if !write_out.status.success() {
+        return Err(format!(
+            "Failed to write setup script into pod: {}",
+            String::from_utf8_lossy(&write_out.stderr).trim()
+        ).into());
+    }
 
-    if !repo_exists {
-        println!("  /workspace/{} not found — cloning from main...", repo_name);
+    println!("  ✓ Setup script written to pod, executing...");
 
-        let clone_cmd = format!(
-            "GIT_SSH_COMMAND='ssh \
-                 -i /root/.ssh/id_ed25519 \
-                 -o StrictHostKeyChecking=no \
-                 -o UserKnownHostsFile=/dev/null \
-                 -p 3333' \
-             {git} clone -b main git@source.gingersociety.org:{repo}.git {ws}/{repo} && \
-             chown -R dev:dev {ws}/{repo}",
-            git  = git,
-            repo = repo_name,
-            ws   = "/workspace",
-        );
-        // ... rest unchanged, just use `git` variable for clone
-
-        checkout_or_create_branch(pod_name, container, &workspace_repo, branch, &git).await?;
-
-    } else {
-        let safe_repo_cmd = format!(
-            "{git} config --global --add safe.directory {workspace_repo}",
-            git = git,
-        );
-        let _ = tokio::process::Command::new("kubectl")
-            .args(["exec", pod_name, "-c", container, "--", "sh", "-c", &safe_repo_cmd])
-            .status().await?;
-
-        // Fix ownership so git doesn't reject the directory
-        let _ = tokio::process::Command::new("kubectl")
-            .args(["exec", pod_name, "-c", container, "--",
-                   "chown", "-R", "dev:dev", &workspace_repo])
-            .status().await?;
-
-        let current_branch_out = tokio::process::Command::new("kubectl")
+    // Execute as dev user
+    let exec_out = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new("kubectl")
             .args([
                 "exec", pod_name, "-c", container,
-                "--", "sh", "-c",
-                &format!("{git} -C {workspace_repo} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown",
-                    git = git),
+                "--", "su", "dev", "-s", "/bin/sh", "/tmp/ginger_setup.sh",
             ])
-            .output().await?;
+            .output(),
+    ).await
+    .map_err(|_| "Setup script timed out after 120s")?
+    .map_err(|e| format!("Failed to execute setup script: {e}"))?;
 
-        let current_branch = String::from_utf8_lossy(&current_branch_out.stdout)
-            .trim().to_string();
+    let stdout = String::from_utf8_lossy(&exec_out.stdout);
+    let stderr = String::from_utf8_lossy(&exec_out.stderr);
 
-        if current_branch == branch {
-            println!("  {} already on branch '{}' — nothing to do", repo_name, branch);
-        } else {
-            println!("  {} is on '{}', switching to '{}'...", repo_name, current_branch, branch);
-            checkout_or_create_branch(pod_name, container, &workspace_repo, branch, &git).await?;
-        }
+    // Always print output for visibility
+    for line in stdout.lines() { println!("  {}", line); }
+    if !stderr.trim().is_empty() {
+        for line in stderr.lines() { eprintln!("  [stderr] {}", line); }
+    }
+
+    if !exec_out.status.success() {
+        return Err(format!(
+            "Setup script failed (exit {:?})", exec_out.status.code()
+        ).into());
+    }
+
+    if stdout.contains("checked-out-remote") {
+        println!("✓ Checked out existing remote branch '{}' in {}", branch, workspace_repo);
+    } else if stdout.contains("checked-out-local") {
+        println!("✓ Checked out existing local branch '{}' in {}", branch, workspace_repo);
+    } else if stdout.contains("created-new") {
+        println!(
+            "✓ Created new branch '{}' in {} (push with: git push -u origin {})",
+            branch, workspace_repo, branch
+        );
     }
 
     Ok(())
 }
 
-// ── Checkout branch if it exists remotely, otherwise create it ────────────────
-
 async fn checkout_or_create_branch(
-    pod_name:      &str,
-    container:     &str,
+    pod_name:       &str,
+    container:      &str,
     workspace_repo: &str,
-    branch:        &str,
-    git:            &str,   
+    branch:         &str,
+    git:            &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Fetch remote so we know if the branch exists there
     let fetch_cmd = format!(
         "{git} -C {repo} fetch origin {branch} 2>/dev/null || true; \
          if {git} -C {repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then \
@@ -490,6 +544,7 @@ async fn checkout_or_create_branch(
              {git} -C {repo} checkout {branch} && \
              echo 'checked-out-local'; \
          else \
+             echo 'Branch {branch} does not exist on remote or locally — creating fresh off current HEAD'; \
              {git} -C {repo} checkout -b {branch} && \
              echo 'created-new'; \
          fi",
@@ -501,7 +556,8 @@ async fn checkout_or_create_branch(
     let out = tokio::process::Command::new("kubectl")
         .args([
             "exec", pod_name, "-c", container,
-            "--", "sh", "-c", &fetch_cmd,
+            "--", "su", "-", "dev", "-s", "/bin/sh", "-c",
+            &fetch_cmd,
         ])
         .output().await?;
 
@@ -509,20 +565,20 @@ async fn checkout_or_create_branch(
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     if stdout.contains("checked-out-remote") {
-        println!(
-            "✓ Checked out existing remote branch '{}' in {}",
-            branch, workspace_repo
-        );
+        println!("✓ Checked out existing remote branch '{}' in {}", branch, workspace_repo);
+    } else if stdout.contains("checked-out-local") {
+        println!("✓ Checked out existing local branch '{}' in {}", branch, workspace_repo);
     } else if stdout.contains("created-new") {
         println!(
-            "✓ Created new branch '{}' in {} (no remote branch existed)",
-            branch, workspace_repo
+            "✓ Created new branch '{}' in {} (branch did not exist on remote — \
+             push with: git push -u origin {})",
+            branch, workspace_repo, branch
         );
     } else {
-        eprintln!(
-            "Warning: branch checkout may have failed for '{}' in {}\n  stdout: {}\n  stderr: {}",
+        return Err(format!(
+            "Branch checkout failed for '{}' in {}\n  stdout: {}\n  stderr: {}",
             branch, workspace_repo, stdout.trim(), stderr.trim()
-        );
+        ).into());
     }
 
     Ok(())
@@ -730,11 +786,12 @@ pub async fn eject(
         if workspace_empty {
             // Copy keys for the initial clone, then clean them up
             println!("⏳ Copying SSH keys into pod for initial clone...");
-            match copy_ssh_keys_to_root(&final_pod, deployment_name).await {
+            match copy_ssh_keys_to_dev(&final_pod, deployment_name).await {
                 Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
                 Ok(()) => {
                     setup_repo_branch(&final_pod, deployment_name, &repo_name, &branch).await?;
-                    if let Err(e) = delete_root_ssh(&final_pod, deployment_name).await {
+                    // was: delete_root_ssh
+                    if let Err(e) = delete_dev_ssh_keys(&final_pod, deployment_name).await {
                         eprintln!("Warning: {e}");
                     }
                 }
