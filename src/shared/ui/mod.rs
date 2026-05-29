@@ -318,7 +318,7 @@ async fn run_tui(
                                         PopupAction::ShellBlocked => unreachable!(),
                                         PopupAction::Eject | PopupAction::Uneject => {
                                             // ── grab dep, lang, ejected, meta_name ──
-                                            let (dep, lang, ejected, meta_name) = {
+                                            let (dep, lang, ejected, meta_name, organization_id) = {
                                                 let svcs = services.lock().unwrap();
                                                 let idx  = *selected_idx.lock().unwrap();
                                                 svcs.get(idx)
@@ -327,8 +327,9 @@ async fn run_tui(
                                                         s.lang.clone(),
                                                         s.ejected,
                                                         s.meta_name.clone(),
+                                                        s.organization_id.clone(),   // ← new
                                                     ))
-                                                    .unwrap_or((None, None, false, String::new()))
+                                                    .unwrap_or((None, None, false, String::new(), String::new()))
                                             };
 
                                             if let Some(dep_name) = dep {
@@ -351,6 +352,7 @@ async fn run_tui(
                                                         &dep_name,
                                                         lang.as_deref().unwrap_or(""),
                                                         &meta_name,
+                                                        &organization_id,
                                                     ).await
                                                 };
 

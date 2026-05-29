@@ -620,6 +620,7 @@ pub async fn eject(
     deployment_name: &str,
     lang:            &str,
     meta_name:       &str,
+    organization_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     assert_daemon_reachable()?;
@@ -815,6 +816,7 @@ pub async fn eject(
             "deployment_name": deployment_name,
             "deployment_port": 22,
             "forwarding_port": forwarding_port,
+            "organization_id": organization_id,
         });
 
         match send_to_daemon(&register_payload.to_string()) {

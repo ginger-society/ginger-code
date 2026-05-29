@@ -77,6 +77,7 @@ pub struct DeploymentEntry {
     pub deployment_name: String,
     pub deployment_port: u16,
     pub forwarding_port: u16,
+    pub organization_id:  String,
 }
 
 // ── Forward status ────────────────────────────────────────────────────────────
@@ -688,6 +689,7 @@ enum Request {
         deployment_name: String,
         deployment_port: u16,
         forwarding_port: u16,
+        organization_id: String,
     },
     List,
     Remove { deployment_name: String },
@@ -698,6 +700,7 @@ pub struct DeploymentStatus {
     pub deployment_name: String,
     pub deployment_port: u16,
     pub forwarding_port: u16,
+    pub organization_id:  String,
     pub forward_status:  ForwardStatus,
     pub restarts:        u32,
     pub pid:             Option<u32>,
@@ -722,7 +725,7 @@ fn dispatch(
     match req {
         Request::Ping => Response::Ok { message: "pong".to_string() },
 
-        Request::Register { deployment_name, deployment_port, forwarding_port } => {
+        Request::Register { deployment_name, deployment_port, forwarding_port , organization_id} => {
             let cfg = Config::load(cfg_path);
 
             let Some(ref branch) = cfg.active_branch else {
@@ -737,6 +740,7 @@ fn dispatch(
                 deployment_name: deployment_name.clone(),
                 deployment_port,
                 forwarding_port,
+                organization_id: organization_id.clone(),
             });
             bc.save(cfg_path, branch);
 
@@ -747,6 +751,7 @@ fn dispatch(
                         deployment_name: deployment_name.clone(),
                         deployment_port,
                         forwarding_port,
+                        organization_id: organization_id.clone(),
                     };
                     let stop   = Arc::new(AtomicBool::new(false));
                     let handle = spawn_forward_thread(
@@ -783,6 +788,7 @@ fn dispatch(
                     deployment_name: e.deployment_name.clone(),
                     deployment_port: e.deployment_port,
                     forwarding_port: e.forwarding_port,
+                    organization_id: e.organization_id.clone(),
                     forward_status:  fw.map_or(
                         ForwardStatus::Retrying { attempt: 0 },
                         |f| f.status.clone(),

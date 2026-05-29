@@ -365,6 +365,7 @@ impl App {
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
         let idx       = self.state.selected_idx;
+        let org_id = svc.organization_id.clone();
 
         self.ejecting = Some(format!("Ejecting {}…", meta_name));
 
@@ -375,7 +376,7 @@ impl App {
                 .expect("tokio rt");
 
             rt.block_on(async move {
-                let result = eject(&dep, &lang, &meta_name).await;
+                let result = eject(&dep, &lang, &meta_name, &org_id ).await;
                 let (success, message) = match result {
                     Ok(())  => (true,  format!("✓ Ejected {}", meta_name)),
                     Err(e)  => (false, format!("✗ Eject failed for {}: {}", meta_name, e)),

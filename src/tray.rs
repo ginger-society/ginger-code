@@ -186,11 +186,27 @@ fn open_cli() {
 
 // ── VS Code launcher ──────────────────────────────────────────────────────────
 
-fn open_vscode(deployment_name: &str, forwarding_port: u16) {
-    println!(
-        "[ginger-code] open_vscode: '{}' on port {}",
-        deployment_name, forwarding_port
+fn open_vscode(deployment_name: &str, forwarding_port: u16, organization_id: &str) {
+    let host_alias = format!("{}-local", deployment_name);
+    let remote_uri = format!(
+        "vscode-remote://ssh-remote+{}/workspace/{}-{}",
+        host_alias,
+        organization_id,
+        deployment_name,
     );
+
+    println!("[ginger-code] opening VS Code: {}", remote_uri);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = std::process::Command::new("code")
+        .arg("--folder-uri")
+        .arg(&remote_uri)
+        .spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "code", "--folder-uri", &remote_uri])
+        .spawn();
 }
 
 // ── Menu snapshot — only rebuild when something actually changed ───────────────
@@ -223,7 +239,7 @@ struct BuiltMenu {
     menu:           Menu,
     dashboard_id:   tray_icon::menu::MenuId,
     cli_id:         tray_icon::menu::MenuId,
-    deployment_ids: Vec<(tray_icon::menu::MenuId, String, u16)>,
+    deployment_ids: Vec<(tray_icon::menu::MenuId, String, u16, String)>,
     quit_id:        tray_icon::menu::MenuId,
 }
 
@@ -273,7 +289,8 @@ fn build_menu(
             let item   = MenuItem::new(&label, connected, None);
             let id     = item.id().clone();
             menu.append(&item).unwrap();
-            deployment_ids.push((id, entry.deployment_name.clone(), entry.forwarding_port));
+            deployment_ids.push((id, entry.deployment_name.clone(), entry.forwarding_port, entry.organization_id.clone()));
+
         }
     }
 
@@ -343,7 +360,7 @@ struct TrayApp {
     last_tick:      std::time::Instant,
     dashboard_id:   tray_icon::menu::MenuId,
     cli_id:         tray_icon::menu::MenuId,
-    deployment_ids: Vec<(tray_icon::menu::MenuId, String, u16)>,
+    deployment_ids: Vec<(tray_icon::menu::MenuId, String, u16, String)>,
     quit_id:        tray_icon::menu::MenuId,
     last_snapshot:  MenuSnapshot,
 }
@@ -444,9 +461,9 @@ impl ApplicationHandler for TrayApp {
                 open_cli();
                 continue;
             }
-            for (id, name, port) in &self.deployment_ids {
+            for (id, name, port, org_id) in &self.deployment_ids {
                 if ev.id == *id {
-                    open_vscode(name, *port);
+                    open_vscode(name, *port, org_id);
                     break;
                 }
             }
