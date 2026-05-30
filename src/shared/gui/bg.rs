@@ -67,13 +67,10 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                             identifier:      p.identifier,
                             package_type:    p.package_type,
                             lang:            p.lang,
-                            version:         p.version,
                             description:     p.description,
                             organization_id: p.organization_id,
                             mounted:         false,
                             dependencies:    p.dependencies,
-                            repo_origin:     p.repo_origin.and_then(|o| o),
-                            quick_links:     p.quick_links.and_then(|q| q),
                         })
                         .collect();
                     let _ = tx.send(BgMsg::Packages(packages));

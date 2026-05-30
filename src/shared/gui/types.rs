@@ -51,17 +51,13 @@ pub struct Package {
     pub identifier:      String,
     pub package_type:    String,
     pub lang:            String,
-    pub version:         String,
     pub description:     String,
+    /// Used by mount/unmount ops — not displayed.
     pub organization_id: String,
     /// True when a dev container has been successfully mounted for this package.
     pub mounted:         bool,
-    /// Dependency identifiers, for display.
+    /// Dependency identifiers shown in the detail panel.
     pub dependencies:    Vec<String>,
-    /// Optional repo URL.
-    pub repo_origin:     Option<String>,
-    /// Optional quick-links blob (raw string from API).
-    pub quick_links:     Option<String>,
 }
 
 // ── Right-pane tab ────────────────────────────────────────────────────────────

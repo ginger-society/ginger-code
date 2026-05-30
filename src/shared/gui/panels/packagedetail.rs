@@ -2,9 +2,7 @@
 
 use eframe::egui;
 
-use super::super::colors::{
-    COLOR_BG, COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_FG, COLOR_MAGENTA, COLOR_MUTED,
-};
+use super::super::colors::{COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_FG, COLOR_MAGENTA, COLOR_MUTED};
 use super::super::types::Package;
 
 // ── Action returned to app.rs ─────────────────────────────────────────────────
@@ -18,7 +16,7 @@ pub struct PackageDetailAction {
 // ── Main draw function ────────────────────────────────────────────────────────
 
 /// Draw the full detail view for `pkg`.
-/// `mounting` is `Some("…message…")` while a mount/unmount op is in flight.
+/// `mounting` is `Some("…msg…")` while a mount/unmount op is in flight.
 pub fn draw_package_detail(
     pkg:      &Package,
     mounting: Option<&str>,
@@ -46,11 +44,10 @@ pub fn draw_package_detail(
                         .color(egui::Color32::WHITE),
                 );
                 ui.add_space(8.0);
-                // Type badge
                 let badge_color = match pkg.package_type.as_str() {
-                    "lib" | "library"      => COLOR_CYAN,
-                    "bin" | "executable"   => COLOR_MAGENTA,
-                    _                      => COLOR_DIM,
+                    "lib" | "library"    => COLOR_CYAN,
+                    "bin" | "executable" => COLOR_MAGENTA,
+                    _                    => COLOR_DIM,
                 };
                 ui.label(
                     egui::RichText::new(format!("[{}]", pkg.package_type))
@@ -61,14 +58,10 @@ pub fn draw_package_detail(
 
             ui.add_space(4.0);
 
-            // ── Version + lang ────────────────────────────────────────────────
+            // ── Lang ──────────────────────────────────────────────────────────
             ui.horizontal(|ui| {
                 ui.add_space(pad);
-                kv_inline(ui, "version", &pkg.version);
-                ui.add_space(16.0);
                 kv_inline(ui, "lang", &pkg.lang);
-                ui.add_space(16.0);
-                kv_inline(ui, "org", &pkg.organization_id);
             });
 
             ui.add_space(12.0);
@@ -88,27 +81,8 @@ pub fn draw_package_detail(
                 ui.add_space(12.0);
             }
 
-            // ── Repo origin ───────────────────────────────────────────────────
-            if let Some(ref repo) = pkg.repo_origin {
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    kv_block(ui, "repo", repo);
-                });
-                ui.add_space(8.0);
-            }
-
-            // ── Quick links ───────────────────────────────────────────────────
-            if let Some(ref links) = pkg.quick_links {
-                ui.horizontal(|ui| {
-                    ui.add_space(pad);
-                    kv_block(ui, "quick links", links);
-                });
-                ui.add_space(8.0);
-            }
-
             // ── Dependencies ──────────────────────────────────────────────────
             if !pkg.dependencies.is_empty() {
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(pad);
                     ui.label(
@@ -140,7 +114,6 @@ pub fn draw_package_detail(
                 ui.add_space(pad);
 
                 if let Some(msg) = mounting {
-                    // In-flight: show spinner label, no buttons.
                     let t    = ui.input(|i| i.time);
                     let dots = match ((t * 2.0) as usize) % 4 { 0=>"", 1=>".", 2=>"..", _=>"..." };
                     ui.label(
@@ -150,17 +123,15 @@ pub fn draw_package_detail(
                     );
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
                 } else if pkg.mounted {
-                    // Mounted state — Unmount + Open VS Code
-                    if ui.add(mount_button("↩ Unmount", egui::Color32::from_rgb(130, 85, 10))).clicked() {
+                    if ui.add(action_button("↩ Unmount", egui::Color32::from_rgb(130, 85, 10))).clicked() {
                         action.unmount_clicked = true;
                     }
                     ui.add_space(8.0);
-                    if ui.add(mount_button("[>] Open VS Code", egui::Color32::from_rgb(20, 75, 140))).clicked() {
+                    if ui.add(action_button("[>] Open VS Code", egui::Color32::from_rgb(20, 75, 140))).clicked() {
                         action.open_editor_clicked = true;
                     }
                 } else {
-                    // Unmounted state — just Mount
-                    if ui.add(mount_button("⬡ Mount Dev Container", egui::Color32::from_rgb(30, 100, 60))).clicked() {
+                    if ui.add(action_button("⬡ Mount Dev Container", egui::Color32::from_rgb(30, 100, 60))).clicked() {
                         action.mount_clicked = true;
                     }
                 }
@@ -172,9 +143,8 @@ pub fn draw_package_detail(
     action
 }
 
-// ── Small helpers ─────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// "key  value" inline, key dim, value muted.
 fn kv_inline(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.label(
         egui::RichText::new(key)
@@ -189,22 +159,6 @@ fn kv_inline(ui: &mut egui::Ui, key: &str, value: &str) {
     );
 }
 
-/// "key\nvalue" stacked block.
-fn kv_block(ui: &mut egui::Ui, key: &str, value: &str) {
-    ui.vertical(|ui| {
-        ui.label(
-            egui::RichText::new(key)
-                .font(egui::FontId::new(10.0, egui::FontFamily::Monospace))
-                .color(COLOR_DIM),
-        );
-        ui.label(
-            egui::RichText::new(value)
-                .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-                .color(COLOR_MUTED),
-        );
-    });
-}
-
 fn separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 1.0),
@@ -216,9 +170,9 @@ fn separator(ui: &mut egui::Ui) {
     );
 }
 
-fn mount_button(label: &str, bg: egui::Color32) -> impl egui::Widget + '_ {
+fn action_button(label: &str, bg: egui::Color32) -> impl egui::Widget + '_ {
     move |ui: &mut egui::Ui| {
-        let desired = egui::vec2(label.len() as f32 * 7.5 + 16.0, 24.0);
+        let desired  = egui::vec2(label.len() as f32 * 7.5 + 16.0, 24.0);
         let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
         let color = if response.hovered() { bg.linear_multiply(1.3) } else { bg };
         ui.painter().rect_filled(rect, 4.0, color);

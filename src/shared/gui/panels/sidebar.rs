@@ -178,14 +178,6 @@ fn draw_package_row(
         egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
     );
 
-    // Version badge
-    let name_w = short_name.len() as f32 * 7.2;
-    painter.text(
-        egui::pos2(row_rect.min.x + 24.0 + name_w + 6.0, row_rect.min.y + 9.0),
-        egui::Align2::LEFT_TOP, &format!("v{}", pkg.version),
-        egui::FontId::new(9.0, egui::FontFamily::Monospace), COLOR_DIM,
-    );
-
     // Type · lang
     let sub = format!("{}  ·  {}", pkg.package_type, pkg.lang);
     painter.text(
