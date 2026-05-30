@@ -1,8 +1,9 @@
 pub mod app;
+pub mod bg;
 pub mod colors;
-pub mod panels;
 pub mod terminal;
 pub mod types;
+pub mod panels;
 
 use eframe::egui;
 use app::App;
@@ -11,7 +12,7 @@ const ICON_BYTES: &[u8] = include_bytes!("../../../assets/ginger-code.png");
 
 pub fn run_gui() -> eframe::Result<()> {
     let icon = {
-        let img = ::image::load_from_memory(ICON_BYTES)  // :: prefix = crate root
+        let img = ::image::load_from_memory(ICON_BYTES)
             .expect("Failed to load icon")
             .into_rgba8();
         let (w, h) = img.dimensions();

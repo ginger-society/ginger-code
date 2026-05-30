@@ -44,6 +44,18 @@ impl K8sService {
     }
 }
 
+// ── Package (from MetadataService, not on k8s) ───────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct Package {
+    pub identifier:      String,
+    pub package_type:    String,
+    pub lang:            String,
+    pub version:         String,
+    pub description:     String,
+    pub organization_id: String,
+}
+
 // ── Right-pane tab ────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -110,6 +122,7 @@ impl TermTab {
 
 pub struct AppState {
     pub services:        Vec<K8sService>,
+    pub packages:        Vec<Package>,
     pub selected_idx:    usize,
     pub right_pane:      RightPane,
     /// Log lines for the selected service.
@@ -135,6 +148,7 @@ impl AppState {
     pub fn new(font_size: f32, services: Vec<K8sService>) -> Self {
         AppState {
             services,
+            packages:        Vec::new(),
             selected_idx:    0,
             right_pane:      RightPane::Logs,
             logs:            vec!["Fetching logs…".into()],
@@ -192,28 +206,22 @@ impl AppState {
     /// Swap out the current service's tabs and swap in `new_idx`'s tabs.
     /// Returns the generation number that log pollers should use for `new_idx`.
     pub fn switch_service(&mut self, new_idx: usize) -> u64 {
-        // Save the current service's tab list.
         let old_idx  = self.selected_idx;
         let old_tabs = std::mem::take(&mut self.term_tabs);
         if !old_tabs.is_empty() {
             self.tabs_by_service.insert(old_idx, old_tabs);
         } else {
-            // Remove stale empty entry if it existed.
             self.tabs_by_service.remove(&old_idx);
         }
 
-        // Restore the new service's tab list (or start fresh).
-        self.term_tabs = self.tabs_by_service.remove(&new_idx).unwrap_or_default();
-
+        self.term_tabs     = self.tabs_by_service.remove(&new_idx).unwrap_or_default();
         self.selected_idx  = new_idx;
         self.log_generation += 1;
 
-        // Decide which pane to show.
         if self.term_tabs.is_empty() {
             self.right_pane  = RightPane::Logs;
             self.active_term = 0;
         } else {
-            // Restore to the last active tab (clamp in case tabs were closed).
             self.active_term = self.active_term.min(self.term_tabs.len() - 1);
             self.right_pane  = RightPane::TerminalTab(self.active_term);
         }
