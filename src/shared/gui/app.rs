@@ -1,22 +1,23 @@
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::{mpsc, Arc};
-use std::collections::HashMap;
 
 use super::bg::{
     BgMsg,
     spawn_bulk_ejected_check,
     spawn_k8s_poller,
     spawn_metadata_fetch,
+    spawn_mount,
     spawn_service_refresh,
+    spawn_unmount,
 };
-use super::colors::{COLOR_BG, COLOR_BORDER, COLOR_CYAN, COLOR_SIDEBAR_BG, COLOR_TAB_ACTIVE};
+use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
-    draw_info_strip, draw_logs_pane, draw_service_list, draw_statusbar,
-    draw_tab_bar, draw_terminal_pane, draw_titlebar, TabBarAction,
+    draw_info_strip, draw_logs_pane, draw_package_detail, draw_service_list,
+    draw_statusbar, draw_tab_bar, draw_terminal_pane, draw_titlebar, TabBarAction,
 };
 use super::terminal::{spawn_kubectl, TermPerformer};
-use super::types::{AppState, K8sService, RightPane, TermState};
+use super::types::{AppState, RightPane, TermState};
 use crate::shared::ui::eject::{eject, uneject};
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -26,9 +27,10 @@ pub struct App {
     rx:       mpsc::Receiver<BgMsg>,
     tx:       mpsc::Sender<BgMsg>,
     loading:  bool,
-    /// Human-readable description of the in-flight eject/uneject operation,
-    /// shown as a spinner in the info strip.
+    /// In-flight eject/uneject description (shown in the service info strip).
     ejecting: Option<String>,
+    /// In-flight mount/unmount description + package index.
+    mounting: Option<(usize, String)>,
     ctx:      egui::Context,
 }
 
@@ -52,7 +54,6 @@ impl App {
         let (tx, rx) = mpsc::channel::<BgMsg>();
         let ctx      = cc.egui_ctx.clone();
 
-        // Background tasks — all spawn logic lives in bg.rs.
         spawn_metadata_fetch(tx.clone(), ctx.clone());
         spawn_k8s_poller(tx.clone(), ctx.clone());
 
@@ -62,6 +63,7 @@ impl App {
             tx,
             loading:  true,
             ejecting: None,
+            mounting: None,
             ctx,
         }
     }
@@ -90,7 +92,74 @@ impl App {
         }
     }
 
-    // ── Eject ─────────────────────────────────────────────────────────────────
+    // ── Package selection ─────────────────────────────────────────────────────
+
+    fn select_package(&mut self, pkg_idx: usize) {
+        self.state.right_pane = RightPane::PackageDetail(pkg_idx);
+    }
+
+    // ── Mount / unmount ───────────────────────────────────────────────────────
+
+    fn run_mount(&mut self, pkg_idx: usize) {
+        let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
+        if pkg.mounted { return; }
+
+        let label = pkg.identifier.clone();
+        self.mounting = Some((pkg_idx, format!("Mounting {}…", label)));
+
+        spawn_mount(
+            self.tx.clone(),
+            self.ctx.clone(),
+            pkg_idx,
+            pkg.organization_id.clone(),
+            pkg.identifier.clone(),
+            pkg.lang.clone(),
+        );
+    }
+
+    fn run_unmount(&mut self, pkg_idx: usize) {
+        let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
+        if !pkg.mounted { return; }
+
+        let label = pkg.identifier.clone();
+        self.mounting = Some((pkg_idx, format!("Unmounting {}…", label)));
+
+        spawn_unmount(
+            self.tx.clone(),
+            self.ctx.clone(),
+            pkg_idx,
+            pkg.organization_id.clone(),
+            pkg.identifier.clone(),
+        );
+    }
+
+    // ── Open VS Code for a mounted package ────────────────────────────────────
+
+    fn open_package_editor(&self, pkg_idx: usize) {
+        let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
+        if !pkg.mounted { return; }
+
+        // Convention mirrors the service editor: ssh-remote alias is
+        // "<org_id>-<identifier>-local", workspace folder is the same.
+        let alias      = format!("{}-{}-local", pkg.organization_id, pkg.identifier);
+        let remote_uri = format!(
+            "vscode-remote://ssh-remote+{}/workspace/{}-{}",
+            alias, pkg.organization_id, pkg.identifier,
+        );
+        println!("Opening VS Code for package: {}", remote_uri);
+
+        std::thread::spawn(move || {
+            match std::process::Command::new("code")
+                .arg("--folder-uri").arg(&remote_uri).status()
+            {
+                Ok(s) if s.success() => println!("✓ VS Code launched"),
+                Ok(s)                => eprintln!("VS Code exited: {}", s),
+                Err(e)               => eprintln!("Failed to launch VS Code: {e}"),
+            }
+        });
+    }
+
+    // ── Service eject / uneject ───────────────────────────────────────────────
 
     fn run_eject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
@@ -99,7 +168,7 @@ impl App {
         let Some(dep)  = svc.deployment_name.clone() else { return };
         let Some(lang) = svc.lang.clone()            else { return };
 
-        let meta_name = format!("{}-{}", svc.organization_id, svc.meta_name.clone());
+        let meta_name = format!("{}-{}", svc.organization_id, svc.meta_name);
         let org_id    = svc.organization_id.clone();
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
@@ -122,14 +191,11 @@ impl App {
         });
     }
 
-    // ── Un-eject ──────────────────────────────────────────────────────────────
-
     fn run_uneject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
         if !svc.ejected { return; }
 
         let Some(dep) = svc.deployment_name.clone() else { return };
-
         let meta_name = svc.meta_name.clone();
         let tx        = self.tx.clone();
         let ctx       = ctx.clone();
@@ -152,7 +218,7 @@ impl App {
         });
     }
 
-    // ── Open VS Code remote ───────────────────────────────────────────────────
+    // ── Open VS Code for ejected service ─────────────────────────────────────
 
     fn open_editor(&self) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
@@ -176,7 +242,7 @@ impl App {
         });
     }
 
-    // ── Terminal: open + connect ──────────────────────────────────────────────
+    // ── Terminal helpers ──────────────────────────────────────────────────────
 
     fn open_and_connect_term(&mut self, ctx: &egui::Context) {
         let tab_idx = match self.state.open_term_tab(24, 80) {
@@ -197,7 +263,7 @@ impl App {
         let rows    = tab.term_rows as u16;
         let cols    = tab.term_cols as u16;
 
-        let host = match self.state.services.get(svc_idx).and_then(|s| s.ssh_host.as_ref()) {
+        let _host = match self.state.services.get(svc_idx).and_then(|s| s.ssh_host.as_ref()) {
             Some(h) => h.clone(),
             None => {
                 if let Some(t) = self.state.term_tabs.get_mut(tab_idx) {
@@ -213,18 +279,16 @@ impl App {
                 .with_sink(Arc::clone(&sink)),
         ));
 
-        let tab            = &mut self.state.term_tabs[tab_idx];
-        tab.performer      = Arc::clone(&performer);
-        tab.scrollback_arc = Some(Arc::clone(&sink));
+        self.state.term_tabs[tab_idx].performer      = Arc::clone(&performer);
+        self.state.term_tabs[tab_idx].scrollback_arc = Some(Arc::clone(&sink));
 
         let dep_name = match self.state.services.get(svc_idx)
             .and_then(|s| s.deployment_name.as_ref())
         {
             Some(d) => d.clone(),
             None => {
-                if let Some(t) = self.state.term_tabs.get_mut(tab_idx) {
-                    t.state = TermState::Error("No deployment name for this service".into());
-                }
+                self.state.term_tabs[tab_idx].state =
+                    TermState::Error("No deployment name for this service".into());
                 return;
             }
         };
@@ -245,7 +309,6 @@ impl App {
                     self.state.selected_idx = 0;
                     self.loading            = false;
 
-                    // Service 0: full refresh.
                     if let Some(svc) = self.state.services.first() {
                         let gen = self.state.log_generation;
                         if let Some(dep) = svc.deployment_name.clone() {
@@ -253,7 +316,6 @@ impl App {
                         }
                     }
 
-                    // Services 1..N: ejected-only check for sidebar badges.
                     let rest: Vec<(usize, String)> = self.state.services
                         .iter().enumerate().skip(1)
                         .filter_map(|(i, s)| s.deployment_name.clone().map(|d| (i, d)))
@@ -286,8 +348,7 @@ impl App {
                         svc.ejected = ejected;
                     }
                     if idx == self.state.selected_idx && ejected {
-                        let name = self.state.services
-                            .get(idx)
+                        let name = self.state.services.get(idx)
                             .map(|s| s.meta_name.as_str())
                             .unwrap_or("this service");
                         self.state.logs = vec![
@@ -316,8 +377,7 @@ impl App {
                         if idx == self.state.selected_idx {
                             self.state.log_generation += 1;
                         }
-                        if let Some(dep) = self.state.services
-                            .get(idx)
+                        if let Some(dep) = self.state.services.get(idx)
                             .and_then(|s| s.deployment_name.clone())
                         {
                             let gen = if idx == self.state.selected_idx {
@@ -328,6 +388,23 @@ impl App {
                             spawn_service_refresh(self.tx.clone(), self.ctx.clone(), idx, dep, gen);
                         }
                     }
+                }
+
+                Ok(BgMsg::MountResult { success, message, pkg_idx, mounted }) => {
+                    // Clear spinner regardless of outcome.
+                    if matches!(self.mounting, Some((i, _)) if i == pkg_idx) {
+                        self.mounting = None;
+                    }
+                    // Update the mounted flag.
+                    if success {
+                        if let Some(pkg) = self.state.packages.get_mut(pkg_idx) {
+                            pkg.mounted = mounted;
+                        }
+                    }
+                    // Surface the result message in the logs pane so it's visible
+                    // when the user switches back to a service, and also just as a
+                    // general notification channel.
+                    self.state.logs.push(message);
                 }
 
                 Err(_) => break,
@@ -344,7 +421,7 @@ impl eframe::App for App {
 
         self.drain_bg_channel();
 
-        // ── Raise window on first frame (tray launch) ─────────────────────────
+        // ── Raise window on first frame ───────────────────────────────────────
         if !self.state.raised_on_open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -365,6 +442,10 @@ impl eframe::App for App {
         }
         if matches!(self.state.right_pane, RightPane::TerminalTab(_)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // Keep repainting while a mount/unmount spinner is animating.
+        if self.mounting.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
         // ── Sync terminal scrollback ──────────────────────────────────────────
@@ -393,20 +474,15 @@ impl eframe::App for App {
             .resizable(false)
             .frame(egui::Frame::none().fill(COLOR_SIDEBAR_BG))
             .show(ctx, |ui| {
-                // The "Services" header scrolls away with the content so the
-                // full sidebar area is usable by the scroll area.
                 if self.loading {
                     ui.add_space(8.0);
                     ui.colored_label(COLOR_CYAN, "Loading services…");
-                } else if self.state.services.is_empty() {
-                    ui.add_space(8.0);
-                    ui.colored_label(COLOR_CYAN, "No services found.");
                 } else {
-                    // draw_service_list now returns a SidebarAction enum.
                     use super::panels::sidebar::SidebarAction;
                     if let Some(action) = draw_service_list(&self.state, ui) {
                         match action {
                             SidebarAction::SelectService(idx) => self.select_service(idx),
+                            SidebarAction::SelectPackage(idx) => self.select_package(idx),
                         }
                     }
                 }
@@ -416,9 +492,35 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(COLOR_BG))
             .show(ctx, |ui| {
-                if self.loading || self.state.services.is_empty() {
+                if self.loading {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(COLOR_CYAN, "Loading services…");
+                    });
+                    return;
+                }
+
+                // ── Package detail view ───────────────────────────────────────
+                if let RightPane::PackageDetail(pkg_idx) = self.state.right_pane {
+                    // Clone what we need to avoid holding borrow on self.state
+                    // while calling methods on self.
+                    if let Some(pkg) = self.state.packages.get(pkg_idx).cloned() {
+                        let mounting_msg = self.mounting.as_ref()
+                            .filter(|(i, _)| *i == pkg_idx)
+                            .map(|(_, m)| m.as_str());
+
+                        let action = draw_package_detail(&pkg, mounting_msg, ui);
+
+                        if action.mount_clicked       { self.run_mount(pkg_idx); }
+                        if action.unmount_clicked     { self.run_unmount(pkg_idx); }
+                        if action.open_editor_clicked { self.open_package_editor(pkg_idx); }
+                    }
+                    return;
+                }
+
+                // ── Service view (logs / terminal) ────────────────────────────
+                if self.state.services.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.colored_label(COLOR_CYAN, "No services found.");
                     });
                     return;
                 }
@@ -436,14 +538,15 @@ impl eframe::App for App {
                             self.state.right_pane  = RightPane::TerminalTab(i);
                             self.state.active_term = i;
                         }
-                        Some(TabBarAction::NewTerm)         => self.open_and_connect_term(ctx),
-                        Some(TabBarAction::CloseTerm(i))    => self.state.close_term_tab(i),
+                        Some(TabBarAction::NewTerm)      => self.open_and_connect_term(ctx),
+                        Some(TabBarAction::CloseTerm(i)) => self.state.close_term_tab(i),
                         None => {}
                     }
 
                     match self.state.right_pane {
                         RightPane::Logs           => draw_logs_pane(&self.state, ui),
                         RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
+                        RightPane::PackageDetail(_) => {} // handled above
                     }
                 });
             });

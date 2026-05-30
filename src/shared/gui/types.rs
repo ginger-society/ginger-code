@@ -54,6 +54,14 @@ pub struct Package {
     pub version:         String,
     pub description:     String,
     pub organization_id: String,
+    /// True when a dev container has been successfully mounted for this package.
+    pub mounted:         bool,
+    /// Dependency identifiers, for display.
+    pub dependencies:    Vec<String>,
+    /// Optional repo URL.
+    pub repo_origin:     Option<String>,
+    /// Optional quick-links blob (raw string from API).
+    pub quick_links:     Option<String>,
 }
 
 // ── Right-pane tab ────────────────────────────────────────────────────────────
@@ -63,12 +71,13 @@ pub enum RightPane {
     Logs,
     /// Index into `AppState::term_tabs`.
     TerminalTab(usize),
+    /// Detail view for a package at the given index in `AppState::packages`.
+    PackageDetail(usize),
 }
 
 // ── Per-terminal-tab state ────────────────────────────────────────────────────
 
 pub enum TermState {
-    /// Not yet connected; connect lazily on first render.
     Idle,
     Connected(SshSession),
     Error(String),
@@ -76,21 +85,12 @@ pub enum TermState {
 
 /// One independent terminal session.
 pub struct TermTab {
-    /// Label shown on the tab chip, e.g. `"iam-admin-fe"` or `"iam-admin-fe #2"`.
     pub label:          String,
-    /// Index of the service this terminal is connected to.
     pub service_idx:    usize,
-    /// The live VTE grid + cursor.
     pub performer:      Arc<Mutex<TermPerformer>>,
-    /// SSH connection state.
     pub state:          TermState,
-    /// Rows scrolled off the top of the live grid, accumulated here each frame
-    /// from `scrollback_arc`.
     pub scrollback:     Vec<Vec<Cell>>,
-    /// Arc to the same `Vec` that `TermPerformer::scroll_up` pushes into.
-    /// `app.rs` drains it into `scrollback` every frame.
     pub scrollback_arc: Option<ScrollbackSink>,
-    /// 0 = bottom (live); higher = further into scrollback history.
     pub scroll_offset:  usize,
     pub term_rows:      usize,
     pub term_cols:      usize,
@@ -125,16 +125,10 @@ pub struct AppState {
     pub packages:        Vec<Package>,
     pub selected_idx:    usize,
     pub right_pane:      RightPane,
-    /// Log lines for the selected service.
     pub logs:            Vec<String>,
-    /// Terminal tabs for the *currently selected* service.
-    /// Swapped in/out of `tabs_by_service` on every service switch.
     pub term_tabs:       Vec<TermTab>,
-    /// Saved terminal tabs for every service index that has ever had tabs opened.
     pub tabs_by_service: HashMap<usize, Vec<TermTab>>,
-    /// Index of the currently active terminal tab.
     pub active_term:     usize,
-    /// Incremented on every service switch so stale log pollers can be ignored.
     pub log_generation:  u64,
     pub font_size:       f32,
     pub cell_w:          f32,
@@ -165,8 +159,6 @@ impl AppState {
         }
     }
 
-    /// Allocate a new `TermTab` for the currently selected service.
-    /// Returns the index of the new tab, or `None` when the cap is reached.
     pub fn open_term_tab(&mut self, rows: usize, cols: usize) -> Option<usize> {
         if self.term_tabs.len() >= MAX_TERM_TABS {
             return None;
@@ -182,7 +174,6 @@ impl AppState {
         Some(self.term_tabs.len() - 1)
     }
 
-    /// Close the tab at `idx`, fix indices, and update `right_pane`.
     pub fn close_term_tab(&mut self, idx: usize) {
         if idx >= self.term_tabs.len() { return; }
         self.term_tabs.remove(idx);
@@ -203,8 +194,6 @@ impl AppState {
         }
     }
 
-    /// Swap out the current service's tabs and swap in `new_idx`'s tabs.
-    /// Returns the generation number that log pollers should use for `new_idx`.
     pub fn switch_service(&mut self, new_idx: usize) -> u64 {
         let old_idx  = self.selected_idx;
         let old_tabs = std::mem::take(&mut self.term_tabs);

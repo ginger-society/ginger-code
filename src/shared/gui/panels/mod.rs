@@ -4,15 +4,16 @@
 
 mod infostrip;
 mod logspane;
+pub mod packagedetail;
 pub mod sidebar;
 mod statusbar;
 mod tabbar;
 mod terminalpane;
 mod titlebar;
 
-// Re-export every public surface so callers use `panels::*` as before.
 pub use infostrip::{draw_info_strip, InfoStripAction};
 pub use logspane::draw_logs_pane;
+pub use packagedetail::{draw_package_detail, PackageDetailAction};
 pub use sidebar::draw_service_list;
 pub use statusbar::draw_statusbar;
 pub use tabbar::{draw_tab_bar, TabBarAction};

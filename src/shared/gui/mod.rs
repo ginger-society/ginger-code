@@ -1,9 +1,10 @@
 pub mod app;
 pub mod bg;
 pub mod colors;
+pub mod mount;
+pub mod panels;
 pub mod terminal;
 pub mod types;
-pub mod panels;
 
 use eframe::egui;
 use app::App;

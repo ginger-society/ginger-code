@@ -1,8 +1,4 @@
 //! Background task helpers and channel message types.
-//!
-//! All network/async work is spawned here; results are sent back to the main
-//! thread via `mpsc::Sender<BgMsg>`.  `app.rs` owns the receiver and drains it
-//! every frame.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -13,9 +9,11 @@ use tokio::time::sleep;
 
 use MetadataService::{
     apis::{
-        configuration::Configuration as MetadataConfiguration,
         default_api::{
-            MetadataGetServicesAndEnvsParams, MetadataGetUserPackagesParams, MetadataGetUserPackagesUserLandParams, metadata_get_services_and_envs, metadata_get_user_packages, metadata_get_user_packages_public, metadata_get_user_packages_user_land
+            metadata_get_services_and_envs,
+            metadata_get_user_packages,
+            MetadataGetServicesAndEnvsParams,
+            MetadataGetUserPackagesParams,
         },
     },
     get_configuration as get_metadata_configuration,
@@ -23,44 +21,36 @@ use MetadataService::{
 use ginger_shared_rs::utils::get_token_from_file_storage;
 
 use crate::shared::ui::kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name};
+use super::mount::{mount, unmount};
 use super::types::{K8sService, Package};
 
 // ── Channel messages ──────────────────────────────────────────────────────────
 
 pub enum BgMsg {
-    /// Initial services list from metadata.
     Services(Vec<K8sService>),
-    /// Packages fetched from metadata (not k8s-deployed).
     Packages(Vec<Package>),
-    /// Periodic k8s status poll — deployment_name → (status, ready).
     K8sStatuses(HashMap<String, (String, String)>),
-    /// Ejected flag update for one service by index.
     EjectedFlag { idx: usize, ejected: bool },
-    /// Fresh log lines for the currently-selected service.
-    /// `generation` must match `AppState::log_generation` to be applied.
     Logs { lines: Vec<String>, generation: u64 },
-    /// Metadata or network error.
     Error(String),
-    /// Result of an eject or uneject operation.
-    EjectResult { success: bool, message: String, idx: usize },
+    EjectResult  { success: bool, message: String, idx: usize },
+    /// Result of a mount or unmount operation for a package.
+    MountResult  { success: bool, message: String, pkg_idx: usize, mounted: bool },
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
 
-/// One-shot: fetch services + packages from the metadata API.
-/// Sends `BgMsg::Services`, `BgMsg::Packages`, or `BgMsg::Error`.
+/// One-shot: fetch packages then services from the metadata API.
 pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+            .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
             let token           = get_token_from_file_storage();
             let metadata_config = get_metadata_configuration(Some(token));
 
-            // ── Fetch packages ──────────────────────────────────────────────
+            // ── Packages ────────────────────────────────────────────────────
             match metadata_get_user_packages(
                 &metadata_config,
                 MetadataGetUserPackagesParams {
@@ -80,18 +70,22 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                             version:         p.version,
                             description:     p.description,
                             organization_id: p.organization_id,
+                            mounted:         false,
+                            dependencies:    p.dependencies,
+                            repo_origin:     p.repo_origin.and_then(|o| o),
+                            quick_links:     p.quick_links.and_then(|q| q),
                         })
                         .collect();
                     let _ = tx.send(BgMsg::Packages(packages));
                     ctx.request_repaint();
                 }
                 Err(e) => {
-                    // Non-fatal: log but continue so services still load.
+                    // Non-fatal — services still load.
                     eprintln!("Package fetch error: {e:?}");
                 }
             }
 
-            // ── Fetch services ──────────────────────────────────────────────
+            // ── Services ────────────────────────────────────────────────────
             match metadata_get_services_and_envs(
                 &metadata_config,
                 MetadataGetServicesAndEnvsParams {
@@ -102,33 +96,24 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
             )
             .await
             {
-                Err(e) => {
-                    let _ = tx.send(BgMsg::Error(format!("{e:?}")));
-                }
+                Err(e) => { let _ = tx.send(BgMsg::Error(format!("{e:?}"))); }
                 Ok(raw) => {
-                    let services = raw
-                        .iter()
-                        .map(|s| {
-                            let meta_name       = s.identifier.to_string();
-                            let deployment_name = meta_to_deployment_name(&meta_name);
-                            let lang = s.lang
-                                .as_ref()
-                                .and_then(|l| l.as_ref())
-                                .cloned();
-                            let pod_name =
-                                Some(deployment_name.to_lowercase().replace('_', "-"));
-                            K8sService {
-                                meta_name,
-                                organization_id: s.organization_id.clone(),
-                                deployment_name: Some(deployment_name),
-                                status:  "Unknown".into(),
-                                ready:   "–".into(),
-                                lang,
-                                ejected: false,
-                                ssh_host: pod_name,
-                            }
-                        })
-                        .collect();
+                    let services = raw.iter().map(|s| {
+                        let meta_name       = s.identifier.to_string();
+                        let deployment_name = meta_to_deployment_name(&meta_name);
+                        let lang            = s.lang.as_ref().and_then(|l| l.as_ref()).cloned();
+                        let pod_name        = Some(deployment_name.to_lowercase().replace('_', "-"));
+                        K8sService {
+                            meta_name,
+                            organization_id: s.organization_id.clone(),
+                            deployment_name: Some(deployment_name),
+                            status:  "Unknown".into(),
+                            ready:   "–".into(),
+                            lang,
+                            ejected: false,
+                            ssh_host: pod_name,
+                        }
+                    }).collect();
                     let _ = tx.send(BgMsg::Services(services));
                 }
             }
@@ -138,13 +123,10 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
 }
 
 /// Infinite loop: poll k8s deployment statuses every 5 seconds.
-/// Sends `BgMsg::K8sStatuses` on each tick.
 pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+            .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
             loop {
@@ -157,12 +139,7 @@ pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     });
 }
 
-/// Check ejected flag, then (if not ejected) fetch logs and start the
-/// recurring log poller for `deployment_name`.
-///
-/// This is the single entry-point for all per-service refresh work.
-/// `generation` is captured so stale results from old pollers are silently
-/// discarded when the user switches services before results arrive.
+/// Check ejected flag, then start a log poller if not ejected.
 pub fn spawn_service_refresh(
     tx:              mpsc::Sender<BgMsg>,
     ctx:             egui::Context,
@@ -172,42 +149,30 @@ pub fn spawn_service_refresh(
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+            .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
-            // Step 1: ejected check (always first — no racing with log poller).
             let ejected = is_ejected(&deployment_name).await;
             let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
             ctx.request_repaint();
 
-            if ejected {
-                // Do not start a log poller for ejected services.
-                return;
-            }
+            if ejected { return; }
 
-            // Step 2: first log fetch.
             let lines = get_pod_logs(&deployment_name).await;
             let _ = tx.send(BgMsg::Logs { lines, generation });
             ctx.request_repaint();
 
-            // Step 3: recurring poll.
             loop {
                 sleep(Duration::from_secs(2)).await;
                 let lines = get_pod_logs(&deployment_name).await;
-                if tx.send(BgMsg::Logs { lines, generation }).is_err() {
-                    break;
-                }
+                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
                 ctx.request_repaint();
             }
         });
     });
 }
 
-/// Check the ejected flag for a batch of services (for sidebar badges).
-/// Spawns ONE thread that checks each sequentially and sends an
-/// `EjectedFlag` message per service.
+/// Bulk ejected check for sidebar badges (services 1..N).
 pub fn spawn_bulk_ejected_check(
     tx:       mpsc::Sender<BgMsg>,
     ctx:      egui::Context,
@@ -215,9 +180,7 @@ pub fn spawn_bulk_ejected_check(
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+            .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
             for (idx, deployment_name) in services {
@@ -225,6 +188,55 @@ pub fn spawn_bulk_ejected_check(
                 let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
                 ctx.request_repaint();
             }
+        });
+    });
+}
+
+/// Mount a dev container for `pkg_idx`.
+pub fn spawn_mount(
+    tx:          mpsc::Sender<BgMsg>,
+    ctx:         egui::Context,
+    pkg_idx:     usize,
+    org_id:      String,
+    identifier:  String,
+    lang:        String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            let result = mount(&org_id, &identifier, &lang).await;
+            let (success, message) = match result {
+                Ok(())  => (true,  format!("✓ Mounted dev container for {}", identifier)),
+                Err(e)  => (false, format!("✗ Mount failed for {}: {}", identifier, e)),
+            };
+            let _ = tx.send(BgMsg::MountResult { success, message, pkg_idx, mounted: true });
+            ctx.request_repaint();
+        });
+    });
+}
+
+/// Unmount the dev container for `pkg_idx`.
+pub fn spawn_unmount(
+    tx:          mpsc::Sender<BgMsg>,
+    ctx:         egui::Context,
+    pkg_idx:     usize,
+    org_id:      String,
+    identifier:  String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            let result = unmount(&org_id, &identifier).await;
+            let (success, message) = match result {
+                Ok(())  => (true,  format!("✓ Unmounted dev container for {}", identifier)),
+                Err(e)  => (false, format!("✗ Unmount failed for {}: {}", identifier, e)),
+            };
+            let _ = tx.send(BgMsg::MountResult { success, message, pkg_idx, mounted: false });
+            ctx.request_repaint();
         });
     });
 }
