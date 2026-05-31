@@ -1,5 +1,3 @@
-//! Pod-side SSH key management and git clone / branch checkout helpers.
-
 // ── Git binary discovery ──────────────────────────────────────────────────────
 
 pub async fn find_git_in_pod(pod_name: &str, container: &str) -> String {
@@ -200,22 +198,32 @@ pub async fn delete_dev_ssh_keys(
 
 // ── Clone + branch checkout ───────────────────────────────────────────────────
 
-/// Ensure `/workspace/<repo_name>` exists and is on `branch`.
+/// Ensure `/workspace/<dir_name>` exists on `branch`, cloning from
+/// `source:<git_repo>.git` if needed.
+///
+/// Two names are required because they differ:
+/// * `git_repo` — the gitolite remote name, org-prefixed
+///               e.g. `"ginger-society-ginger-db"`
+/// * `dir_name` — the local workspace directory (slug only, no org prefix)
+///               e.g. `"ginger-db"`
 ///
 /// Three cases handled transparently:
-/// 1. Directory absent → clone `main`/`master`, then checkout branch.
+/// 1. `/workspace/<dir_name>` absent  → clone into it, then checkout branch.
 /// 2. Directory present, branch missing → checkout or create branch.
 /// 3. Directory present, branch already active → no-op.
 pub async fn setup_repo_branch(
     pod_name:  &str,
     container: &str,
-    repo_name: &str,
+    git_repo:  &str,   // gitolite remote:  "ginger-society-ginger-db"
+    dir_name:  &str,   // local directory:  "ginger-db"
     branch:    &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let git = find_git_in_pod(pod_name, container).await;
     println!("  Using git binary: {}", git);
+    println!("  Remote repo: source:{}.git", git_repo);
+    println!("  Local dir:   /workspace/{}", dir_name);
 
-    let workspace_repo = format!("/workspace/{}", repo_name);
+    let workspace_repo = format!("/workspace/{}", dir_name);
 
     let script = format!(
         r#"#!/bin/sh
@@ -226,37 +234,38 @@ export GIT="{git}"
 echo "[clone] checking SSH access..."
 ssh source 2>&1 || true
 
-if [ ! -d "{ws}/{repo}" ]; then
-    echo "[clone] cloning {repo}..."
-    "$GIT" clone -b main source:{repo}.git {ws}/{repo} \
-        || "$GIT" clone -b master source:{repo}.git {ws}/{repo}
-    chown -R dev:dev {ws}/{repo}
+if [ ! -d "{ws}/{dir}" ]; then
+    echo "[clone] cloning {git_repo} into {dir}..."
+    "$GIT" clone -b main source:{git_repo}.git {ws}/{dir} \
+        || "$GIT" clone -b master source:{git_repo}.git {ws}/{dir}
+    chown -R dev:dev {ws}/{dir}
     echo "[clone] done"
-    DEFAULT_BRANCH=$("$GIT" -C {ws}/{repo} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+    DEFAULT_BRANCH=$("$GIT" -C {ws}/{dir} rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
     echo "[clone] on branch: $DEFAULT_BRANCH"
 else
-    echo "[clone] repo already exists"
+    echo "[clone] repo already exists at {ws}/{dir}"
 fi
 
 echo "[branch] setting up branch {branch}..."
-"$GIT" -C {ws}/{repo} fetch origin {branch} 2>/dev/null || true
+"$GIT" -C {ws}/{dir} fetch origin {branch} 2>/dev/null || true
 
-if "$GIT" -C {ws}/{repo} show-ref --verify --quiet refs/remotes/origin/{branch}; then
-    "$GIT" -C {ws}/{repo} checkout -B {branch} origin/{branch}
+if "$GIT" -C {ws}/{dir} show-ref --verify --quiet refs/remotes/origin/{branch}; then
+    "$GIT" -C {ws}/{dir} checkout -B {branch} origin/{branch}
     echo "checked-out-remote"
-elif "$GIT" -C {ws}/{repo} show-ref --verify --quiet refs/heads/{branch}; then
-    "$GIT" -C {ws}/{repo} checkout {branch}
+elif "$GIT" -C {ws}/{dir} show-ref --verify --quiet refs/heads/{branch}; then
+    "$GIT" -C {ws}/{dir} checkout {branch}
     echo "checked-out-local"
 else
     echo "[branch] {branch} not on remote — creating fresh"
-    "$GIT" -C {ws}/{repo} checkout -b {branch}
+    "$GIT" -C {ws}/{dir} checkout -b {branch}
     echo "created-new"
 fi
 "#,
-        git    = git,
-        ws     = "/workspace",
-        repo   = repo_name,
-        branch = branch,
+        git      = git,
+        ws       = "/workspace",
+        git_repo = git_repo,
+        dir      = dir_name,
+        branch   = branch,
     );
 
     // Write the script into the pod
@@ -331,15 +340,9 @@ fi
     }
 
     if stdout.contains("checked-out-remote") {
-        println!(
-            "✓ Checked out existing remote branch '{}' in {}",
-            branch, workspace_repo
-        );
+        println!("✓ Checked out existing remote branch '{}' in {}", branch, workspace_repo);
     } else if stdout.contains("checked-out-local") {
-        println!(
-            "✓ Checked out existing local branch '{}' in {}",
-            branch, workspace_repo
-        );
+        println!("✓ Checked out existing local branch '{}' in {}", branch, workspace_repo);
     } else if stdout.contains("created-new") {
         println!(
             "✓ Created new branch '{}' in {} (push with: git push -u origin {})",

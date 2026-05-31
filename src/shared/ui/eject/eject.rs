@@ -1,7 +1,7 @@
 //! Eject / uneject operations for k8s services.
 //!
 //! All low-level helpers (daemon, git, SSH, kubectl) live in
-//! `crate::shared::mount::*` and are shared with `mount.rs`.
+//! `crate::shared::ui::eject::*` and are shared with `mount.rs`.
 
 use std::fs;
 
@@ -84,12 +84,10 @@ pub async fn eject(
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_daemon_reachable()?;
 
-    // Read active branch
     let branch = active_branch()
         .ok_or("No active branch set — run `ginger-code -b <branch>` first")?;
     println!("  Active branch: {}", branch);
 
-    // Read session user
     let user_file = dirs::home_dir()
         .ok_or("Could not locate home directory")?
         .join(".ginger-society")
@@ -104,11 +102,15 @@ pub async fn eject(
         .ok_or("sub missing or not a string in user.json")?
         .to_string();
 
-    let image     = builder_image(lang)?;
-    let ssh       = supports_ssh(lang);
-    let repo_name = meta_to_repo_name(meta_name).to_lowercase();
+    let image    = builder_image(lang)?;
+    let ssh      = supports_ssh(lang);
+    // git_repo: org-prefixed name used for the gitolite clone URL
+    // e.g. "@ginger-society/dev-portal" → "ginger-society-dev-portal"
+    let git_repo = meta_to_repo_name(meta_name);
+    // dir_name: same as deployment_name (already org-free slug from caller)
+    // e.g. "dev-portal"
+    let dir_name = deployment_name.to_string();
 
-    // Read current image before patching
     let original_image =
         get_deployment_annotation(deployment_name, ".spec.template.spec.containers[0].image")
             .await
@@ -166,13 +168,9 @@ pub async fn eject(
 
     let status = tokio::process::Command::new("kubectl")
         .args([
-            "patch",
-            "deployment",
-            deployment_name,
-            "--type",
-            "strategic",
-            "-p",
-            &patch.to_string(),
+            "patch", "deployment", deployment_name,
+            "--type", "strategic",
+            "-p", &patch.to_string(),
         ])
         .status()
         .await?;
@@ -180,10 +178,7 @@ pub async fn eject(
     if !status.success() {
         return Err(format!("kubectl patch failed for {}", deployment_name).into());
     }
-    println!(
-        "✓ Patched {} → {} (branch: {})",
-        deployment_name, image, branch
-    );
+    println!("✓ Patched {} → {} (branch: {})", deployment_name, image, branch);
 
     if ssh {
         println!("⏳ Waiting for pod to be scheduled...");
@@ -197,10 +192,8 @@ pub async fn eject(
 
         tokio::process::Command::new("kubectl")
             .args([
-                "wait",
-                &format!("pod/{}", final_pod),
-                "--for=condition=Ready",
-                "--timeout=300s",
+                "wait", &format!("pod/{}", final_pod),
+                "--for=condition=Ready", "--timeout=300s",
             ])
             .status()
             .await?;
@@ -223,7 +216,12 @@ pub async fn eject(
             match copy_ssh_keys_to_dev(&final_pod, deployment_name).await {
                 Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
                 Ok(()) => {
-                    setup_repo_branch(&final_pod, deployment_name, &repo_name, &branch).await?;
+                    setup_repo_branch(
+                        &final_pod, deployment_name,
+                        &git_repo,  // source:ginger-society-dev-portal.git
+                        &dir_name,  // /workspace/dev-portal
+                        &branch,
+                    ).await?;
                     if let Err(e) = delete_dev_ssh_keys(&final_pod, deployment_name).await {
                         eprintln!("Warning: {e}");
                     }
@@ -231,7 +229,12 @@ pub async fn eject(
             }
         } else {
             println!("  /workspace is not empty — checking branch...");
-            setup_repo_branch(&final_pod, deployment_name, &repo_name, &branch).await?;
+            setup_repo_branch(
+                &final_pod, deployment_name,
+                &git_repo,
+                &dir_name,
+                &branch,
+            ).await?;
         }
 
         if let Err(e) = add_source_ssh_config() {
@@ -240,9 +243,7 @@ pub async fn eject(
 
         let forwarding_port = find_free_22xx_port()?;
 
-        if let Err(e) =
-            daemon_register(deployment_name, 22, forwarding_port, organization_id)
-        {
+        if let Err(e) = daemon_register(deployment_name, 22, forwarding_port, organization_id) {
             eprintln!(
                 "Warning: {e}\n\
                  Register manually:\n  \
@@ -300,13 +301,9 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     let status = tokio::process::Command::new("kubectl")
         .args([
-            "patch",
-            "deployment",
-            deployment_name,
-            "--type",
-            "strategic",
-            "-p",
-            &patch.to_string(),
+            "patch", "deployment", deployment_name,
+            "--type", "strategic",
+            "-p", &patch.to_string(),
         ])
         .status()
         .await?;
@@ -314,10 +311,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
     if !status.success() {
         return Err(format!("kubectl patch failed for {}", deployment_name).into());
     }
-    println!(
-        "✓ Unejected {} → restored {}",
-        deployment_name, original_image
-    );
+    println!("✓ Unejected {} → restored {}", deployment_name, original_image);
 
     if let Err(e) = remove_from_branch_config(deployment_name) {
         eprintln!("Warning: could not update branch config: {e}");

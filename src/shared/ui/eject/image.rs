@@ -15,17 +15,25 @@ pub fn supports_ssh(lang: &str) -> bool {
     matches!(lang, "TS" | "Rust")
 }
 
-/// Convert a metadata package identifier such as `"@ginger-society/dev-portal"`
-/// into a k8s-safe name such as `"ginger-society-dev-portal"`.
+/// Convert any package/service identifier into the gitolite repo name.
+///
+/// The gitolite server stores repos with the org prefix, using `-` as
+/// separator.  Both eject and mount use this for the clone URL.
+///
+/// Examples:
+/// * `"@ginger-society/dev-portal"` → `"ginger-society-dev-portal"`
+/// * `"@ginger-society/IAMService"` → `"ginger-society-iamservice"`
 pub fn meta_to_repo_name(meta_name: &str) -> String {
-    meta_name.trim_start_matches('@').replace('/', "-")
+    meta_name
+        .trim_start_matches('@')
+        .replace('/', "-")
+        .to_lowercase()
 }
 
-/// Derive a k8s deployment / PVC slug from a bare package identifier.
+/// Derive a k8s deployment / PVC slug from a package identifier.
 ///
-/// Rules (no org prefix — all packages are assumed to share a single org):
-/// * Strip a leading `@scope/` if present, keep only the final segment.
-/// * Lowercase the result.
+/// Strips the org scope and lowercases — used for k8s resource names only,
+/// NOT for the gitolite clone URL (use [`meta_to_repo_name`] for that).
 ///
 /// Examples:
 /// * `"@ginger-society/IAMService"` → `"iamservice"`
