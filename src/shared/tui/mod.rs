@@ -442,7 +442,7 @@ async fn run_tui(
                             SidebarItem::Package(pkg_i) => {
                                 if let Some(pkg) = packages_snap.get(pkg_i) {
                                     if pkg.mounted {
-                                        let alias = format!("{}-{}-local", pkg.organization_id, pkg.identifier);
+                                        let alias = format!("{}-local", pkg.identifier);
                                         let uri   = format!("vscode-remote://ssh-remote+{}/workspace/{}-{}",
                                             alias, pkg.organization_id, pkg.identifier);
                                         open_vscode(&mut terminal, &uri).await?;
