@@ -21,7 +21,7 @@ use MetadataService::{
 use ginger_shared_rs::utils::get_token_from_file_storage;
 
 use crate::shared::ui::kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name};
-use crate::shared::ui::eject::{mount, unmount};
+use crate::shared::core::{mount, unmount};
 use super::types::{K8sService, Package};
 
 // ── Channel messages ──────────────────────────────────────────────────────────

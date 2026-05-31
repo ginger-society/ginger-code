@@ -14,7 +14,7 @@ use std::fs;
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::shared::ui::eject::{
+use crate::shared::core::{
     daemon::{assert_daemon_reachable, daemon_register, daemon_remove},
     git_ops::{
         copy_ssh_keys_to_dev, delete_dev_ssh_keys, setup_repo_branch, write_pod_ssh_config,

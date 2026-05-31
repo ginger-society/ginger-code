@@ -2,7 +2,7 @@
 
 use std::net::TcpListener;
 
-use crate::shared::ui::eject::daemon::daemon_used_ports;
+use crate::shared::core::daemon::daemon_used_ports;
 
 
 /// Find a free port in 2200–2299 that is not already registered with the daemon.
