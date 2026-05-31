@@ -38,8 +38,8 @@ fn deployment_slug(pkg_identifier: &str) -> String {
 
 /// Gitolite remote repo name — org-prefixed, lowercased.
 /// e.g. `"@ginger-society/IAMService"` → `"ginger-society-iamservice"`
-fn gitolite_repo(pkg_identifier: &str) -> String {
-    meta_to_repo_name(pkg_identifier)
+fn gitolite_repo(org_id: &str, pkg_identifier: &str) -> String {
+    meta_to_repo_name(org_id, pkg_identifier)
 }
 
 fn workspace_pvc_name(slug: &str) -> String {
@@ -94,7 +94,7 @@ pub async fn mount(
 
     let user     = session_user()?;
     let slug     = deployment_slug(pkg_identifier); // "iamservice"
-    let git_repo = gitolite_repo(pkg_identifier);   // "ginger-society-iamservice"
+    let git_repo = gitolite_repo(org_id, pkg_identifier);   // "ginger-society-iamservice"
     let image    = builder_image(lang)?;
     let ssh      = supports_ssh(lang);
 
@@ -213,7 +213,7 @@ pub async fn mount(
                     setup_repo_branch(
                         &final_pod, &slug,
                         &git_repo,  // source:ginger-society-iamservice.git
-                        &slug,      // /workspace/iamservice
+                        &format!("{}-{}", org_id, slug),      // /workspace/iamservice
                         &branch,
                     ).await?;
                     if let Err(e) = delete_dev_ssh_keys(&final_pod, &slug).await {
@@ -226,7 +226,7 @@ pub async fn mount(
             setup_repo_branch(
                 &final_pod, &slug,
                 &git_repo,
-                &slug,
+                &format!("{}-{}", org_id, slug),
                 &branch,
             ).await?;
         }

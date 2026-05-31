@@ -106,7 +106,7 @@ pub async fn eject(
     let ssh      = supports_ssh(lang);
     // git_repo: org-prefixed name used for the gitolite clone URL
     // e.g. "@ginger-society/dev-portal" → "ginger-society-dev-portal"
-    let git_repo = meta_to_repo_name(meta_name);
+    let git_repo = meta_to_repo_name(organization_id, meta_name);
     // dir_name: same as deployment_name (already org-free slug from caller)
     // e.g. "dev-portal"
     let dir_name = deployment_name.to_string();
@@ -219,7 +219,7 @@ pub async fn eject(
                     setup_repo_branch(
                         &final_pod, deployment_name,
                         &git_repo,  // source:ginger-society-dev-portal.git
-                        &dir_name,  // /workspace/dev-portal
+                        &git_repo,  // /workspace/ginger-society-dev-portal
                         &branch,
                     ).await?;
                     if let Err(e) = delete_dev_ssh_keys(&final_pod, deployment_name).await {
@@ -231,8 +231,8 @@ pub async fn eject(
             println!("  /workspace is not empty — checking branch...");
             setup_repo_branch(
                 &final_pod, deployment_name,
-                &git_repo,
-                &dir_name,
+                &git_repo,  // source:ginger-society-dev-portal.git
+                &git_repo,  // /workspace/ginger-society-dev-portal
                 &branch,
             ).await?;
         }
@@ -246,9 +246,9 @@ pub async fn eject(
         if let Err(e) = daemon_register(deployment_name, 22, forwarding_port, organization_id) {
             eprintln!(
                 "Warning: {e}\n\
-                 Register manually:\n  \
-                 ginger-code register --deployment-name {} --deployment-port 22 \
-                 --forwarding-port {}",
+                Register manually:\n  \
+                ginger-code register --deployment-name {} --deployment-port 22 \
+                --forwarding-port {}",
                 deployment_name, forwarding_port
             );
         }

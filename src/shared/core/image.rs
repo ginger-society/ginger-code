@@ -23,11 +23,8 @@ pub fn supports_ssh(lang: &str) -> bool {
 /// Examples:
 /// * `"@ginger-society/dev-portal"` → `"ginger-society-dev-portal"`
 /// * `"@ginger-society/IAMService"` → `"ginger-society-iamservice"`
-pub fn meta_to_repo_name(meta_name: &str) -> String {
-    meta_name
-        .trim_start_matches('@')
-        .replace('/', "-")
-        .to_lowercase()
+pub fn meta_to_repo_name(org_id: &str, meta_name: &str) -> String {
+    format!("{}-{}", org_id, meta_name.to_lowercase())
 }
 
 /// Derive a k8s deployment / PVC slug from a package identifier.
