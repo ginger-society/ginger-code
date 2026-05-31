@@ -1,7 +1,6 @@
 pub mod app;
 pub mod bg;
 pub mod colors;
-pub mod mount;
 pub mod panels;
 pub mod terminal;
 pub mod types;

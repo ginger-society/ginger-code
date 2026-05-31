@@ -39,10 +39,10 @@ use MetadataService::{
     },
 };
 
-use crate::shared::gui::mount::{mount, unmount};
+
+use crate::shared::ui::eject::{eject::{eject, uneject}, mount::{mount , unmount}};
 
 use self::{
-    eject::{eject, uneject},
     kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name, shell_into_pod},
     render::draw,
     types::{Focus, K8sService, Package, Popup, PopupAction, SidebarItem},

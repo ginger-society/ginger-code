@@ -18,7 +18,7 @@ use super::panels::{
 };
 use super::terminal::{spawn_kubectl, TermPerformer};
 use super::types::{AppState, RightPane, TermState};
-use crate::shared::ui::eject::{eject, uneject};
+use crate::shared::ui::eject::eject::{eject, uneject};
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
