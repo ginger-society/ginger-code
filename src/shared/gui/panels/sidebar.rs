@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::shared;
+
 use super::super::colors::{
     COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_MUTED, COLOR_SELECTED_BG,
     COLOR_SIDEBAR_BG, COLOR_TAB_ACTIVE,
@@ -122,7 +124,7 @@ fn draw_service_row(state: &AppState, ui: &mut egui::Ui, i: usize) -> Option<Sid
 
 fn draw_package_row(
     ui:       &mut egui::Ui,
-    pkg:      &super::super::types::Package,
+    pkg:      &shared::core::types::Package,
     idx:      usize,
     selected: bool,
 ) -> Option<SidebarAction> {

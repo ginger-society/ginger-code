@@ -5,22 +5,10 @@ use std::sync::Arc;
 
 use super::colors::{COLOR_DIM, COLOR_RED, COLOR_YELLOW};
 use super::terminal::{Cell, ScrollbackSink, SshSession, TermPerformer};
+use crate::shared::core::types::{Package , K8sService};
 
 pub const MAX_TERM_TABS: usize = 5;
 
-// ── K8s service ───────────────────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct K8sService {
-    pub meta_name:       String,
-    pub organization_id: String,
-    pub deployment_name: Option<String>,
-    pub status:          String,
-    pub ready:           String,
-    pub lang:            Option<String>,
-    pub ejected:         bool,
-    pub ssh_host:        Option<String>,
-}
 
 impl K8sService {
     pub fn status_color(&self) -> egui::Color32 {
@@ -42,22 +30,6 @@ impl K8sService {
             _              => "✗",
         }
     }
-}
-
-// ── Package (from MetadataService, not on k8s) ───────────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct Package {
-    pub identifier:      String,
-    pub package_type:    String,
-    pub lang:            String,
-    pub description:     String,
-    /// Used by mount/unmount ops — not displayed.
-    pub organization_id: String,
-    /// True when a dev container has been successfully mounted for this package.
-    pub mounted:         bool,
-    /// Dependency identifiers shown in the detail panel.
-    pub dependencies:    Vec<String>,
 }
 
 // ── Right-pane tab ────────────────────────────────────────────────────────────

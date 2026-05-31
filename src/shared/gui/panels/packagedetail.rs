@@ -2,8 +2,9 @@
 
 use eframe::egui;
 
+use crate::shared::core::types::Package;
+
 use super::super::colors::{COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_FG, COLOR_MAGENTA, COLOR_MUTED};
-use super::super::types::Package;
 
 // ── Action returned to app.rs ─────────────────────────────────────────────────
 

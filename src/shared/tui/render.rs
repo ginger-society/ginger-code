@@ -10,10 +10,10 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
-use crate::shared::tui::{
+use crate::shared::{core::types::{K8sService, Package}, tui::{
     popup::render_popup,
-    types::{Focus, K8sService, Package, Popup, SidebarItem},
-};
+    types::{Focus, Popup, SidebarItem},
+}};
 
 /* ================================================================
    STATUS COLOUR / ICON

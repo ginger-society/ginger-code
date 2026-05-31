@@ -16,6 +16,7 @@ pub mod k8s_ops;
 pub mod mount;
 pub mod port;
 pub mod ssh_config;
+pub mod types;
 
 // Re-export functions with unambiguous names.
 // Can't use `pub use mount::mount` because `mount` the module shadows it.

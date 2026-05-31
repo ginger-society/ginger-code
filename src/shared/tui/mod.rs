@@ -39,12 +39,12 @@ use MetadataService::{
 };
 
 
-use crate::shared::core::{eject::{eject, uneject}, mount::{mount , unmount}};
+use crate::shared::core::{eject::{eject, uneject}, mount::{mount , unmount}, types::{K8sService, Package}};
 
 use self::{
     kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name, shell_into_pod},
     render::draw,
-    types::{Focus, K8sService, Package, Popup, PopupAction, SidebarItem},
+    types::{Focus, Popup, PopupAction, SidebarItem},
 };
 
 /* ================================================================
@@ -98,12 +98,13 @@ pub async fn fetch_metadata_and_process(
         let lang            = s.lang.as_ref().and_then(|l| l.as_ref()).cloned();
         K8sService {
             meta_name,
-            deployment_name: Some(deployment_name),
+            deployment_name: Some(deployment_name.clone()),
             status:          "Unknown".to_string(),
             ready:           "-".to_string(),
             organization_id: s.organization_id.clone(),
             lang,
             ejected:         false,
+            ssh_host: Some(deployment_name.to_lowercase().replace('_', "-")),
         }
     }).collect();
 
