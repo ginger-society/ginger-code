@@ -39,10 +39,10 @@ use MetadataService::{
 };
 
 
-use crate::shared::core::{eject::{eject, uneject}, mount::{mount , unmount}, types::{K8sService, Package}};
+use crate::shared::core::{eject::{eject, uneject}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name}, mount::{mount , unmount}, types::{K8sService, Package}};
 
 use self::{
-    kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name, shell_into_pod},
+    kubernetes::{shell_into_pod},
     render::draw,
     types::{Focus, Popup, PopupAction, SidebarItem},
 };
