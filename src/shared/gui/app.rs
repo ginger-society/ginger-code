@@ -141,7 +141,7 @@ impl App {
 
         // Convention mirrors the service editor: ssh-remote alias is
         // "<org_id>-<identifier>-local", workspace folder is the same.
-        let alias      = format!("{}-{}-local", pkg.organization_id, pkg.identifier);
+        let alias      = format!("{}-local", pkg.identifier);
         let remote_uri = format!(
             "vscode-remote://ssh-remote+{}/workspace/{}-{}",
             alias, pkg.organization_id, pkg.identifier,
