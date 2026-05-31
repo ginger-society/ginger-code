@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use crate::shared::core::data_source;
 
 use crossterm::{
     cursor::MoveTo,
@@ -29,17 +30,11 @@ use tokio::time::sleep;
 use MetadataService::{
     apis::{
         configuration::Configuration as MetadataConfiguration,
-        default_api::{
-            metadata_get_services_and_envs,
-            metadata_get_user_packages,
-            MetadataGetServicesAndEnvsParams,
-            MetadataGetUserPackagesParams,
-        },
     },
 };
 
 
-use crate::shared::core::{eject::{eject, uneject}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name}, mount::{mount , unmount}, types::{K8sService, Package}};
+use crate::shared::core::{eject::{eject, uneject}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected}, mount::{mount , unmount}, types::{K8sService, Package}};
 
 use self::{
     kubernetes::{shell_into_pod},
@@ -50,63 +45,29 @@ use self::{
 /* ================================================================
    ENTRY POINT
    ================================================================ */
-
 pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
-    session_user:    &str,
+    session_user: &str,
 ) {
     // ── Packages (non-fatal) ──────────────────────────────────────────────────
-    let packages: Vec<Package> = match metadata_get_user_packages(
-        metadata_config,
-        MetadataGetUserPackagesParams {
-            org_id: "ginger-society".to_string(),
-            env:    "stage".to_string(),
-        },
-    )
-    .await
-    {
-        Ok(raw) => raw.into_iter().map(|p| Package {
-            identifier:      p.identifier,
-            package_type:    p.package_type,
-            lang:            p.lang,
-            description:     p.description,
-            organization_id: p.organization_id,
-            mounted:         false,
-            dependencies:    p.dependencies,
-        }).collect(),
-        Err(e) => { eprintln!("Warning: package fetch failed: {e:?}"); vec![] }
-    };
+    let packages: Vec<Package> =
+        match data_source::fetch_packages(metadata_config, "ginger-society", "stage").await {
+            Ok(pkgs) => pkgs,
+            Err(e) => {
+                eprintln!("Warning: package fetch failed: {e:?}");
+                vec![]
+            }
+        };
 
-    // ── Services ──────────────────────────────────────────────────────────────
-    let raw_services = match metadata_get_services_and_envs(
-        metadata_config,
-        MetadataGetServicesAndEnvsParams {
-            page_number: Some("1".to_string()),
-            page_size:   Some("50".to_string()),
-            org_id:      "ginger-society".to_string(),
-        },
-    )
-    .await
-    {
-        Ok(s)  => s,
-        Err(e) => { eprintln!("{:?}\nUnable to get metadata", e); exit(1); }
-    };
-
-    let initial_services: Vec<K8sService> = raw_services.iter().map(|s| {
-        let meta_name       = s.identifier.to_string();
-        let deployment_name = meta_to_deployment_name(&meta_name);
-        let lang            = s.lang.as_ref().and_then(|l| l.as_ref()).cloned();
-        K8sService {
-            meta_name,
-            deployment_name: Some(deployment_name.clone()),
-            status:          "Unknown".to_string(),
-            ready:           "-".to_string(),
-            organization_id: s.organization_id.clone(),
-            lang,
-            ejected:         false,
-            ssh_host: Some(deployment_name.to_lowercase().replace('_', "-")),
-        }
-    }).collect();
+    // ── Services (fatal on error) ─────────────────────────────────────────────
+    let initial_services: Vec<K8sService> =
+        match data_source::fetch_services(metadata_config, "ginger-society", 50).await {
+            Ok(svcs) => svcs,
+            Err(e) => {
+                eprintln!("{e:?}\nUnable to get metadata");
+                exit(1);
+            }
+        };
 
     if let Err(e) = run_tui(initial_services, packages, session_user).await {
         eprintln!("TUI error: {}", e);

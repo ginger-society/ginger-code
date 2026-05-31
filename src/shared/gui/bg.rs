@@ -1,5 +1,7 @@
 //! Background task helpers and channel message types.
 
+//! Background task helpers and channel message types.
+
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -7,21 +9,15 @@ use std::time::Duration;
 use eframe::egui;
 use tokio::time::sleep;
 
-use MetadataService::{
-    apis::{
-        default_api::{
-            metadata_get_services_and_envs,
-            metadata_get_user_packages,
-            MetadataGetServicesAndEnvsParams,
-            MetadataGetUserPackagesParams,
-        },
-    },
-    get_configuration as get_metadata_configuration,
-};
 use ginger_shared_rs::utils::get_token_from_file_storage;
+use MetadataService::get_configuration as get_metadata_configuration;
 
-use crate::shared::core::{k8_info::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name}, types::{K8sService, Package}};
-use crate::shared::core::{mount, unmount};
+use crate::shared::core::{
+    data_source::{fetch_packages, fetch_services},
+    k8_info::{get_k8s_deployments, get_pod_logs, is_ejected},
+    mount, unmount,
+    types::{K8sService, Package},
+};
 
 // ── Channel messages ──────────────────────────────────────────────────────────
 
@@ -32,9 +28,9 @@ pub enum BgMsg {
     EjectedFlag { idx: usize, ejected: bool },
     Logs { lines: Vec<String>, generation: u64 },
     Error(String),
-    EjectResult  { success: bool, message: String, idx: usize },
+    EjectResult { success: bool, message: String, idx: usize },
     /// Result of a mount or unmount operation for a package.
-    MountResult  { success: bool, message: String, pkg_idx: usize, mounted: bool },
+    MountResult { success: bool, message: String, pkg_idx: usize, mounted: bool },
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
@@ -43,80 +39,37 @@ pub enum BgMsg {
 pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().expect("tokio rt");
+            .enable_all()
+            .build()
+            .expect("tokio rt");
 
         rt.block_on(async move {
-            let token           = get_token_from_file_storage();
-            let metadata_config = get_metadata_configuration(Some(token));
+            let token = get_token_from_file_storage();
+            let config = get_metadata_configuration(Some(token));
 
-            // ── Packages ────────────────────────────────────────────────────
-            match metadata_get_user_packages(
-                &metadata_config,
-                MetadataGetUserPackagesParams {
-                    org_id: "ginger-society".to_string(),
-                    env:    "stage".to_string(),
-                },
-            )
-            .await
-            {
-                Ok(raw) => {
-                    let packages = raw
-                        .into_iter()
-                        .map(|p| Package {
-                            identifier:      p.identifier,
-                            package_type:    p.package_type,
-                            lang:            p.lang,
-                            description:     p.description,
-                            organization_id: p.organization_id,
-                            mounted:         false,
-                            dependencies:    p.dependencies,
-                        })
-                        .collect();
+            // ── Packages (non-fatal) ─────────────────────────────────────
+            match fetch_packages(&config, "ginger-society", "stage").await {
+                Ok(packages) => {
                     let _ = tx.send(BgMsg::Packages(packages));
                     ctx.request_repaint();
                 }
-                Err(e) => {
-                    // Non-fatal — services still load.
-                    eprintln!("Package fetch error: {e:?}");
-                }
+                Err(e) => eprintln!("Package fetch error: {e:?}"),
             }
 
-            // ── Services ────────────────────────────────────────────────────
-            match metadata_get_services_and_envs(
-                &metadata_config,
-                MetadataGetServicesAndEnvsParams {
-                    page_number: Some("1".to_string()),
-                    page_size:   Some("100".to_string()),
-                    org_id:      "ginger-society".to_string(),
-                },
-            )
-            .await
-            {
-                Err(e) => { let _ = tx.send(BgMsg::Error(format!("{e:?}"))); }
-                Ok(raw) => {
-                    let services = raw.iter().map(|s| {
-                        let meta_name       = s.identifier.to_string();
-                        let deployment_name = meta_to_deployment_name(&meta_name);
-                        let lang            = s.lang.as_ref().and_then(|l| l.as_ref()).cloned();
-                        let pod_name        = Some(deployment_name.to_lowercase().replace('_', "-"));
-                        K8sService {
-                            meta_name,
-                            organization_id: s.organization_id.clone(),
-                            deployment_name: Some(deployment_name),
-                            status:  "Unknown".into(),
-                            ready:   "–".into(),
-                            lang,
-                            ejected: false,
-                            ssh_host: pod_name,
-                        }
-                    }).collect();
+            // ── Services ─────────────────────────────────────────────────
+            match fetch_services(&config, "ginger-society", 100).await {
+                Ok(services) => {
                     let _ = tx.send(BgMsg::Services(services));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("{e:?}")));
                 }
             }
             ctx.request_repaint();
         });
     });
 }
+
 
 /// Infinite loop: poll k8s deployment statuses every 5 seconds.
 pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
