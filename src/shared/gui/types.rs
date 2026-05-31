@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::colors::{COLOR_DIM, COLOR_RED, COLOR_YELLOW};
 use super::terminal::{Cell, ScrollbackSink, SshSession, TermPerformer};
-use crate::shared::core::types::{Package , K8sService};
+use crate::shared::core::types::{DbSchema, Package, K8sService};
 
 pub const MAX_TERM_TABS: usize = 5;
 
@@ -41,6 +41,8 @@ pub enum RightPane {
     TerminalTab(usize),
     /// Detail view for a package at the given index in `AppState::packages`.
     PackageDetail(usize),
+    /// Detail view for a DB schema at the given index in `AppState::db_schemas`.
+    DbSchemaDetail(usize),
 }
 
 // ── Per-terminal-tab state ────────────────────────────────────────────────────
@@ -91,9 +93,12 @@ impl TermTab {
 pub struct AppState {
     pub services:        Vec<K8sService>,
     pub packages:        Vec<Package>,
+    pub db_schemas:      Vec<DbSchema>,
     pub selected_idx:    usize,
     pub right_pane:      RightPane,
     pub logs:            Vec<String>,
+    /// Live logs for the currently selected DB schema deployment (if any).
+    pub db_logs:         Vec<String>,
     pub term_tabs:       Vec<TermTab>,
     pub tabs_by_service: HashMap<usize, Vec<TermTab>>,
     pub active_term:     usize,
@@ -111,9 +116,11 @@ impl AppState {
         AppState {
             services,
             packages:        Vec::new(),
+            db_schemas:      Vec::new(),
             selected_idx:    0,
             right_pane:      RightPane::Logs,
             logs:            vec!["Fetching logs…".into()],
+            db_logs:         vec!["Select a DB schema to view logs…".into()],
             term_tabs:       Vec::new(),
             tabs_by_service: HashMap::new(),
             active_term:     0,

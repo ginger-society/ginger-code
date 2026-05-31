@@ -5,6 +5,7 @@ use std::sync::{mpsc, Arc};
 use super::bg::{
     BgMsg,
     spawn_bulk_ejected_check,
+    spawn_db_schema_logs,
     spawn_k8s_poller,
     spawn_metadata_fetch,
     spawn_mount,
@@ -13,12 +14,14 @@ use super::bg::{
 };
 use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
-    draw_info_strip, draw_logs_pane, draw_package_detail, draw_service_list,
-    draw_statusbar, draw_tab_bar, draw_terminal_pane, draw_titlebar, TabBarAction,
+    draw_db_schema_detail, draw_info_strip, draw_logs_pane, draw_package_detail,
+    draw_service_list, draw_statusbar, draw_tab_bar, draw_terminal_pane, draw_titlebar,
+    TabBarAction,
 };
 use super::terminal::{spawn_kubectl, TermPerformer};
 use super::types::{AppState, RightPane, TermState};
 use crate::shared::core::eject::{eject, uneject};
+use crate::shared::core::image::pkg_to_slug;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -31,6 +34,9 @@ pub struct App {
     ejecting: Option<String>,
     /// In-flight mount/unmount description + package index.
     mounting: Option<(usize, String)>,
+    /// Index of the DB schema whose logs are currently being polled.
+    /// Used to avoid restarting the poller when the user re-clicks the same schema.
+    db_log_schema_idx: Option<usize>,
     ctx:      egui::Context,
 }
 
@@ -58,12 +64,13 @@ impl App {
         spawn_k8s_poller(tx.clone(), ctx.clone());
 
         App {
-            state:    AppState::new(13.0, vec![]),
+            state:             AppState::new(13.0, vec![]),
             rx,
             tx,
-            loading:  true,
-            ejecting: None,
-            mounting: None,
+            loading:           true,
+            ejecting:          None,
+            mounting:          None,
+            db_log_schema_idx: None,
             ctx,
         }
     }
@@ -96,6 +103,39 @@ impl App {
 
     fn select_package(&mut self, pkg_idx: usize) {
         self.state.right_pane = RightPane::PackageDetail(pkg_idx);
+    }
+
+    // ── DB schema selection ───────────────────────────────────────────────────
+
+    fn select_db_schema(&mut self, schema_idx: usize) {
+        self.state.right_pane = RightPane::DbSchemaDetail(schema_idx);
+        self.state.db_logs    = vec![];  // reset to "loading" state
+
+        // Only start a new poller if a different schema is selected
+        if self.db_log_schema_idx == Some(schema_idx) {
+            return;
+        }
+        self.db_log_schema_idx = Some(schema_idx);
+
+        // Derive the deployment slug from the schema identifier (falls back to name)
+        let slug = self.state.db_schemas
+            .get(schema_idx)
+            .and_then(|s| s.identifier.clone())
+            .unwrap_or_else(|| {
+                self.state.db_schemas
+                    .get(schema_idx)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            })
+            .to_lowercase()
+            .replace('_', "-");
+
+        spawn_db_schema_logs(
+            self.tx.clone(),
+            self.ctx.clone(),
+            schema_idx,
+            slug,
+        );
     }
 
     // ── Mount / unmount ───────────────────────────────────────────────────────
@@ -139,8 +179,6 @@ impl App {
         let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
         if !pkg.mounted { return; }
 
-        // Convention mirrors the service editor: ssh-remote alias is
-        // "<org_id>-<identifier>-local", workspace folder is the same.
         let alias      = format!("{}-local", pkg.identifier);
         let remote_uri = format!(
             "vscode-remote://ssh-remote+{}/workspace/{}-{}",
@@ -273,7 +311,7 @@ impl App {
             }
         };
 
-        let sink = Arc::new(Mutex::new(Vec::new()));
+        let sink      = Arc::new(Mutex::new(Vec::new()));
         let performer = Arc::new(Mutex::new(
             TermPerformer::new(rows as usize, cols as usize)
                 .with_sink(Arc::clone(&sink)),
@@ -329,6 +367,10 @@ impl App {
                     self.state.packages = pkgs;
                 }
 
+                Ok(BgMsg::DbSchemas(schemas)) => {
+                    self.state.db_schemas = schemas;
+                }
+
                 Ok(BgMsg::K8sStatuses(deployments)) => {
                     for svc in &mut self.state.services {
                         if let Some(ref dep) = svc.deployment_name {
@@ -364,6 +406,13 @@ impl App {
                     }
                 }
 
+                Ok(BgMsg::DbSchemaLogs { lines, schema_idx }) => {
+                    // Only update if this is still the selected schema
+                    if self.db_log_schema_idx == Some(schema_idx) {
+                        self.state.db_logs = lines;
+                    }
+                }
+
                 Ok(BgMsg::Error(e)) => {
                     self.loading    = false;
                     self.state.logs = vec![format!("Failed to load services: {e}")];
@@ -391,19 +440,14 @@ impl App {
                 }
 
                 Ok(BgMsg::MountResult { success, message, pkg_idx, mounted }) => {
-                    // Clear spinner regardless of outcome.
                     if matches!(self.mounting, Some((i, _)) if i == pkg_idx) {
                         self.mounting = None;
                     }
-                    // Update the mounted flag.
                     if success {
                         if let Some(pkg) = self.state.packages.get_mut(pkg_idx) {
                             pkg.mounted = mounted;
                         }
                     }
-                    // Surface the result message in the logs pane so it's visible
-                    // when the user switches back to a service, and also just as a
-                    // general notification channel.
                     self.state.logs.push(message);
                 }
 
@@ -443,7 +487,6 @@ impl eframe::App for App {
         if matches!(self.state.right_pane, RightPane::TerminalTab(_)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
-        // Keep repainting while a mount/unmount spinner is animating.
         if self.mounting.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
@@ -481,8 +524,9 @@ impl eframe::App for App {
                     use super::panels::sidebar::SidebarAction;
                     if let Some(action) = draw_service_list(&self.state, ui) {
                         match action {
-                            SidebarAction::SelectService(idx) => self.select_service(idx),
-                            SidebarAction::SelectPackage(idx) => self.select_package(idx),
+                            SidebarAction::SelectService(idx)  => self.select_service(idx),
+                            SidebarAction::SelectPackage(idx)  => self.select_package(idx),
+                            SidebarAction::SelectDbSchema(idx) => self.select_db_schema(idx),
                         }
                     }
                 }
@@ -499,10 +543,25 @@ impl eframe::App for App {
                     return;
                 }
 
+                // ── DB schema detail ──────────────────────────────────────────
+                if let RightPane::DbSchemaDetail(idx) = self.state.right_pane {
+                    if let Some(schema) = self.state.db_schemas.get(idx).cloned() {
+                        // Pass logs as Option<&[String]>:
+                        //   None      → still loading (db_logs is empty AND poller just started)
+                        //   Some([])  → poller ran, no deployment found
+                        //   Some([..])→ live lines
+                        let logs_opt: Option<&[String]> = if self.db_log_schema_idx == Some(idx) {
+                            Some(&self.state.db_logs)
+                        } else {
+                            None
+                        };
+                        draw_db_schema_detail(&schema, logs_opt, ui);
+                    }
+                    return;
+                }
+
                 // ── Package detail view ───────────────────────────────────────
                 if let RightPane::PackageDetail(pkg_idx) = self.state.right_pane {
-                    // Clone what we need to avoid holding borrow on self.state
-                    // while calling methods on self.
                     if let Some(pkg) = self.state.packages.get(pkg_idx).cloned() {
                         let mounting_msg = self.mounting.as_ref()
                             .filter(|(i, _)| *i == pkg_idx)
@@ -546,7 +605,7 @@ impl eframe::App for App {
                     match self.state.right_pane {
                         RightPane::Logs           => draw_logs_pane(&self.state, ui),
                         RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
-                        RightPane::PackageDetail(_) => {} // handled above
+                        RightPane::PackageDetail(_) | RightPane::DbSchemaDetail(_) => {}
                     }
                 });
             });

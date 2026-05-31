@@ -4,15 +4,14 @@
 //! their error-handling strategy differs, so we expose the two fetches as
 //! independent `async fn`s and let each caller decide what to do on failure.
 
-use MetadataService::{
-    apis::{
+use MetadataService::apis::{
         configuration::Configuration as MetadataConfiguration,
         default_api::{
-            metadata_get_services_and_envs, metadata_get_user_packages,
-            MetadataGetServicesAndEnvsParams, MetadataGetUserPackagesParams,
+            MetadataGetDbschemasAndTablesParams, MetadataGetDbschemasParams, MetadataGetServicesAndEnvsParams, MetadataGetUserPackagesParams, metadata_get_dbschemas, metadata_get_dbschemas_and_tables, metadata_get_services_and_envs, metadata_get_user_packages
         },
-    },
-};
+    };
+
+use crate::shared::core::types::DbSchema;
 
 use super::{
     k8_info::meta_to_deployment_name,
@@ -100,4 +99,39 @@ pub async fn fetch_services(
         .collect();
 
     Ok(services)
+}
+
+pub async fn fetch_dbs(
+    config:    &MetadataConfiguration,
+    org_id:    &str,
+    _page_size: u32,
+) -> Result<Vec<DbSchema>, DataSourceError> {
+    use super::types::DbSchema;
+
+    let raw = metadata_get_dbschemas_and_tables(
+        config,
+        MetadataGetDbschemasAndTablesParams {
+            org_id: org_id.to_string(),
+            env:    "stage".to_string(),
+        },
+    )
+    .await?;
+
+    let schemas = raw
+        .into_iter()
+        .map(|s| DbSchema {
+            id:              s.id,
+            name:            s.name,
+            identifier:      s.identifier.and_then(|o| o),
+            db_type:         s.db_type.and_then(|o| o),
+            organization_id: s.organization_id,
+            tables:          s.tables,
+            description:     s.description.and_then(|o| o),
+            version:         s.version.and_then(|o| o),
+            pipeline_status: s.pipeline_status.and_then(|o| o),
+            updated_at:      s.updated_at,
+        })
+        .collect();
+
+    Ok(schemas)
 }

@@ -10,6 +10,7 @@ mod statusbar;
 mod tabbar;
 mod terminalpane;
 mod titlebar;
+pub mod dbschemadetail;
 
 pub use infostrip::{draw_info_strip, InfoStripAction};
 pub use logspane::draw_logs_pane;
@@ -19,3 +20,4 @@ pub use statusbar::draw_statusbar;
 pub use tabbar::{draw_tab_bar, TabBarAction};
 pub use terminalpane::draw_terminal_pane;
 pub use titlebar::draw_titlebar;
+pub use dbschemadetail::draw_db_schema_detail;

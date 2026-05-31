@@ -1,7 +1,5 @@
 //! Background task helpers and channel message types.
 
-//! Background task helpers and channel message types.
-
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -13,10 +11,10 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_packages, fetch_services},
+    data_source::{fetch_dbs, fetch_packages, fetch_services},
     k8_info::{get_k8s_deployments, get_pod_logs, is_ejected},
     mount, unmount,
-    types::{K8sService, Package},
+    types::{DbSchema, K8sService, Package},
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -24,9 +22,12 @@ use crate::shared::core::{
 pub enum BgMsg {
     Services(Vec<K8sService>),
     Packages(Vec<Package>),
+    DbSchemas(Vec<DbSchema>),
     K8sStatuses(HashMap<String, (String, String)>),
     EjectedFlag { idx: usize, ejected: bool },
     Logs { lines: Vec<String>, generation: u64 },
+    /// Logs for the selected DB schema deployment (empty vec = no deployment found).
+    DbSchemaLogs { lines: Vec<String>, schema_idx: usize },
     Error(String),
     EjectResult { success: bool, message: String, idx: usize },
     /// Result of a mount or unmount operation for a package.
@@ -35,7 +36,7 @@ pub enum BgMsg {
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
 
-/// One-shot: fetch packages then services from the metadata API.
+/// One-shot: fetch packages, services, and DB schemas from the metadata API.
 pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -44,10 +45,10 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
             .expect("tokio rt");
 
         rt.block_on(async move {
-            let token = get_token_from_file_storage();
+            let token  = get_token_from_file_storage();
             let config = get_metadata_configuration(Some(token));
 
-            // ── Packages (non-fatal) ─────────────────────────────────────
+            // ── Packages (non-fatal) ──────────────────────────────────────
             match fetch_packages(&config, "ginger-society", "stage").await {
                 Ok(mut packages) => {
                     for pkg in &mut packages {
@@ -69,11 +70,20 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                     let _ = tx.send(BgMsg::Error(format!("{e:?}")));
                 }
             }
+
+            // ── DB Schemas (non-fatal) ────────────────────────────────────
+            match fetch_dbs(&config, "ginger-society", 100).await {
+                Ok(schemas) => {
+                    let _ = tx.send(BgMsg::DbSchemas(schemas));
+                    ctx.request_repaint();
+                }
+                Err(e) => eprintln!("DB schema fetch error: {e:?}"),
+            }
+
             ctx.request_repaint();
         });
     });
 }
-
 
 /// Infinite loop: poll k8s deployment statuses every 5 seconds.
 pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
@@ -147,12 +157,12 @@ pub fn spawn_bulk_ejected_check(
 
 /// Mount a dev container for `pkg_idx`.
 pub fn spawn_mount(
-    tx:          mpsc::Sender<BgMsg>,
-    ctx:         egui::Context,
-    pkg_idx:     usize,
-    org_id:      String,
-    identifier:  String,
-    lang:        String,
+    tx:         mpsc::Sender<BgMsg>,
+    ctx:        egui::Context,
+    pkg_idx:    usize,
+    org_id:     String,
+    identifier: String,
+    lang:       String,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -172,11 +182,11 @@ pub fn spawn_mount(
 
 /// Unmount the dev container for `pkg_idx`.
 pub fn spawn_unmount(
-    tx:          mpsc::Sender<BgMsg>,
-    ctx:         egui::Context,
-    pkg_idx:     usize,
-    org_id:      String,
-    identifier:  String,
+    tx:         mpsc::Sender<BgMsg>,
+    ctx:        egui::Context,
+    pkg_idx:    usize,
+    org_id:     String,
+    identifier: String,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -190,6 +200,42 @@ pub fn spawn_unmount(
             };
             let _ = tx.send(BgMsg::MountResult { success, message, pkg_idx, mounted: false });
             ctx.request_repaint();
+        });
+    });
+}
+
+/// Poll logs for a DB schema's deployment (by identifier slug).
+/// Sends `DbSchemaLogs` with an empty vec if no deployment exists.
+/// Runs until the sender is dropped (i.e. the user switches away).
+pub fn spawn_db_schema_logs(
+    tx:         mpsc::Sender<BgMsg>,
+    ctx:        egui::Context,
+    schema_idx: usize,
+    slug:       String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            loop {
+                let lines = get_pod_logs(&slug).await;
+                // get_pod_logs returns a single "No pods found" string when absent —
+                // we normalise that into our "no deployment" indicator.
+                let normalised = if lines.len() == 1
+                    && lines[0].starts_with("No pods found")
+                {
+                    vec![]
+                } else {
+                    lines
+                };
+
+                if tx.send(BgMsg::DbSchemaLogs { lines: normalised, schema_idx }).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+                sleep(Duration::from_secs(3)).await;
+            }
         });
     });
 }

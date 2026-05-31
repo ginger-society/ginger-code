@@ -32,3 +32,18 @@ pub struct Package {
     /// Dependency identifiers shown in the detail panel.
     pub dependencies:    Vec<String>,
 }
+
+
+#[derive(Clone, Debug)]
+pub struct DbSchema {
+    pub id:              i64,
+    pub name:            String,
+    pub identifier:      Option<String>,
+    pub db_type:         Option<String>,
+    pub organization_id: String,
+    pub tables:          Vec<String>,
+    pub description:     Option<String>,
+    pub version:         Option<String>,
+    pub pipeline_status: Option<String>,
+    pub updated_at:      String,
+}
