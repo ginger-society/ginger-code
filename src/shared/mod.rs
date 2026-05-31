@@ -1,6 +1,6 @@
-pub mod ui;
 pub mod gui;
 pub mod core;
+pub mod tui;
 
 
 pub const ICON_GREEN: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22">

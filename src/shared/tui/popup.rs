@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear as RatatuiClear, Paragraph},
 };
 
-use crate::shared::ui::types::{Popup, PopupAction};
+use crate::shared::tui::types::{Popup, PopupAction};
 
 pub fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     let popup_width = r.width * percent_x / 100;

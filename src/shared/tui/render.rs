@@ -10,7 +10,7 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
-use crate::shared::ui::{
+use crate::shared::tui::{
     popup::render_popup,
     types::{Focus, K8sService, Package, Popup, SidebarItem},
 };

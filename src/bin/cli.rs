@@ -10,7 +10,7 @@ use IAMService::apis::default_api::identity_validate_api_token;
 use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::apis::configuration::Configuration as MetadataConfiguration;
 use MetadataService::get_configuration as get_metadata_configuration;
-use shared::ui::fetch_metadata_and_process;
+use shared::tui::fetch_metadata_and_process;
 
 // ── ANSI colours ──────────────────────────────────────────────────────────────
 

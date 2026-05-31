@@ -1,7 +1,7 @@
-pub mod kubernetes;
 pub mod popup;
 pub mod render;
 pub mod types;
+pub mod kubernetes;
 
 use std::{
     collections::HashMap,
