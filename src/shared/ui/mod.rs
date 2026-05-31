@@ -7,7 +7,6 @@ pub mod types;
 use std::{
     collections::HashMap,
     io::{self, Write},
-    path::Path,
     process::exit,
     sync::{Arc, Mutex},
     time::Duration,
@@ -31,18 +30,22 @@ use tokio::time::sleep;
 use MetadataService::{
     apis::{
         configuration::Configuration as MetadataConfiguration,
-        default_api::{metadata_get_services_and_envs, MetadataGetServicesAndEnvsParams},
+        default_api::{
+            metadata_get_services_and_envs,
+            metadata_get_user_packages,
+            MetadataGetServicesAndEnvsParams,
+            MetadataGetUserPackagesParams,
+        },
     },
 };
-use ginger_shared_rs::read_service_config_file;
+
+use crate::shared::gui::mount::{mount, unmount};
 
 use self::{
     eject::{eject, uneject},
-    kubernetes::{
-        get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name, shell_into_pod,
-    },
+    kubernetes::{get_k8s_deployments, get_pod_logs, is_ejected, meta_to_deployment_name, shell_into_pod},
     render::draw,
-    types::{Focus, K8sService, Popup, PopupAction},
+    types::{Focus, K8sService, Package, Popup, PopupAction, SidebarItem},
 };
 
 /* ================================================================
@@ -51,49 +54,61 @@ use self::{
 
 pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
-    session_user: &str,
+    session_user:    &str,
 ) {
+    // ── Packages (non-fatal) ──────────────────────────────────────────────────
+    let packages: Vec<Package> = match metadata_get_user_packages(
+        metadata_config,
+        MetadataGetUserPackagesParams {
+            org_id: "ginger-society".to_string(),
+            env:    "stage".to_string(),
+        },
+    )
+    .await
+    {
+        Ok(raw) => raw.into_iter().map(|p| Package {
+            identifier:      p.identifier,
+            package_type:    p.package_type,
+            lang:            p.lang,
+            description:     p.description,
+            organization_id: p.organization_id,
+            mounted:         false,
+            dependencies:    p.dependencies,
+        }).collect(),
+        Err(e) => { eprintln!("Warning: package fetch failed: {e:?}"); vec![] }
+    };
 
+    // ── Services ──────────────────────────────────────────────────────────────
     let raw_services = match metadata_get_services_and_envs(
         metadata_config,
         MetadataGetServicesAndEnvsParams {
             page_number: Some("1".to_string()),
             page_size:   Some("50".to_string()),
-            org_id:      "ginger-society".to_string(),  // TODO: get from session or config
+            org_id:      "ginger-society".to_string(),
         },
     )
     .await
     {
         Ok(s)  => s,
-        Err(e) => {
-            eprintln!("{:?}", e);
-            eprintln!("Unable to get metadata");
-            exit(1);
-        }
+        Err(e) => { eprintln!("{:?}\nUnable to get metadata", e); exit(1); }
     };
 
-    let initial_services: Vec<K8sService> = raw_services
-        .iter()
-        .map(|s| {
-            let meta_name       = format!("{}", s.identifier);
-            let deployment_name = meta_to_deployment_name(&meta_name);
-            let lang            = s.lang
-                .as_ref()
-                .and_then(|l| l.as_ref())
-                .map(|l| l.clone());
-            K8sService {
-                meta_name,
-                deployment_name: Some(deployment_name),
-                status: "Unknown".to_string(),
-                ready:  "-".to_string(),
-                organization_id: s.organization_id.clone(),
-                lang,
-                ejected: false,
-            }
-        })
-        .collect();
+    let initial_services: Vec<K8sService> = raw_services.iter().map(|s| {
+        let meta_name       = s.identifier.to_string();
+        let deployment_name = meta_to_deployment_name(&meta_name);
+        let lang            = s.lang.as_ref().and_then(|l| l.as_ref()).cloned();
+        K8sService {
+            meta_name,
+            deployment_name: Some(deployment_name),
+            status:          "Unknown".to_string(),
+            ready:           "-".to_string(),
+            organization_id: s.organization_id.clone(),
+            lang,
+            ejected:         false,
+        }
+    }).collect();
 
-    if let Err(e) = run_tui(initial_services, session_user).await {
+    if let Err(e) = run_tui(initial_services, packages, session_user).await {
         eprintln!("TUI error: {}", e);
         exit(1);
     }
@@ -105,7 +120,8 @@ pub async fn fetch_metadata_and_process(
 
 async fn run_tui(
     initial_services: Vec<K8sService>,
-    session_user: &str,
+    initial_packages: Vec<Package>,
+    _session_user:    &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -113,11 +129,13 @@ async fn run_tui(
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let services:     Arc<Mutex<Vec<K8sService>>>              = Arc::new(Mutex::new(initial_services));
-    let logs:         Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let selected_idx: Arc<Mutex<usize>>                        = Arc::new(Mutex::new(0));
+    let services:  Arc<Mutex<Vec<K8sService>>> = Arc::new(Mutex::new(initial_services));
+    let packages:  Arc<Mutex<Vec<Package>>>    = Arc::new(Mutex::new(initial_packages));
+    let logs:      Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // The index of the currently "active" service for log streaming.
+    let svc_log_idx: Arc<Mutex<usize>>         = Arc::new(Mutex::new(0));
 
-    // ── Background: poll k8s deployment statuses + ejected flag ──────────────
+    // ── Background: k8s status + ejected flags ────────────────────────────────
     {
         let services = services.clone();
         tokio::spawn(async move {
@@ -137,11 +155,9 @@ async fn run_tui(
                         }
                     }
                 }
-
                 let deps: Vec<(usize, String)> = {
                     let svcs = services.lock().unwrap();
-                    svcs.iter()
-                        .enumerate()
+                    svcs.iter().enumerate()
                         .filter_map(|(i, s)| s.deployment_name.clone().map(|d| (i, d)))
                         .collect()
                 };
@@ -151,79 +167,79 @@ async fn run_tui(
                         svc.ejected = ejected;
                     }
                 }
-
                 sleep(Duration::from_secs(5)).await;
             }
         });
     }
 
-    // ── Background: stream logs for selected service ──────────────────────────
+    // ── Background: stream logs for the active service ────────────────────────
     {
-        let services     = services.clone();
-        let logs         = logs.clone();
-        let selected_idx = selected_idx.clone();
+        let services    = services.clone();
+        let logs        = logs.clone();
+        let svc_log_idx = svc_log_idx.clone();
         tokio::spawn(async move {
             loop {
                 let (dep_name, meta_name) = {
                     let svcs = services.lock().unwrap();
-                    let idx  = *selected_idx.lock().unwrap();
+                    let idx  = *svc_log_idx.lock().unwrap();
                     svcs.get(idx)
                         .map(|s| (s.deployment_name.clone(), s.meta_name.clone()))
                         .unwrap_or((None, String::new()))
                 };
-
                 if let Some(dep) = dep_name {
-                    let new_logs = get_pod_logs(&dep).await;
-                    logs.lock().unwrap().insert(meta_name, new_logs);
+                    let lines = get_pod_logs(&dep).await;
+                    logs.lock().unwrap().insert(meta_name, lines);
                 }
-
                 sleep(Duration::from_secs(2)).await;
             }
         });
     }
 
-    let mut focus         = Focus::Services;
-    let mut auto_scroll   = true;
-    let mut scroll_offset: usize = 0;
-    let mut popup: Option<Popup> = None;
-
-    let mut services_list_area = ratatui::layout::Rect::default();
-    let mut logs_area          = ratatui::layout::Rect::default();
+    // ── UI state ──────────────────────────────────────────────────────────────
+    let mut focus:         Focus       = Focus::Sidebar;
+    let mut sidebar_item:  SidebarItem = SidebarItem::Service(0);
+    let mut auto_scroll:   bool        = true;
+    let mut scroll_offset: usize       = 0;
+    let mut popup:         Option<Popup> = None;
+    let mut sidebar_scroll: usize      = 0; // last rendered scroll offset, for hit-test
 
     loop {
-        let services_snap  = services.lock().unwrap().clone();
-        let current_idx    = *selected_idx.lock().unwrap();
-        let selected       = services_snap.get(current_idx).cloned();
-        let has_deployment = selected
-            .as_ref()
-            .map(|s| s.status != "Not deployed" && s.status != "Unknown")
-            .unwrap_or(false);
-        let has_lang       = selected.as_ref().and_then(|s| s.lang.as_ref()).is_some();
-        let is_ejected_now = selected.as_ref().map(|s| s.ejected).unwrap_or(false);
+        let services_snap = services.lock().unwrap().clone();
+        let packages_snap = packages.lock().unwrap().clone();
+        let logs_snap     = logs.lock().unwrap().clone();
+
+        // Derive per-frame context from sidebar_item.
+        let (selected_svc, has_deployment, has_lang, is_ejected_now) =
+            if let SidebarItem::Service(i) = sidebar_item {
+                let svc = services_snap.get(i);
+                let has_dep = svc.map(|s| s.status != "Not deployed" && s.status != "Unknown").unwrap_or(false);
+                let has_lang = svc.and_then(|s| s.lang.as_ref()).is_some();
+                let ejected  = svc.map(|s| s.ejected).unwrap_or(false);
+                (svc, has_dep, has_lang, ejected)
+            } else {
+                (None, false, false, false)
+            };
 
         // ── Draw ──────────────────────────────────────────────────────────────
-        let logs_snap = logs.lock().unwrap().clone();
         terminal.draw(|f| {
-            let log_text = selected.as_ref().and_then(|s| logs_snap.get(&s.meta_name))
-                .map(|l| l.join("\n"))
-                .unwrap_or_default();
-            let num_lines  = log_text.lines().count();
-            let height     = f.size().height.saturating_sub(10) as usize;
-            let max_scroll = num_lines.saturating_sub(height);
-            if auto_scroll {
-                scroll_offset = max_scroll;
-            } else {
-                scroll_offset = scroll_offset.min(max_scroll);
-                if scroll_offset >= max_scroll {
-                    auto_scroll = true;
+            // Sync log scroll.
+            if let Some(svc) = selected_svc {
+                let log_text = logs_snap.get(&svc.meta_name).map(|l| l.join("\n")).unwrap_or_default();
+                let max_scroll = log_text.lines().count()
+                    .saturating_sub(f.size().height.saturating_sub(10) as usize);
+                if auto_scroll {
+                    scroll_offset = max_scroll;
+                } else {
+                    scroll_offset = scroll_offset.min(max_scroll);
+                    if scroll_offset >= max_scroll { auto_scroll = true; }
                 }
             }
 
-            draw(
+            let drawn = draw(
                 f,
                 &services_snap,
-                current_idx,
-                selected.as_ref(),
+                &packages_snap,
+                &sidebar_item,
                 &logs_snap,
                 &focus,
                 auto_scroll,
@@ -233,325 +249,399 @@ async fn run_tui(
                 is_ejected_now,
                 popup.as_ref(),
             );
+            sidebar_scroll = drawn.sidebar_scroll;
         })?;
-
-        {
-            use ratatui::layout::{Constraint, Direction, Layout};
-            let area = terminal.get_frame().size();
-            let root = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(2)])
-                .split(area);
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-                .split(root[0]);
-            let right_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(6), Constraint::Min(0)])
-                .split(chunks[1]);
-            services_list_area = chunks[0];
-            logs_area          = right_chunks[1];
-        }
 
         /* ================================================================
            INPUT
            ================================================================ */
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
+        if !event::poll(Duration::from_millis(100))? { continue; }
 
-                /* ── Mouse ──────────────────────────────────────────────── */
-                Event::Mouse(mouse) => {
-                    if popup.is_some() {
-                        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                            popup = None;
-                        }
-                        continue;
-                    }
-                    match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let (col, row) = (mouse.column, mouse.row);
-                            if let Some(idx) = render::click_service_index(
-                                col, row, services_list_area, services_snap.len(),
-                            ) {
-                                focus = Focus::Services;
-                                *selected_idx.lock().unwrap() = idx;
+        match event::read()? {
+
+            /* ── Mouse ──────────────────────────────────────────────────── */
+            Event::Mouse(mouse) => {
+                if popup.is_some() {
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) { popup = None; }
+                    continue;
+                }
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let (col, row) = (mouse.column, mouse.row);
+                        // Check sidebar click.
+                        let sidebar_area = {
+                            // Recompute sidebar rect — same split as in draw().
+                            let term = terminal.size()?;
+                            let root_h = term.height.saturating_sub(2);
+                            let sidebar_w = term.width * 35 / 100;
+                            ratatui::layout::Rect { x: 0, y: 0, width: sidebar_w, height: root_h }
+                        };
+                        if let Some(item) = render::click_sidebar_item(
+                            col, row, sidebar_area, sidebar_scroll,
+                            services_snap.len(), packages_snap.len(),
+                        ) {
+                            focus = Focus::Sidebar;
+                            if let SidebarItem::Service(i) = item {
+                                *svc_log_idx.lock().unwrap() = i;
                                 auto_scroll = true;
-                            } else if render::point_in_rect(col, row, logs_area) {
+                            }
+                            sidebar_item = item;
+                        } else {
+                            // Clicked right pane → focus logs (for service view).
+                            if matches!(sidebar_item, SidebarItem::Service(_)) {
                                 focus = Focus::Logs;
                             }
                         }
-                        MouseEventKind::ScrollUp => {
-                            if focus == Focus::Logs {
-                                auto_scroll   = false;
-                                scroll_offset = scroll_offset.saturating_sub(3);
-                            }
-                        }
-                        MouseEventKind::ScrollDown => {
-                            if focus == Focus::Logs {
-                                scroll_offset += 3;
-                            }
-                        }
-                        _ => {}
                     }
+                    MouseEventKind::ScrollUp => {
+                        if focus == Focus::Logs { auto_scroll = false; scroll_offset = scroll_offset.saturating_sub(3); }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if focus == Focus::Logs { scroll_offset += 3; }
+                    }
+                    _ => {}
                 }
+            }
 
-                /* ── Keyboard ───────────────────────────────────────────── */
-                Event::Key(key) => {
-                    /* ── Popup active ───────────────────────────────────── */
-                    if let Some(ref mut p) = popup {
-                        if p.action == PopupAction::ShellBlocked {
-                            popup = None;
-                            continue;
-                        }
-                        match key.code {
-                            KeyCode::Left  | KeyCode::Char('h') => p.selected = 0,
-                            KeyCode::Right | KeyCode::Char('l') => p.selected = 1,
-                            KeyCode::Tab => p.selected = (p.selected + 1) % 2,
-                            KeyCode::Enter => {
-                                if p.selected == 0 {
-                                    match p.action {
-                                        PopupAction::Quit => {
-                                            popup = None;
-                                            break;
-                                        }
-                                        PopupAction::ShellBlocked => unreachable!(),
-                                        PopupAction::Eject | PopupAction::Uneject => {
-                                            // ── grab dep, lang, ejected, meta_name ──
-                                            let (dep, lang, ejected, meta_name, organization_id) = {
-                                                let svcs = services.lock().unwrap();
-                                                let idx  = *selected_idx.lock().unwrap();
-                                                svcs.get(idx)
-                                                    .map(|s| (
-                                                        s.deployment_name.clone(),
-                                                        s.lang.clone(),
-                                                        s.ejected,
-                                                        s.meta_name.clone(),
-                                                        s.organization_id.clone(),   // ← new
-                                                    ))
-                                                    .unwrap_or((None, None, false, String::new(), String::new()))
-                                            };
+            /* ── Keyboard ───────────────────────────────────────────────── */
+            Event::Key(key) => {
+                /* ── Popup active ───────────────────────────────────────── */
+                if let Some(ref mut p) = popup {
+                    if p.action == PopupAction::ShellBlocked { popup = None; continue; }
+                    match key.code {
+                        KeyCode::Left  | KeyCode::Char('h') => p.selected = 0,
+                        KeyCode::Right | KeyCode::Char('l') => p.selected = 1,
+                        KeyCode::Tab => p.selected = (p.selected + 1) % 2,
+                        KeyCode::Esc => { popup = None; }
+                        KeyCode::Enter => {
+                            if p.selected == 0 {
+                                match p.action {
+                                    PopupAction::Quit => { popup = None; break; }
+                                    PopupAction::ShellBlocked => unreachable!(),
 
-                                            if let Some(dep_name) = dep {
-                                                popup = None;
-                                                disable_raw_mode()?;
-                                                execute!(
-                                                    terminal.backend_mut(),
-                                                    LeaveAlternateScreen,
-                                                    DisableMouseCapture,
-                                                    Clear(ClearType::All),
-                                                    MoveTo(0, 0)
-                                                )?;
-                                                terminal.show_cursor()?;
-                                                io::stdout().flush()?;
-
-                                                let result = if ejected {
-                                                    uneject(&dep_name).await
-                                                } else {
-                                                    eject(
-                                                        &dep_name,
-                                                        lang.as_deref().unwrap_or(""),
-                                                        &meta_name,
-                                                        &organization_id,
-                                                    ).await
-                                                };
-
-                                                if let Err(e) = result {
-                                                    eprintln!("Error: {}", e);
+                                    PopupAction::Eject | PopupAction::Uneject => {
+                                        if let SidebarItem::Service(svc_i) = sidebar_item {
+                                            let svcs = services.lock().unwrap();
+                                            if let Some(svc) = svcs.get(svc_i) {
+                                                let dep      = svc.deployment_name.clone();
+                                                let lang     = svc.lang.clone();
+                                                let ejected  = svc.ejected;
+                                                let meta     = svc.meta_name.clone();
+                                                let org      = svc.organization_id.clone();
+                                                drop(svcs);
+                                                if let Some(dep_name) = dep {
+                                                    popup = None;
+                                                    leave_tui(&mut terminal)?;
+                                                    let r = if ejected {
+                                                        uneject(&dep_name).await
+                                                    } else {
+                                                        eject(&dep_name, lang.as_deref().unwrap_or(""), &meta, &org).await
+                                                    };
+                                                    if let Err(e) = r { eprintln!("Error: {e}"); }
+                                                    sleep(Duration::from_secs(2)).await;
+                                                    enter_tui(&mut terminal)?;
+                                                    continue;
                                                 }
-                                                sleep(Duration::from_secs(2)).await;
-
-                                                enable_raw_mode()?;
-                                                execute!(
-                                                    terminal.backend_mut(),
-                                                    EnterAlternateScreen,
-                                                    EnableMouseCapture
-                                                )?;
-                                                terminal.hide_cursor()?;
-                                                terminal.clear()?;
-                                                continue;
                                             }
                                         }
+                                        popup = None;
+                                    }
+
+                                    PopupAction::Mount => {
+                                        if let SidebarItem::Package(pkg_i) = sidebar_item {
+                                            let (org, id, lang) = {
+                                                let pkgs = packages.lock().unwrap();
+                                                pkgs.get(pkg_i).map(|p| (
+                                                    p.organization_id.clone(),
+                                                    p.identifier.clone(),
+                                                    p.lang.clone(),
+                                                )).unwrap_or_default()
+                                            };
+                                            popup = None;
+                                            leave_tui(&mut terminal)?;
+                                            match mount(&org, &id, &lang).await {
+                                                Ok(()) => {
+                                                    if let Some(p) = packages.lock().unwrap().get_mut(pkg_i) {
+                                                        p.mounted = true;
+                                                    }
+                                                    println!("✓ Mounted dev container for {id}");
+                                                }
+                                                Err(e) => eprintln!("✗ Mount failed: {e}"),
+                                            }
+                                            sleep(Duration::from_secs(1)).await;
+                                            enter_tui(&mut terminal)?;
+                                        } else {
+                                            popup = None;
+                                        }
+                                        continue;
+                                    }
+
+                                    PopupAction::Unmount => {
+                                        if let SidebarItem::Package(pkg_i) = sidebar_item {
+                                            let (org, id) = {
+                                                let pkgs = packages.lock().unwrap();
+                                                pkgs.get(pkg_i).map(|p| (
+                                                    p.organization_id.clone(),
+                                                    p.identifier.clone(),
+                                                )).unwrap_or_default()
+                                            };
+                                            popup = None;
+                                            leave_tui(&mut terminal)?;
+                                            match unmount(&org, &id).await {
+                                                Ok(()) => {
+                                                    if let Some(p) = packages.lock().unwrap().get_mut(pkg_i) {
+                                                        p.mounted = false;
+                                                    }
+                                                    println!("✓ Unmounted dev container for {id}");
+                                                }
+                                                Err(e) => eprintln!("✗ Unmount failed: {e}"),
+                                            }
+                                            sleep(Duration::from_secs(1)).await;
+                                            enter_tui(&mut terminal)?;
+                                        } else {
+                                            popup = None;
+                                        }
+                                        continue;
                                     }
                                 }
+                            } else {
                                 popup = None;
                             }
-                            KeyCode::Esc => popup = None,
-                            _ => {}
                         }
-                        continue;
-                    }
-
-                    /* ── Normal keys ────────────────────────────────────── */
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            popup = Some(Popup {
-                                service_name: String::new(),
-                                action:   PopupAction::Quit,
-                                selected: 1,
-                            });
-                        }
-
-                        KeyCode::Left  => focus = Focus::Services,
-                        KeyCode::Right => focus = Focus::Logs,
-
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if focus == Focus::Services {
-                                let len = services.lock().unwrap().len();
-                                if len > 0 {
-                                    let mut idx = selected_idx.lock().unwrap();
-                                    *idx = (*idx + 1).min(len - 1);
-                                    auto_scroll = true;
-                                }
-                            } else {
-                                auto_scroll   = false;
-                                scroll_offset += 1;
-                            }
-                        }
-
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if focus == Focus::Services {
-                                let mut idx = selected_idx.lock().unwrap();
-                                *idx = idx.saturating_sub(1);
-                                auto_scroll = true;
-                            } else {
-                                auto_scroll   = false;
-                                scroll_offset = scroll_offset.saturating_sub(1);
-                            }
-                        }
-
-                        KeyCode::PageDown  => { if focus == Focus::Logs { auto_scroll = true; } }
-                        KeyCode::PageUp    => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                        KeyCode::Char('g') => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                        KeyCode::Char('G') => { if focus == Focus::Logs { auto_scroll = true; } }
-
-                        /* ── Open VS Code remote ────────────────────────── */
-                        KeyCode::Char('c') => {
-                            if has_deployment && is_ejected_now {
-                                if let Some((dep_name, organization_id)) = selected
-                                        .as_ref()
-                                        .and_then(|s| s.deployment_name.as_ref().map(|d| (d, &s.organization_id)))
-                                    {
-                                    let host_alias = format!("{}-local", dep_name);
-                                    let remote_uri = format!(
-                                        "vscode-remote://ssh-remote+{}/workspace/{}-{}",
-                                        host_alias,
-                                        organization_id, // change this to organization id
-                                        dep_name
-                                    );
-
-                                    disable_raw_mode()?;
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        LeaveAlternateScreen,
-                                        DisableMouseCapture,
-                                        Clear(ClearType::All),
-                                        MoveTo(0, 0)
-                                    )?;
-                                    terminal.show_cursor()?;
-                                    io::stdout().flush()?;
-
-                                    println!("Opening VS Code: {}", remote_uri);
-                                    let result = tokio::process::Command::new("code")
-                                        .arg("--folder-uri")
-                                        .arg(&remote_uri)
-                                        .status()
-                                        .await;
-
-                                    match result {
-                                        Ok(s) if s.success() => println!("✓ VS Code launched"),
-                                        Ok(s)  => eprintln!("VS Code exited with status: {}", s),
-                                        Err(e) => eprintln!("Failed to launch VS Code (is `code` in PATH?): {e}"),
-                                    }
-
-                                    sleep(Duration::from_secs(1)).await;
-
-                                    enable_raw_mode()?;
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        EnterAlternateScreen,
-                                        EnableMouseCapture
-                                    )?;
-                                    terminal.hide_cursor()?;
-                                    terminal.clear()?;
-                                }
-                            }
-                        }
-
-                        /* ── Shell into pod ─────────────────────────────── */
-                        KeyCode::Char('s') => {
-                            let (dep, ejected) = {
-                                let svcs = services.lock().unwrap();
-                                let idx  = *selected_idx.lock().unwrap();
-                                svcs.get(idx)
-                                    .filter(|s| {
-                                        s.status != "Not deployed" && s.status != "Unknown"
-                                    })
-                                    .map(|s| (s.deployment_name.clone(), s.ejected))
-                                    .unwrap_or((None, false))
-                            };
-
-                            if dep.is_some() && ejected {
-                                popup = Some(Popup {
-                                    service_name: String::new(),
-                                    action:   PopupAction::ShellBlocked,
-                                    selected: 0,
-                                });
-                            } else if let Some(dep_name) = dep {
-                                disable_raw_mode()?;
-                                execute!(
-                                    terminal.backend_mut(),
-                                    LeaveAlternateScreen,
-                                    DisableMouseCapture,
-                                    Clear(ClearType::All),
-                                    MoveTo(0, 0)
-                                )?;
-                                terminal.show_cursor()?;
-                                io::stdout().flush()?;
-
-                                let _ = shell_into_pod(&dep_name).await;
-
-                                enable_raw_mode()?;
-                                execute!(
-                                    terminal.backend_mut(),
-                                    EnterAlternateScreen,
-                                    EnableMouseCapture
-                                )?;
-                                terminal.hide_cursor()?;
-                                terminal.clear()?;
-                            }
-                        }
-
-                        /* ── Eject / uneject ────────────────────────────── */
-                        KeyCode::Char('e') => {
-                            if has_deployment && has_lang {
-                                let svc_name = selected
-                                    .as_ref()
-                                    .map(|s| s.meta_name.clone())
-                                    .unwrap_or_default();
-                                popup = Some(Popup {
-                                    service_name: svc_name,
-                                    action:   if is_ejected_now {
-                                        PopupAction::Uneject
-                                    } else {
-                                        PopupAction::Eject
-                                    },
-                                    selected: 0,
-                                });
-                            }
-                        }
-
                         _ => {}
                     }
+                    continue;
                 }
 
-                _ => {}
+                /* ── Normal keys ────────────────────────────────────────── */
+                match key.code {
+                    KeyCode::Char('q') => {
+                        popup = Some(Popup { service_name: String::new(), action: PopupAction::Quit, selected: 1 });
+                    }
+
+                    // ── Arrow left: move focus back to sidebar ────────────
+                    KeyCode::Left => { focus = Focus::Sidebar; }
+
+                    // ── Arrow right: move focus to logs pane (service only)
+                    KeyCode::Right => {
+                        if matches!(sidebar_item, SidebarItem::Service(_)) {
+                            focus = Focus::Logs;
+                        }
+                    }
+
+                    // ── Up / k ────────────────────────────────────────────
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = false;
+                            scroll_offset = scroll_offset.saturating_sub(1);
+                        } else {
+                            sidebar_item = sidebar_prev(&sidebar_item, &services_snap, &packages_snap);
+                            if let SidebarItem::Service(i) = sidebar_item {
+                                *svc_log_idx.lock().unwrap() = i;
+                                auto_scroll = true;
+                            }
+                        }
+                    }
+
+                    // ── Down / j ──────────────────────────────────────────
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = false;
+                            scroll_offset += 1;
+                        } else {
+                            sidebar_item = sidebar_next(&sidebar_item, &services_snap, &packages_snap);
+                            if let SidebarItem::Service(i) = sidebar_item {
+                                *svc_log_idx.lock().unwrap() = i;
+                                auto_scroll = true;
+                            }
+                        }
+                    }
+
+                    KeyCode::PageDown => { if focus == Focus::Logs { auto_scroll = true; } }
+                    KeyCode::PageUp   => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
+                    KeyCode::Char('g') => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
+                    KeyCode::Char('G') => { if focus == Focus::Logs { auto_scroll = true; } }
+
+                    // ── m: mount / unmount ────────────────────────────────
+                    KeyCode::Char('m') => {
+                        if let SidebarItem::Package(pkg_i) = sidebar_item {
+                            if let Some(pkg) = packages_snap.get(pkg_i) {
+                                popup = Some(Popup {
+                                    service_name: pkg.identifier.clone(),
+                                    action:       if pkg.mounted { PopupAction::Unmount } else { PopupAction::Mount },
+                                    selected:     0,
+                                });
+                            }
+                        }
+                    }
+
+                    // ── c: VS Code ────────────────────────────────────────
+                    KeyCode::Char('c') => {
+                        match sidebar_item {
+                            SidebarItem::Package(pkg_i) => {
+                                if let Some(pkg) = packages_snap.get(pkg_i) {
+                                    if pkg.mounted {
+                                        let alias = format!("{}-{}-local", pkg.organization_id, pkg.identifier);
+                                        let uri   = format!("vscode-remote://ssh-remote+{}/workspace/{}-{}",
+                                            alias, pkg.organization_id, pkg.identifier);
+                                        open_vscode(&mut terminal, &uri).await?;
+                                    }
+                                }
+                            }
+                            SidebarItem::Service(svc_i) => {
+                                if is_ejected_now {
+                                    if let Some(svc) = services_snap.get(svc_i) {
+                                        if let Some(ref dep) = svc.deployment_name {
+                                            let uri = format!(
+                                                "vscode-remote://ssh-remote+{}-local/workspace/{}-{}",
+                                                dep, svc.organization_id, dep
+                                            );
+                                            open_vscode(&mut terminal, &uri).await?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── s: shell into pod ─────────────────────────────────
+                    KeyCode::Char('s') => {
+                        if let SidebarItem::Service(svc_i) = sidebar_item {
+                            if let Some(svc) = services_snap.get(svc_i) {
+                                if svc.status != "Not deployed" && svc.status != "Unknown" {
+                                    if svc.ejected {
+                                        popup = Some(Popup {
+                                            service_name: String::new(),
+                                            action:       PopupAction::ShellBlocked,
+                                            selected:     0,
+                                        });
+                                    } else if let Some(ref dep) = svc.deployment_name {
+                                        let dep = dep.clone();
+                                        leave_tui(&mut terminal)?;
+                                        let _ = shell_into_pod(&dep).await;
+                                        enter_tui(&mut terminal)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── e: eject / uneject ────────────────────────────────
+                    KeyCode::Char('e') => {
+                        if has_deployment && has_lang {
+                            if let SidebarItem::Service(svc_i) = sidebar_item {
+                                if let Some(svc) = services_snap.get(svc_i) {
+                                    popup = Some(Popup {
+                                        service_name: svc.meta_name.clone(),
+                                        action:       if svc.ejected { PopupAction::Uneject } else { PopupAction::Eject },
+                                        selected:     0,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
             }
+
+            _ => {}
         }
     }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
+    Ok(())
+}
+
+/* ================================================================
+   SIDEBAR NAVIGATION HELPERS
+   ================================================================ */
+
+/// Total items in the sidebar (services + packages).
+fn sidebar_total(services: &[K8sService], packages: &[Package]) -> usize {
+    services.len() + packages.len()
+}
+
+/// Convert a sidebar_item to its flat index (services first, packages after).
+fn sidebar_flat(item: &SidebarItem, svc_count: usize) -> usize {
+    match item {
+        SidebarItem::Service(i) => *i,
+        SidebarItem::Package(i) => svc_count + i,
+    }
+}
+
+/// Convert a flat index back to a SidebarItem.
+fn sidebar_from_flat(flat: usize, svc_count: usize) -> SidebarItem {
+    if flat < svc_count {
+        SidebarItem::Service(flat)
+    } else {
+        SidebarItem::Package(flat - svc_count)
+    }
+}
+
+fn sidebar_next(
+    current:  &SidebarItem,
+    services: &[K8sService],
+    packages: &[Package],
+) -> SidebarItem {
+    let total = sidebar_total(services, packages);
+    if total == 0 { return current.clone(); }
+    let flat  = sidebar_flat(current, services.len());
+    let next  = (flat + 1).min(total - 1);
+    sidebar_from_flat(next, services.len())
+}
+
+fn sidebar_prev(
+    current:  &SidebarItem,
+    services: &[K8sService],
+    packages: &[Package],
+) -> SidebarItem {
+    if sidebar_total(services, packages) == 0 { return current.clone(); }
+    let flat = sidebar_flat(current, services.len());
+    sidebar_from_flat(flat.saturating_sub(1), services.len())
+}
+
+/* ================================================================
+   TUI SUSPEND / RESUME
+   ================================================================ */
+
+fn leave_tui<B: ratatui::backend::Backend + io::Write>(
+    terminal: &mut Terminal<B>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture,
+        Clear(ClearType::All), MoveTo(0, 0))?;
+    terminal.show_cursor()?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn enter_tui<B: ratatui::backend::Backend + io::Write>(
+    terminal: &mut Terminal<B>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(())
+}
+
+async fn open_vscode<B: ratatui::backend::Backend + io::Write>(
+    terminal:   &mut Terminal<B>,
+    remote_uri: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    leave_tui(terminal)?;
+    println!("Opening VS Code: {}", remote_uri);
+    match tokio::process::Command::new("code")
+        .arg("--folder-uri").arg(remote_uri).status().await
+    {
+        Ok(s) if s.success() => println!("✓ VS Code launched"),
+        Ok(s)  => eprintln!("VS Code exited: {s}"),
+        Err(e) => eprintln!("Failed to launch VS Code: {e}"),
+    }
+    sleep(Duration::from_secs(1)).await;
+    enter_tui(terminal)?;
     Ok(())
 }
