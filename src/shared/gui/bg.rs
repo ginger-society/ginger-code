@@ -49,7 +49,11 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
 
             // ── Packages (non-fatal) ─────────────────────────────────────
             match fetch_packages(&config, "ginger-society", "stage").await {
-                Ok(packages) => {
+                Ok(mut packages) => {
+                    for pkg in &mut packages {
+                        let slug = crate::shared::core::image::pkg_to_slug(&pkg.identifier);
+                        pkg.mounted = crate::shared::core::k8_info::is_mounted(&slug).await;
+                    }
                     let _ = tx.send(BgMsg::Packages(packages));
                     ctx.request_repaint();
                 }

@@ -1,6 +1,20 @@
 use std::collections::HashMap;
 
 
+pub async fn is_mounted(deployment_slug: &str) -> bool {
+    let out = tokio::process::Command::new("kubectl")
+        .args([
+            "get",
+            "deployment",
+            deployment_slug,
+            "-o",
+            "jsonpath={.metadata.annotations.ginger-mounted}",
+        ])
+        .output()
+        .await;
+    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
 /// "@ginger-society/dev-portal"  → "dev-portal"
 /// "@ginger-society/IAMService"  → "iamservice"
 pub fn meta_to_deployment_name(meta_name: &str) -> String {

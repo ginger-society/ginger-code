@@ -180,6 +180,16 @@ fn draw_package_row(
         egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
     );
 
+    if pkg.mounted {
+        let tag_x = row_rect.min.x + 24.0 + short_name.len() as f32 * 7.2 + 6.0;
+        painter.text(
+            egui::pos2(tag_x, row_rect.min.y + 8.0),
+            egui::Align2::LEFT_TOP, "[MOUNTED]",
+            egui::FontId::new(10.0, egui::FontFamily::Monospace),
+            egui::Color32::from_rgb(39, 201, 63),
+        );
+    }
+
     // Type · lang
     let sub = format!("{}  ·  {}", pkg.package_type, pkg.lang);
     painter.text(

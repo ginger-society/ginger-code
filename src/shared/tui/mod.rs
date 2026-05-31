@@ -52,7 +52,13 @@ pub async fn fetch_metadata_and_process(
     // ── Packages (non-fatal) ──────────────────────────────────────────────────
     let packages: Vec<Package> =
         match data_source::fetch_packages(metadata_config, "ginger-society", "stage").await {
-            Ok(pkgs) => pkgs,
+            Ok(mut pkgs) => {
+                for pkg in &mut pkgs {
+                    let slug = crate::shared::core::image::pkg_to_slug(&pkg.identifier);
+                    pkg.mounted = crate::shared::core::k8_info::is_mounted(&slug).await;
+                }
+                pkgs
+            }
             Err(e) => {
                 eprintln!("Warning: package fetch failed: {e:?}");
                 vec![]

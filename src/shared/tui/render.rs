@@ -323,6 +323,11 @@ fn draw_sidebar(
             Line::from(vec![
                 Span::styled(if pkg.mounted { "● " } else { "○ " }, dot_style),
                 Span::styled(short.to_string(), base),
+                if pkg.mounted {
+                    Span::styled(" [MOUNTED]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw("")
+                },
             ]),
             Line::from(vec![
                 Span::raw("  "),
