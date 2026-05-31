@@ -1,10 +1,9 @@
-
-
 /// What the unified sidebar cursor is pointing at.
 #[derive(PartialEq, Clone, Debug)]
 pub enum SidebarItem {
     Service(usize),
     Package(usize),
+    DbSchema(usize),
 }
 
 /// Which panel has keyboard focus — sidebar or the right-hand logs/detail pane.
