@@ -77,13 +77,6 @@ pub fn click_sidebar_item(
     let row_in_list = (row - y0) as usize;
     let raw_row     = scroll_offset * 2 + row_in_list;
 
-    // Layout (each item/header = 2 rows):
-    //   [0 .. svc_count*2)            → services
-    //   [svc_count*2 .. +2)           → "Packages" header  (only if pkg_count > 0)
-    //   [+2 .. +2+pkg_count*2)        → packages
-    //   [+2+pkg_count*2 .. +4)        → "DB Schemas" header (only if db_count > 0)
-    //   [+4 .. +4+db_count*2)         → db schemas
-
     let svc_end = svc_count * 2;
 
     if raw_row < svc_end {
@@ -97,7 +90,7 @@ pub fn click_sidebar_item(
         let pkg_end          = pkg_header_end + pkg_count * 2;
 
         if raw_row < pkg_header_end {
-            return None; // clicked the "Packages" header
+            return None;
         }
         if raw_row < pkg_end {
             let idx = (raw_row - pkg_header_end) / 2;
@@ -110,7 +103,7 @@ pub fn click_sidebar_item(
             let db_end          = db_header_end + db_count * 2;
 
             if raw_row < db_header_end {
-                return None; // clicked the "DB Schemas" header
+                return None;
             }
             if raw_row < db_end {
                 let idx = (raw_row - db_header_end) / 2;
@@ -118,7 +111,6 @@ pub fn click_sidebar_item(
             }
         }
     } else if db_count > 0 {
-        // No packages, so DB header comes right after services
         let db_header_start = svc_end;
         let db_header_end   = db_header_start + 2;
         let db_end          = db_header_end + db_count * 2;
@@ -196,7 +188,7 @@ pub fn draw(
     db_schemas:     &[DbSchema],
     sidebar_item:   &SidebarItem,
     logs:           &HashMap<String, Vec<String>>,
-    db_logs:        Option<&[String]>,   // None=loading, Some([])=not found, Some([..])=live
+    db_logs:        Option<&[String]>,
     focus:          &Focus,
     auto_scroll:    bool,
     scroll_offset:  usize,
@@ -286,37 +278,88 @@ fn draw_sidebar(
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
+    // ── Full-width highlight helpers ──────────────────────────────────────────
+    //
+    // Ratatui's List widget only paints the highlight background behind the
+    // text content of each Span — it does not extend to the right edge of the
+    // list area.  The fix is to append a trailing "fill" Span to every Line of
+    // a selected/current item that carries the same background colour.  The
+    // Span text is a run of spaces wider than the inner area (ratatui clips it),
+    // so the background floods all the way to the right border.
+
+    let row_bg = |is_sel: bool, is_cur: bool| -> Style {
+        if is_sel      { Style::default().bg(Color::Yellow) }
+        else if is_cur { Style::default().bg(Color::DarkGray) }
+        else           { Style::default() }
+    };
+
+    // A trailing span that bleeds colour to the right edge.
+    let fill = |is_sel: bool, is_cur: bool| -> Span<'static> {
+        // inner.width characters is always enough; ratatui clips the rest.
+        Span::styled(
+            " ".repeat(inner.width as usize),
+            row_bg(is_sel, is_cur),
+        )
+    };
+
     let mut items: Vec<ListItem> = Vec::new();
 
     // ── Service items ─────────────────────────────────────────────────────────
     for (i, svc) in services.iter().enumerate() {
         let is_sel = *sidebar_item == SidebarItem::Service(i) && sidebar_focus;
         let is_cur = *sidebar_item == SidebarItem::Service(i);
-        let base   = if is_sel {
+
+        let name_style = if is_sel {
             Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
         } else if is_cur {
             Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
-        let icon_s = Style::default().fg(status_color(&svc.status));
-        let eject  = if svc.ejected {
-            Span::styled(" [EJECTED]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+
+        // Status icon: always carry the row background so it doesn't "punch
+        // through" to the terminal default when the row is highlighted.
+        let icon_style = if is_sel {
+            Style::default().bg(Color::Yellow).fg(status_color(&svc.status))
+        } else if is_cur {
+            Style::default().bg(Color::DarkGray).fg(status_color(&svc.status))
+        } else {
+            Style::default().fg(status_color(&svc.status))
+        };
+
+        let eject_style = if is_sel {
+            Style::default().bg(Color::Yellow).fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        };
+
+        let eject = if svc.ejected {
+            Span::styled(" [EJECTED]", eject_style)
         } else {
             Span::raw("")
         };
+
+        let sub_style = if is_sel {
+            Style::default().bg(Color::Yellow).fg(Color::DarkGray)
+        } else if is_cur {
+            Style::default().bg(Color::DarkGray).fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
         items.push(ListItem::new(vec![
             Line::from(vec![
-                Span::styled(format!("{} ", status_icon(&svc.status)), icon_s),
-                Span::styled(svc.meta_name.clone(), base),
+                Span::styled(format!("{} ", status_icon(&svc.status)), icon_style),
+                Span::styled(svc.meta_name.clone(), name_style),
                 eject,
+                fill(is_sel, is_cur),
             ]),
             Line::from(vec![
-                Span::raw("  "),
                 Span::styled(
-                    format!("ready: {}  {}", svc.ready, svc.status),
-                    Style::default().fg(Color::DarkGray),
+                    format!("  ready: {}  {}", svc.ready, svc.status),
+                    sub_style,
                 ),
+                fill(is_sel, is_cur),
             ]),
         ]));
     }
@@ -334,41 +377,66 @@ fn draw_sidebar(
         for (i, pkg) in packages.iter().enumerate() {
             let is_sel = *sidebar_item == SidebarItem::Package(i) && sidebar_focus;
             let is_cur = *sidebar_item == SidebarItem::Package(i);
-            let base   = if is_sel {
+
+            let name_style = if is_sel {
                 Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
             } else if is_cur {
                 Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let dot_style = if pkg.mounted {
+
+            let dot_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
+            } else if is_cur {
+                Style::default().bg(Color::DarkGray).fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
+            } else if pkg.mounted {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
+
             let type_color = match pkg.package_type.as_str() {
                 "lib" | "library"    => Color::Cyan,
                 "bin" | "executable" => Color::Magenta,
                 _                    => Color::DarkGray,
             };
-            let short   = pkg.identifier.split('/').last().unwrap_or(&pkg.identifier);
+
+            let sub_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(type_color)
+            } else if is_cur {
+                Style::default().bg(Color::DarkGray).fg(type_color)
+            } else {
+                Style::default().fg(type_color)
+            };
+
+            let short = pkg.identifier.split('/').last().unwrap_or(&pkg.identifier);
+
+            let mounted_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+
             let mounted = if pkg.mounted {
-                Span::styled(" [MOUNTED]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                Span::styled(" [MOUNTED]", mounted_style)
             } else {
                 Span::raw("")
             };
+
             items.push(ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(if pkg.mounted { "● " } else { "○ " }, dot_style),
-                    Span::styled(short.to_string(), base),
+                    Span::styled(short.to_string(), name_style),
                     mounted,
+                    fill(is_sel, is_cur),
                 ]),
                 Line::from(vec![
-                    Span::raw("  "),
                     Span::styled(
-                        format!("{}  ·  {}", pkg.package_type, pkg.lang),
-                        Style::default().fg(type_color),
+                        format!("  {}  ·  {}", pkg.package_type, pkg.lang),
+                        sub_style,
                     ),
+                    fill(is_sel, is_cur),
                 ]),
             ]));
         }
@@ -387,33 +455,53 @@ fn draw_sidebar(
         for (i, schema) in db_schemas.iter().enumerate() {
             let is_sel = *sidebar_item == SidebarItem::DbSchema(i) && sidebar_focus;
             let is_cur = *sidebar_item == SidebarItem::DbSchema(i);
-            let base   = if is_sel {
+
+            let name_style = if is_sel {
                 Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
             } else if is_cur {
                 Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
+
+            let icon_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(Color::Cyan)
+            } else if is_cur {
+                Style::default().bg(Color::DarkGray).fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+
             let db_type = schema.db_type.as_deref().unwrap_or("db");
+
+            let sub_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(Color::DarkGray)
+            } else if is_cur {
+                Style::default().bg(Color::DarkGray).fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
             items.push(ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled("⬡ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(schema.name.clone(), base),
+                    Span::styled("⬡ ", icon_style),
+                    Span::styled(schema.name.clone(), name_style),
+                    fill(is_sel, is_cur),
                 ]),
                 Line::from(vec![
-                    Span::raw("  "),
                     Span::styled(
-                        format!("{}  ·  {} tables", db_type, schema.tables.len()),
-                        Style::default().fg(Color::DarkGray),
+                        format!("  {}  ·  {} tables", db_type, schema.tables.len()),
+                        sub_style,
                     ),
+                    fill(is_sel, is_cur),
                 ]),
             ]));
         }
     }
 
     // ── Compute selected flat index ───────────────────────────────────────────
-    let pkg_header  = if packages.is_empty()   { 0 } else { 1 };
-    let db_header   = if db_schemas.is_empty()  { 0 } else { 1 };
+    let pkg_header = if packages.is_empty()  { 0 } else { 1 };
+    let db_header  = if db_schemas.is_empty() { 0 } else { 1 };
 
     let selected_flat = match sidebar_item {
         SidebarItem::Service(i)  => *i,
@@ -426,8 +514,51 @@ fn draw_sidebar(
     let mut state = ListState::default();
     state.select(Some(selected_flat));
 
+    // Use a no-op highlight_style — all highlighting is painted via fill spans
+    // above, so we don't want the List widget to apply its own background on
+    // top (which would only cover the text-content portion of each row).
+    //
+    // Shrink the list area by 1 column on the right to leave room for the
+    // scrollbar — otherwise it renders on top of the list content.
+    let list_area = Rect {
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
     let list = List::new(items).highlight_style(Style::default());
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    // ── Sidebar scrollbar ─────────────────────────────────────────────────────
+    //
+    // Total flat item count (headers count as 1 slot each, items as 1 slot).
+    let pkg_header_slots = if packages.is_empty()   { 0usize } else { 1 };
+    let db_header_slots  = if db_schemas.is_empty()  { 0usize } else { 1 };
+    let total_slots      = services.len()
+        + pkg_header_slots + packages.len()
+        + db_header_slots  + db_schemas.len();
+
+    // Each slot is 2 terminal rows tall; the inner area gives us this many
+    // visible slots (integer division intentional — partial slots don't count).
+    let visible_slots = (inner.height as usize / 2).max(1);
+    let max_scroll    = total_slots.saturating_sub(visible_slots);
+    let scroll_pos    = state.offset();
+
+    if max_scroll > 0 {
+        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll_pos);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█"),
+            Rect {
+                x:      inner.x + inner.width.saturating_sub(1),
+                y:      inner.y,
+                width:  1,
+                height: inner.height,
+            },
+            &mut sb_state,
+        );
+    }
 
     state.offset()
 }
@@ -685,7 +816,6 @@ fn draw_db_schema_detail(
         return;
     };
 
-    // Split: info strip (top, fixed) + logs (bottom, remainder)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(7), Constraint::Min(0)])
@@ -757,7 +887,6 @@ fn draw_db_schema_detail(
 
     // ── Logs pane ─────────────────────────────────────────────────────────────
     match db_logs {
-        // Still waiting for first poll result
         None => {
             f.render_widget(
                 Paragraph::new(vec![
@@ -777,7 +906,6 @@ fn draw_db_schema_detail(
             );
         }
 
-        // Poller ran but found no matching deployment
         Some([]) => {
             f.render_widget(
                 Paragraph::new(vec![
@@ -802,14 +930,12 @@ fn draw_db_schema_detail(
             );
         }
 
-        // Live log lines
         Some(lines) => {
-            let log_text  = lines.join("\n");
-            let num_lines = log_text.lines().count();
-            let height    = chunks[1].height.saturating_sub(2) as usize;
+            let log_text   = lines.join("\n");
+            let num_lines  = log_text.lines().count();
+            let height     = chunks[1].height.saturating_sub(2) as usize;
             let max_scroll = num_lines.saturating_sub(height);
-            // Always follow (auto-scroll) for DB schema logs
-            let offset = max_scroll;
+            let offset     = max_scroll;
 
             let inner_area = Rect { width: chunks[1].width.saturating_sub(1), ..chunks[1] };
 

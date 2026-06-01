@@ -413,7 +413,7 @@ async fn run_tui(
                 }
 
                 match key.code {
-                    KeyCode::Char('q') => {
+                    KeyCode::Char('q') | KeyCode::Esc => {
                         popup = Some(Popup { service_name: String::new(), action: PopupAction::Quit, selected: 1 });
                     }
 
