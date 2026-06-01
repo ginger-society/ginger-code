@@ -930,6 +930,11 @@ fn main() {
         return;
     }
 
+    println!("{:?}" , args);
+
+    let daemon_mode = args.contains(&"--daemon".to_string());
+
+
     #[cfg(target_os = "macos")]
     {
         let current = std::env::var("PATH").unwrap_or_default();
@@ -1024,14 +1029,31 @@ fn main() {
         }
     });
 
+
+    println!("{:?}" , daemon_mode);
+
     // ── Tray — owns the main thread ───────────────────────────────────────────
-    tray::run_tray(
-        Arc::clone(&state_map),
-        Arc::clone(&shutdown),
-        Arc::clone(&offline),
-        sock_path.clone(),
-        cfg_path.clone(),
-    );
+    if daemon_mode {
+        // No tray — block the main thread until SIGTERM / SIGINT.
+        println!("[ginger-code] running in daemon mode (no tray)");
+        let running = Arc::new(AtomicBool::new(true));
+        let r = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Relaxed);
+        })
+        .expect("set signal handler");
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        tray::run_tray(
+            Arc::clone(&state_map),
+            Arc::clone(&shutdown),
+            Arc::clone(&offline),
+            sock_path.clone(),
+            cfg_path.clone(),
+        );
+    }
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     println!("[ginger-code] shutting down...");

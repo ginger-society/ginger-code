@@ -38,6 +38,7 @@ portable-pty  = "0.8"
 vte           = "0.13"
 parking_lot   = "0.12"
 image = { version = "0.24", default-features = false, features = ["png"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 
 [package.metadata]
