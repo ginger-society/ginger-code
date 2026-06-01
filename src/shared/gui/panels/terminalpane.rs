@@ -5,6 +5,23 @@ use super::super::colors::{COLOR_BG, COLOR_CURSOR, COLOR_YELLOW};
 use super::super::terminal::{key_to_char, Cell};
 use super::super::types::{AppState, TermState};
 
+// ── Rewrite a command line to fix known interactive-mode issues ───────────────
+fn fixup_command(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = if let Some(r) = trimmed.strip_prefix("python3") {
+        r.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit())
+    } else if let Some(r) = trimmed.strip_prefix("python") {
+        r
+    } else {
+        return None;
+    };
+    if rest.trim().is_empty() {
+        Some(format!("{} -i", trimmed))
+    } else {
+        None
+    }
+}
+
 pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usize) {
     let font_size = state.font_size;
     let cell_w    = state.cell_w;
@@ -44,8 +61,24 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
         tab.term_cols = new_cols.max(1);
         tab.term_rows = new_rows.max(1);
         tab.performer.lock().resize(tab.term_rows, tab.term_cols);
-        if let TermState::Connected(ref session) = tab.state {
+        if let TermState::Connected(ref mut session) = tab.state {
+            // 1. Resize the local PTY master — sends SIGWINCH to kubectl.
             session.resize(tab.term_rows as u16, tab.term_cols as u16);
+            // 2. Send in-band resize to the shell inside the pod.
+            //    Because we now launch via `script`, the pod has a real PTY,
+            //    so stty / TIOCSWINSZ works and delivers SIGWINCH to the
+            //    foreground process (nano, htop, vim).
+            //    \x15 (Ctrl+U) clears any partial command the user was typing
+            //    so the stty lands cleanly on an empty prompt line; \x0d
+            //    submits it. The export keeps $COLUMNS/$LINES in sync for
+            //    shells and scripts that read env vars instead of the tty.
+            let resize_cmd = format!(
+                "\x15stty rows {rows} cols {cols} 2>/dev/null; \
+                 export COLUMNS={cols} LINES={rows}\x0d",
+                cols = tab.term_cols,
+                rows = tab.term_rows,
+            );
+            let _ = session.writer.lock().write_all(resize_cmd.as_bytes());
         }
     }
 
@@ -176,35 +209,70 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
     drop(painter);
 
     // ── Keyboard input ────────────────────────────────────────────────────────
+    //
+    // IMPORTANT: We collect ALL bytes to send here, then flush them after the
+    // input closure. We never `return` early inside the closure — doing so
+    // would skip remaining events in the same frame.
+    //
+    // Ctrl-key handling strategy:
+    //   egui fires Event::Key  with modifiers.ctrl = true
+    //   egui may also fire Event::Text with the plain character (e.g. "x" for
+    //   Ctrl+X). To avoid double-sending we:
+    //     1. Check ctrl_held BEFORE the input closure (can't nest input borrows).
+    //     2. Skip ANY Event::Text when Ctrl is held — those chars are handled
+    //        exclusively by the Key branch below.
+    //     3. Also skip Event::Text that contains raw control bytes (codepoint
+    //        < 0x20 or == 0x7f) for the same reason.
+
+    // Snapshot modifier state before entering the input closure so we can
+    // reference it inside Event::Text without a nested borrow of ui.input.
+    let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+
     let mut to_send: Vec<Vec<u8>> = Vec::new();
+    let mut scroll_cmd: Option<i32> = None; // +N = scroll up N rows, -N = down
 
     if response.hovered() {
         ui.ctx().input(|i| {
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
+                        // Drop raw control characters — handled by Key branch.
+                        if text.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
+                            continue;
+                        }
+                        // Drop ALL text events when Ctrl is held. On most
+                        // platforms egui fires both Event::Key (with
+                        // modifiers.ctrl) AND Event::Text with the bare letter
+                        // (e.g. Ctrl+X → Key{X, ctrl} + Text("x")). Sending
+                        // the Text here would type a literal "x" in addition
+                        // to the ^X control byte sent by the Key branch.
+                        if ctrl_held {
+                            continue;
+                        }
                         tab.scroll_offset = 0;
                         tab.sel_start     = None;
                         tab.sel_end       = None;
                         to_send.push(text.as_bytes().to_vec());
                     }
+
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        // ── Scrollback navigation (no bytes sent to pty) ──────
                         match key {
-                            egui::Key::PageUp => {
-                                tab.scroll_offset = (tab.scroll_offset + term_rows).min(max_offset);
-                                return;
+                            egui::Key::PageUp if !modifiers.ctrl => {
+                                scroll_cmd = Some(term_rows as i32);
+                                continue;
                             }
-                            egui::Key::PageDown => {
-                                tab.scroll_offset = tab.scroll_offset.saturating_sub(term_rows);
-                                return;
+                            egui::Key::PageDown if !modifiers.ctrl => {
+                                scroll_cmd = Some(-(term_rows as i32));
+                                continue;
                             }
                             egui::Key::End if modifiers.shift => {
-                                tab.scroll_offset = 0;
-                                return;
+                                scroll_cmd = Some(i32::MIN); // jump to bottom
+                                continue;
                             }
                             egui::Key::Home if modifiers.shift => {
-                                tab.scroll_offset = max_offset;
-                                return;
+                                scroll_cmd = Some(i32::MAX); // jump to top
+                                continue;
                             }
                             _ => {}
                         }
@@ -213,6 +281,20 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
                         tab.sel_end       = None;
                         tab.scroll_offset = 0;
 
+                        // ── Ctrl+letter → control byte (^A..^Z) ──────────────
+                        if modifiers.ctrl {
+                            if let Some(ch) = key_to_char(*key) {
+                                if ch >= 'a' && ch <= 'z' {
+                                    to_send.push(vec![(ch as u8) & 0x1f]);
+                                    continue;
+                                }
+                            }
+                            // Ctrl+[ = Escape, Ctrl+\ = FS, Ctrl+] = GS, etc.
+                            // Fall through to normal key handling for anything
+                            // we don't recognise as a letter.
+                        }
+
+                        // ── Special keys → escape sequences ───────────────────
                         let bytes: Option<&[u8]> = match key {
                             egui::Key::Enter      => Some(b"\r"),
                             egui::Key::Backspace  => Some(b"\x7f"),
@@ -224,35 +306,74 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
                             egui::Key::ArrowLeft  => Some(b"\x1b[D"),
                             egui::Key::Home       => Some(b"\x1b[H"),
                             egui::Key::End        => Some(b"\x1b[F"),
-                            egui::Key::PageUp     => Some(b"\x1b[5~"),
-                            egui::Key::PageDown   => Some(b"\x1b[6~"),
                             egui::Key::Delete     => Some(b"\x1b[3~"),
+                            egui::Key::Insert     => Some(b"\x1b[2~"),
                             egui::Key::F1         => Some(b"\x1bOP"),
                             egui::Key::F2         => Some(b"\x1bOQ"),
                             egui::Key::F3         => Some(b"\x1bOR"),
                             egui::Key::F4         => Some(b"\x1bOS"),
-                            _ => {
-                                if modifiers.ctrl {
-                                    if let Some(ch) = key_to_char(*key) {
-                                        if ch >= 'a' && ch <= 'z' {
-                                            to_send.push(vec![(ch as u8) - b'a' + 1]);
-                                        }
-                                    }
-                                }
-                                None
-                            }
+                            egui::Key::F5         => Some(b"\x1b[15~"),
+                            egui::Key::F6         => Some(b"\x1b[17~"),
+                            egui::Key::F7         => Some(b"\x1b[18~"),
+                            egui::Key::F8         => Some(b"\x1b[19~"),
+                            egui::Key::F9         => Some(b"\x1b[20~"),
+                            egui::Key::F10        => Some(b"\x1b[21~"),
+                            egui::Key::F11        => Some(b"\x1b[23~"),
+                            egui::Key::F12        => Some(b"\x1b[24~"),
+                            _ => None,
                         };
                         if let Some(b) = bytes { to_send.push(b.to_vec()); }
                     }
+
                     _ => {}
                 }
             }
         });
     }
 
+    // ── Apply scroll commands ─────────────────────────────────────────────────
+    if let Some(delta) = scroll_cmd {
+        if delta == i32::MAX {
+            tab.scroll_offset = max_offset;
+        } else if delta == i32::MIN {
+            tab.scroll_offset = 0;
+        } else if delta > 0 {
+            tab.scroll_offset = (tab.scroll_offset + delta as usize).min(max_offset);
+        } else {
+            tab.scroll_offset = tab.scroll_offset.saturating_sub((-delta) as usize);
+        }
+    }
+
+    // ── Send bytes, intercepting Enter to rewrite commands if needed ──────────
     if let TermState::Connected(ref mut session) = tab.state {
         for bytes in to_send {
-            let _ = session.writer.write_all(&bytes);
+            if bytes == b"\r" {
+                // Peek at the current input line to check for command rewrites.
+                let line: String = {
+                    let p = tab.performer.lock();
+                    p.grid
+                        .get(p.cursor_row)
+                        .map(|row| row.iter().take(p.cursor_col).map(|c| c.ch).collect())
+                        .unwrap_or_default()
+                };
+                let cmd_part = line
+                    .rfind(|c| c == '$' || c == '#' || c == '%')
+                    .map(|i| line[i + 1..].trim())
+                    .unwrap_or(line.trim());
+
+                if let Some(rewritten) = fixup_command(cmd_part) {
+                    let erase_count = cmd_part.len();
+                    let mut payload = Vec::with_capacity(erase_count + rewritten.len() + 1);
+                    for _ in 0..erase_count { payload.push(0x7f); }
+                    payload.extend_from_slice(rewritten.as_bytes());
+                    payload.push(b'\r');
+                    let _ = session.writer.lock().write_all(&payload);
+                    continue;
+                }
+                let _ = session.writer.lock().write_all(b"\r");
+            } else {
+                let _ = session.writer.lock().write_all(&bytes);
+            }
         }
     }
 

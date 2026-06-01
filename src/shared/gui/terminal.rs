@@ -76,21 +76,18 @@ impl TermPerformer {
         for row in &mut self.grid { row.resize(cols, Cell::default()); }
         self.cursor_row    = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col    = self.cursor_col.min(cols.saturating_sub(1));
-        // Reset scroll region on resize — apps will re-send CSI r
         self.scroll_top    = 0;
         self.scroll_bottom = rows - 1;
     }
 
     fn scroll_up(&mut self) {
         if self.scroll_top == 0 && self.scroll_bottom == self.rows - 1 {
-            // Full screen — evict top row to scrollback
             let evicted = self.grid.remove(0);
             if let Some(ref sink) = self.scrollback_sink {
                 sink.lock().push(evicted);
             }
             self.grid.push(vec![Cell::default(); self.cols]);
         } else {
-            // Partial region — shift within region only, no scrollback
             self.grid.remove(self.scroll_top);
             self.grid.insert(self.scroll_bottom, vec![Cell::default(); self.cols]);
             self.grid.truncate(self.rows);
@@ -98,7 +95,6 @@ impl TermPerformer {
     }
 
     fn scroll_down(&mut self) {
-        // Remove bottom line of region, insert blank at top of region
         if self.scroll_bottom < self.grid.len() {
             self.grid.remove(self.scroll_bottom);
         }
@@ -136,8 +132,11 @@ impl TermPerformer {
                     if let Some(&idx) = params.get(i+2) { self.current_fg = ansi256(idx as u8); i += 2; }
                 }
                 38 if params.get(i+1) == Some(&2) => {
-                    if let (Some(&r), Some(&g), Some(&b)) = (params.get(i+2), params.get(i+3), params.get(i+4)) {
-                        self.current_fg = egui::Color32::from_rgb(r as u8, g as u8, b as u8); i += 4;
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (params.get(i+2), params.get(i+3), params.get(i+4))
+                    {
+                        self.current_fg = egui::Color32::from_rgb(r as u8, g as u8, b as u8);
+                        i += 4;
                     }
                 }
                 39 => self.current_fg = COLOR_FG,
@@ -146,8 +145,11 @@ impl TermPerformer {
                     if let Some(&idx) = params.get(i+2) { self.current_bg = ansi256(idx as u8); i += 2; }
                 }
                 48 if params.get(i+1) == Some(&2) => {
-                    if let (Some(&r), Some(&g), Some(&b)) = (params.get(i+2), params.get(i+3), params.get(i+4)) {
-                        self.current_bg = egui::Color32::from_rgb(r as u8, g as u8, b as u8); i += 4;
+                    if let (Some(&r), Some(&g), Some(&b)) =
+                        (params.get(i+2), params.get(i+3), params.get(i+4))
+                    {
+                        self.current_bg = egui::Color32::from_rgb(r as u8, g as u8, b as u8);
+                        i += 4;
                     }
                 }
                 49        => self.current_bg = COLOR_BG,
@@ -168,7 +170,6 @@ impl vte::Perform for TermPerformer {
             b'\r' => self.cursor_col = 0,
             b'\n' => {
                 if self.cursor_row == self.scroll_bottom {
-                    // At bottom of scroll region — scroll up within region
                     self.scroll_up();
                 } else {
                     self.cursor_row = (self.cursor_row + 1).min(self.rows - 1);
@@ -185,7 +186,6 @@ impl vte::Perform for TermPerformer {
             .map(|sub| sub.first().copied().unwrap_or(0) as i64)
             .collect();
         match action {
-            // ── Cursor movement ───────────────────────────────────────────────
             'A' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 self.cursor_row = self.cursor_row.saturating_sub(n);
@@ -216,8 +216,6 @@ impl vte::Perform for TermPerformer {
                 let row = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
                 self.cursor_row = row.min(self.rows - 1);
             }
-
-            // ── Erase ─────────────────────────────────────────────────────────
             'J' => match p.first().copied().unwrap_or(0) {
                 0 => {
                     for col in self.cursor_col..self.cols {
@@ -258,7 +256,6 @@ impl vte::Perform for TermPerformer {
                 }
                 _ => {}
             },
-            // Erase P characters in place (no shift)
             'X' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 let row = &mut self.grid[self.cursor_row];
@@ -266,26 +263,17 @@ impl vte::Perform for TermPerformer {
                     row[col] = Cell::default();
                 }
             }
-
-            // ── SGR ───────────────────────────────────────────────────────────
             'm' => self.apply_sgr(&p),
-
-            // ── Cursor save/restore ───────────────────────────────────────────
             's' => { self.saved_row = self.cursor_row; self.saved_col = self.cursor_col; }
             'u' => { self.cursor_row = self.saved_row; self.cursor_col = self.saved_col; }
-
-            // ── Scroll region (DECSTBM) — the key fix for nano/vim/htop ───────
             'r' => {
                 let top    = (p.first().copied().unwrap_or(1).max(1) - 1) as usize;
                 let bottom = (p.get(1).copied().unwrap_or(self.rows as i64).max(1) - 1) as usize;
                 self.scroll_top    = top.min(self.rows - 1);
                 self.scroll_bottom = bottom.min(self.rows - 1);
-                // DECSTBM homes the cursor to (0,0)
                 self.cursor_row = 0;
                 self.cursor_col = 0;
             }
-
-            // ── Region scroll ─────────────────────────────────────────────────
             'S' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n { self.scroll_up(); }
@@ -294,8 +282,6 @@ impl vte::Perform for TermPerformer {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n { self.scroll_down(); }
             }
-
-            // ── Line insert/delete ────────────────────────────────────────────
             'L' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 for _ in 0..n {
@@ -312,8 +298,6 @@ impl vte::Perform for TermPerformer {
                     self.grid.push(vec![Cell::default(); self.cols]);
                 }
             }
-
-            // ── Character insert/delete ───────────────────────────────────────
             '@' => {
                 let n = p.first().copied().unwrap_or(1).max(1) as usize;
                 let row = &mut self.grid[self.cursor_row];
@@ -334,19 +318,8 @@ impl vte::Perform for TermPerformer {
                     }
                 }
             }
-
-            // ── Repeat last char (REP) ────────────────────────────────────────
-            'b' => {
-                // Some apps use this; safe to ignore for now
-            }
-
-            // ── Private mode sets (cursor hide/show, alt screen, etc.) ────────
-            'h' | 'l' => {
-                // e.g. ?25h = show cursor, ?1049h = alt screen
-                // We don't maintain alt screen but silently ignore to avoid
-                // corrupting the match
-            }
-
+            'b' => {}
+            'h' | 'l' => {}
             _ => {}
         }
     }
@@ -361,7 +334,6 @@ impl vte::Perform for TermPerformer {
             b'7' => { self.saved_row = self.cursor_row; self.saved_col = self.cursor_col; }
             b'8' => { self.cursor_row = self.saved_row; self.cursor_col = self.saved_col; }
             b'M' => {
-                // Reverse index — scroll down if at top of scroll region
                 if self.cursor_row == self.scroll_top {
                     self.scroll_down();
                 } else {
@@ -373,14 +345,17 @@ impl vte::Perform for TermPerformer {
     }
 }
 
-// ── SSH session ───────────────────────────────────────────────────────────────
+// ── SSH / kubectl session ─────────────────────────────────────────────────────
 
 pub struct SshSession {
-    pub writer:   Box<dyn Write + Send>,
+    pub writer:   Arc<Mutex<Box<dyn Write + Send>>>,
     _pty_pair:    portable_pty::PtyPair,
 }
 
 impl SshSession {
+    /// Notify the local PTY master of a size change (sends SIGWINCH to the
+    /// local kubectl process). Also returns the new dimensions so the caller
+    /// can send an in-band resize notification to the shell inside the pod.
     pub fn resize(&self, rows: u16, cols: u16) {
         let _ = self._pty_pair.master.resize(PtySize {
             rows,
@@ -399,11 +374,13 @@ pub fn spawn_kubectl(
     ctx:       egui::Context,
 ) -> Result<SshSession, Box<dyn std::error::Error>> {
 
-    // ── List all pods and find first Running one matching the deployment prefix
+    // ── Find the first running pod matching the deployment prefix ─────────────
     let pod_output = std::process::Command::new("kubectl")
-        .args(["get", "pods",
-               "--field-selector=status.phase=Running",
-               "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"])
+        .args([
+            "get", "pods",
+            "--field-selector=status.phase=Running",
+            "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}",
+        ])
         .output()?;
 
     let stdout = String::from_utf8(pod_output.stdout)?;
@@ -415,22 +392,63 @@ pub fn spawn_kubectl(
         .ok_or_else(|| format!("No running pod found with prefix '{}'", prefix))?
         .to_string();
 
+    // ── Open a local PTY ──────────────────────────────────────────────────────
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+    let pair = pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width:  0,
+        pixel_height: 0,
+    })?;
+
+    // ── Build the kubectl exec command ────────────────────────────────────────
+    //
+    // Core problem: `kubectl exec -i` connects stdin/stdout as plain pipes.
+    // Inside the pod there is no real TTY, so:
+    //   • stty fails silently (ENOTTY — can't ioctl a pipe)
+    //   • the kernel keeps stdin in canonical/line-buffered mode
+    //   • nano/htop/vim receive keypresses only after Enter
+    //
+    // Fix: use `script -q -c '...' /dev/null` as a PTY wrapper.
+    // `script` allocates a real pseudo-TTY inside the pod and execs the
+    // shell inside it.  Everything that follows now has a real tty:
+    //   • stty / TIOCSWINSZ work correctly
+    //   • the kernel switches to raw mode for interactive apps
+    //   • SIGWINCH is delivered on resize
+    //
+    // We inline the size + env setup into the -c command so the very first
+    // prompt already knows the correct dimensions — no deferred init needed.
+    let shell_cmd = format!(
+        "export COLUMNS={cols} LINES={rows} TERM=xterm-256color PYTHONDONTWRITEBYTECODE=1; \
+         stty rows {rows} cols {cols}; \
+         exec /bin/sh -i",
+        cols = cols,
+        rows = rows,
+    );
 
     let mut cmd = CommandBuilder::new("kubectl");
-        cmd.arg("exec");
-        cmd.arg("-i");          // stdin only — PTY provides the TTY
-        cmd.arg(&pod_name);
-        cmd.arg("-c");
-        cmd.arg(&prefix);       // explicitly name the container, skip the init container
-        cmd.arg("--");
-        cmd.arg("/bin/sh");
+    cmd.arg("exec");
+    cmd.arg("-i");
+    cmd.arg(&pod_name);
+    cmd.arg("-c");
+    cmd.arg(&prefix);
+    cmd.arg("--");
+    cmd.arg("script");
+    cmd.arg("-q");
+    cmd.arg("-c");
+    cmd.arg(&shell_cmd);
+    cmd.arg("/dev/null");
 
+    // ── Spawn inside the PTY slave ────────────────────────────────────────────
     let _child     = pair.slave.spawn_command(cmd)?;
     let writer     = pair.master.take_writer()?;
     let mut reader = pair.master.try_clone_reader()?;
 
+    // No deferred init thread needed — size and shell mode are configured
+    // inside shell_cmd before `sh -i` starts.
+    let writer_arc = Arc::new(Mutex::new(writer));
+
+    // ── Background reader thread → VTE parser ────────────────────────────────
     thread::spawn(move || {
         let mut parser = vte::Parser::new();
         let mut buf    = [0u8; 4096];
@@ -447,10 +465,10 @@ pub fn spawn_kubectl(
         }
     });
 
-    Ok(SshSession { writer, _pty_pair: pair })
+    Ok(SshSession { writer: writer_arc, _pty_pair: pair })
 }
 
-// ── Key → char helper ────────────────────────────────────────────────────────
+// ── Key → char helper ─────────────────────────────────────────────────────────
 
 pub fn key_to_char(key: egui::Key) -> Option<char> {
     use egui::Key::*;
