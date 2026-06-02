@@ -7,7 +7,7 @@
 use MetadataService::apis::{
         configuration::Configuration as MetadataConfiguration,
         default_api::{
-            MetadataGetDbschemasAndTablesParams, MetadataGetDbschemasParams, MetadataGetServicesAndEnvsParams, MetadataGetUserPackagesParams, metadata_get_dbschemas, metadata_get_dbschemas_and_tables, metadata_get_services_and_envs, metadata_get_user_packages
+            MetadataGetDbschemasAndTablesParams, MetadataGetDbschemasParams, MetadataGetServicesAndEnvsParams, MetadataGetUserPackagesParams, metadata_get_current_workspace, metadata_get_dbschemas, metadata_get_dbschemas_and_tables, metadata_get_services_and_envs, metadata_get_user_packages
         },
     };
 
@@ -134,4 +134,16 @@ pub async fn fetch_dbs(
         .collect();
 
     Ok(schemas)
+}
+
+
+pub async fn fetch_current_workspace(
+    config: &MetadataConfiguration,
+) -> Result<String, DataSourceError> {
+    let raw = metadata_get_current_workspace(
+        config,
+    )
+    .await?;
+
+    Ok(raw.org_id)
 }

@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use crate::shared::core::data_source;
+use crate::shared::core::data_source::{self, fetch_current_workspace};
 
 use crossterm::{
     cursor::MoveTo,
@@ -49,8 +49,17 @@ pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
     session_user:    &str,
 ) {
+
+    let org_id = match fetch_current_workspace(&metadata_config).await {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("Workspace fetch error: {e:?}");
+                    exit(1);
+                }
+             };
+
     let packages: Vec<Package> =
-        match data_source::fetch_packages(metadata_config, "ginger-society", "stage").await {
+        match data_source::fetch_packages(metadata_config, &org_id, "stage").await {
             Ok(mut pkgs) => {
                 for pkg in &mut pkgs {
                     let slug = crate::shared::core::image::pkg_to_slug(&pkg.identifier);
@@ -65,7 +74,7 @@ pub async fn fetch_metadata_and_process(
         };
 
     let initial_services: Vec<K8sService> =
-        match data_source::fetch_services(metadata_config, "ginger-society", 50).await {
+        match data_source::fetch_services(metadata_config, &org_id, 50).await {
             Ok(svcs) => svcs,
             Err(e) => {
                 eprintln!("{e:?}\nUnable to get metadata");
@@ -74,7 +83,7 @@ pub async fn fetch_metadata_and_process(
         };
 
     let initial_db_schemas: Vec<DbSchema> =
-        match data_source::fetch_dbs(metadata_config, "ginger-society", 50).await {
+        match data_source::fetch_dbs(metadata_config, &org_id, 50).await {
             Ok(schemas) => schemas,
             Err(e) => {
                 eprintln!("Warning: DB schema fetch failed: {e:?}");
