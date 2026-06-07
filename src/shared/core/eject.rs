@@ -2,6 +2,22 @@
 //!
 //! All low-level helpers (daemon, git, SSH, kubectl) live in
 //! `crate::shared::ui::eject::*` and are shared with `mount.rs`.
+//!
+//! # Main-container annotation
+//!
+//! To tell ginger-code which container in a multi-container pod is the "main"
+//! one to eject/uneject, add this annotation to the **Pod template**:
+//!
+//! ```yaml
+//! spec:
+//!   template:
+//!     metadata:
+//!       annotations:
+//!         x-ginger-code-ejectable: "<container-name>"
+//! ```
+//!
+//! If the annotation is absent, `deployment_name` is used as the fallback,
+//! which keeps single-container deployments working with zero config.
 
 use std::fs;
 
@@ -74,6 +90,32 @@ fn remove_from_branch_config(deployment_name: &str) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+// ── Main-container resolution ─────────────────────────────────────────────────
+
+/// Returns the name of the container to eject/uneject.
+///
+/// Reads `x-ginger-code-ejectable` from the Pod template annotations using
+/// kubectl jsonpath single-quote bracket syntax, which handles hyphenated keys.
+/// Falls back to `deployment_name` if the annotation is absent, keeping
+/// single-container deployments working with zero configuration.
+async fn resolve_main_container(deployment_name: &str) -> String {
+    get_deployment_annotation(
+        deployment_name,
+        // Single-quote bracket syntax is required by kubectl jsonpath
+        // for annotation keys that contain hyphens.
+        ".spec.template.metadata.annotations['x-ginger-code-ejectable']",
+    )
+    .await
+    .unwrap_or_else(|| {
+        println!(
+            "  x-ginger-code-ejectable annotation not found — \
+             falling back to container name '{}'",
+            deployment_name
+        );
+        deployment_name.to_string()
+    })
+}
+
 // ── Eject ─────────────────────────────────────────────────────────────────────
 
 pub async fn eject(
@@ -111,6 +153,14 @@ pub async fn eject(
     // e.g. "dev-portal"
     let dir_name = deployment_name.to_string();
 
+    // ── Resolve which container to eject ──────────────────────────────────────
+    //
+    // For single-container deployments with no annotation this falls back to
+    // deployment_name — identical behaviour to the original containers[0] approach.
+    // For multi-container pods, the annotation names the container to target.
+    let main_container = resolve_main_container(deployment_name).await;
+    println!("  Main container: {}", main_container);
+
     let original_image =
         get_deployment_annotation(deployment_name, ".spec.template.spec.containers[0].image")
             .await
@@ -124,7 +174,10 @@ pub async fn eject(
     apply_pvc(&principals_pvc_name, "16Mi").await?;
     println!("✓ SSH principals PVC ready: {}", principals_pvc_name);
 
-    // ── Patch deployment ──────────────────────────────────────────────────────
+    // ── Build the patched container spec ──────────────────────────────────────
+    //
+    // Strategic merge patch uses `name` as the merge key for `containers[]`,
+    // so only the named container is touched — any sidecars are left unchanged.
     let command = if ssh {
         serde_json::json!(["/entrypoint.sh"])
     } else {
@@ -132,7 +185,7 @@ pub async fn eject(
     };
 
     let mut container = serde_json::json!({
-        "name":    deployment_name,
+        "name":    main_container,   // ← strategic merge key: only this container is patched
         "image":   image,
         "command": command,
         "volumeMounts": [
@@ -144,12 +197,16 @@ pub async fn eject(
         container["ports"] = serde_json::json!([{ "containerPort": 22 }]);
     }
 
+    // ── Patch deployment ──────────────────────────────────────────────────────
     let patch = serde_json::json!({
         "metadata": {
             "annotations": {
                 "ginger-ejected":        "true",
                 "ginger-original-image": original_image,
                 "ginger-branch":         branch,
+                // Store the resolved container name so uneject can find it
+                // even if the Pod-template annotation changes in the meantime.
+                "ginger-main-container": main_container,
             }
         },
         "spec": {
@@ -199,7 +256,7 @@ pub async fn eject(
             .await?;
         println!("✓ Pod ready: {}", final_pod);
 
-        write_ssh_principal(&final_pod, deployment_name, &session_user).await?;
+        write_ssh_principal(&final_pod, &main_container, &session_user).await?;
 
         println!("⏳ Writing pod SSH config for git push...");
         if let Err(e) = write_pod_ssh_config(&final_pod, deployment_name).await {
@@ -207,7 +264,7 @@ pub async fn eject(
         }
 
         println!("⏳ Checking workspace and branch...");
-        let workspace_empty = is_workspace_empty(&final_pod, deployment_name)
+        let workspace_empty = is_workspace_empty(&final_pod, &main_container)
             .await
             .unwrap_or(true);
 
@@ -218,8 +275,8 @@ pub async fn eject(
                 Ok(()) => {
                     setup_repo_branch(
                         &final_pod, deployment_name,
-                        &git_repo,  // source:ginger-society-dev-portal.git
-                        &git_repo,  // /workspace/ginger-society-dev-portal
+                        &git_repo,
+                        &git_repo,
                         &branch,
                     ).await?;
                     if let Err(e) = delete_dev_ssh_keys(&final_pod, deployment_name).await {
@@ -231,8 +288,8 @@ pub async fn eject(
             println!("  /workspace is not empty — checking branch...");
             setup_repo_branch(
                 &final_pod, deployment_name,
-                &git_repo,  // source:ginger-society-dev-portal.git
-                &git_repo,  // /workspace/ginger-society-dev-portal
+                &git_repo,
+                &git_repo,
                 &branch,
             ).await?;
         }
@@ -272,26 +329,45 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
     assert_daemon_reachable()?;
 
     let original_image =
-        get_deployment_annotation(deployment_name, ".metadata.annotations.ginger-original-image")
+        get_deployment_annotation(deployment_name, ".metadata.annotations['ginger-original-image']")
             .await
             .ok_or("No ginger-original-image annotation — was this deployment ejected?")?;
 
+    // Recover which container was ejected from the Deployment-level annotation
+    // stored at eject time — reliable even if the Pod-template annotation changes.
+    let main_container =
+        get_deployment_annotation(deployment_name, ".metadata.annotations['ginger-main-container']")
+            .await
+            .unwrap_or_else(|| {
+                println!(
+                    "  ginger-main-container annotation not found — \
+                     falling back to deployment name '{}'",
+                    deployment_name
+                );
+                deployment_name.to_string()
+            });
+    println!("  Restoring container: {}", main_container);
+
+    // Strategic merge patch: only the named container is restored.
+    // Sidecars are left completely unchanged.
     let patch = serde_json::json!({
         "metadata": {
             "annotations": {
                 "ginger-ejected":        null,
                 "ginger-original-image": null,
                 "ginger-branch":         null,
+                "ginger-main-container": null,
             }
         },
         "spec": {
             "template": {
                 "spec": {
                     "containers": [{
-                        "name":         deployment_name,
+                        "name":         main_container,  // ← strategic merge key
                         "image":        original_image,
                         "command":      null,
-                        "volumeMounts": []
+                        "volumeMounts": [],
+                        "ports":        [],
                     }],
                     "volumes": []
                 }
