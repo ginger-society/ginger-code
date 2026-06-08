@@ -32,7 +32,7 @@ pub fn draw_db_schema_detail(
 
 fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 72.0),
+        egui::vec2(ui.available_width(), 90.0),
         egui::Sense::hover(),
     );
 
@@ -109,6 +109,31 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
             );
         }
     }
+
+    y += 18.0;
+
+    let status_color = match schema.k8s_status.as_str() {
+        "Running"      => egui::Color32::from_rgb(39, 201, 63),
+        "Degraded" | "Pending" => COLOR_YELLOW,
+        "Not deployed" => COLOR_DIM,
+        _              => COLOR_RED,
+    };
+    let k8s_row = format!(
+        "k8s: {}   ready: {}{}",
+        schema.k8s_status,
+        schema.k8s_ready,
+        schema.k8s_name.as_deref()
+            .map(|n| format!("   ({})", n))
+            .unwrap_or_default(),
+    );
+    painter.text(
+        egui::pos2(rect.min.x + pad, y),
+        egui::Align2::LEFT_TOP,
+        &k8s_row,
+        egui::FontId::new(10.5, egui::FontFamily::Monospace),
+        status_color,
+    );
+
 }
 
 // ── Logs pane ─────────────────────────────────────────────────────────────────

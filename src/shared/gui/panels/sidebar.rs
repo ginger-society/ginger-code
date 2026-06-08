@@ -1,6 +1,7 @@
 use eframe::egui;
 
 use crate::shared;
+use crate::shared::gui::colors::COLOR_YELLOW;
 
 use super::super::colors::{
     COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_MUTED, COLOR_SELECTED_BG,
@@ -266,11 +267,25 @@ fn draw_db_schema_row(
     );
 
     // Sub-line: db_type · N tables
-    let sub = format!("{}  ·  {} tables", db_type, schema.tables.len());
+    let sub = format!("{}  ·  {}", db_type, schema.k8s_status);
+
+    let dot = match schema.k8s_status.as_str() {
+        "Running"      => "●",
+        "Degraded"     => "◐",
+        "Pending"      => "○",
+        "Not deployed" => "·",
+        _              => "✗",
+    };
+    let dot_color = match schema.k8s_status.as_str() {
+        "Running"  => egui::Color32::from_rgb(39, 201, 63),
+        "Degraded" | "Pending" => COLOR_YELLOW,
+        _          => COLOR_DIM,
+    };
+
     painter.text(
-        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
-        egui::Align2::LEFT_TOP, &sub,
-        egui::FontId::new(10.0, egui::FontFamily::Monospace), COLOR_CYAN,
+        egui::pos2(row_rect.min.x + 14.0, row_rect.min.y + 13.0),
+        egui::Align2::CENTER_CENTER, dot,
+        egui::FontId::new(11.0, egui::FontFamily::Monospace), dot_color,
     );
 
     painter.line_segment(

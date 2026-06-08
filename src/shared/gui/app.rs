@@ -120,15 +120,8 @@ impl App {
         // Derive the deployment slug from the schema identifier (falls back to name)
         let slug = self.state.db_schemas
             .get(schema_idx)
-            .and_then(|s| s.identifier.clone())
-            .unwrap_or_else(|| {
-                self.state.db_schemas
-                    .get(schema_idx)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default()
-            })
-            .to_lowercase()
-            .replace('_', "-");
+            .and_then(|s| s.k8s_name.clone())
+            .unwrap_or_default();
 
         spawn_db_schema_logs(
             self.tx.clone(),

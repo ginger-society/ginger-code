@@ -120,3 +120,52 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
         Err(e) => vec![format!("Failed to fetch logs: {}", e)],
     }
 }
+
+
+pub fn db_to_k8s_name(name: &str, db_type: &str) -> String {
+    let slug = name.to_lowercase().replace(' ', "-");
+    match db_type {
+        "rdbms"        => format!("{}-postgresql", slug),
+        "cache"        => format!("{}-redis",      slug),
+        "messagequeue" => format!("{}-rabbitmq",   slug),
+        _              => slug,
+    }
+}
+
+pub fn db_is_statefulset(db_type: &str) -> bool {
+    db_type == "rdbms"
+}
+
+pub async fn get_k8s_statefulsets() -> HashMap<String, (String, String)> {
+    let output = tokio::process::Command::new("kubectl")
+        .args(&[
+            "get", "statefulsets",
+            "-o", "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas",
+            "--no-headers",
+        ])
+        .output()
+        .await;
+
+    let mut map = HashMap::new();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let name        = parts[0].to_string();
+                let ready_count = parts[1];
+                let desired     = parts[2];
+                let ready_str   = format!("{}/{}", ready_count, desired);
+                let status = if ready_count == desired {
+                    "Running".to_string()
+                } else if ready_count == "<none>" || ready_count == "0" {
+                    "Pending".to_string()
+                } else {
+                    "Degraded".to_string()
+                };
+                map.insert(name, (status, ready_str));
+            }
+        }
+    }
+    map
+}

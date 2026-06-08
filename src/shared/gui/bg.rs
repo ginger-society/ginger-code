@@ -11,7 +11,7 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_current_workspace, fetch_dbs, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected}, mount, types::{DbSchema, K8sService, Package}, unmount
+    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected}, mount, types::{DbSchema, K8sService, Package}, unmount
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
             }
 
             // ── DB Schemas (non-fatal) ────────────────────────────────────
-            match fetch_dbs(&config, &org_id, 100).await {
+            match fetch_dbs_enriched(&config, &org_id).await {
                 Ok(schemas) => {
                     let _ = tx.send(BgMsg::DbSchemas(schemas));
                     ctx.request_repaint();

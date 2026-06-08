@@ -46,4 +46,8 @@ pub struct DbSchema {
     pub version:         Option<String>,
     pub pipeline_status: Option<String>,
     pub updated_at:      String,
+    // k8s enrichment
+    pub k8s_name:        Option<String>,
+    pub k8s_status:      String,
+    pub k8s_ready:       String,
 }

@@ -83,7 +83,7 @@ pub async fn fetch_metadata_and_process(
         };
 
     let initial_db_schemas: Vec<DbSchema> =
-        match data_source::fetch_dbs(metadata_config, &org_id, 50).await {
+        match data_source::fetch_dbs_enriched(metadata_config, &org_id).await {
             Ok(schemas) => schemas,
             Err(e) => {
                 eprintln!("Warning: DB schema fetch failed: {e:?}");

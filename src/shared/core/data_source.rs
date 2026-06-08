@@ -11,7 +11,7 @@ use MetadataService::apis::{
         },
     };
 
-use crate::shared::core::types::DbSchema;
+use crate::shared::core::{k8_info::{db_is_statefulset, db_to_k8s_name, get_k8s_deployments, get_k8s_statefulsets}, types::DbSchema};
 
 use super::{
     k8_info::meta_to_deployment_name,
@@ -100,14 +100,11 @@ pub async fn fetch_services(
 
     Ok(services)
 }
-
 pub async fn fetch_dbs(
-    config:    &MetadataConfiguration,
-    org_id:    &str,
+    config:     &MetadataConfiguration,
+    org_id:     &str,
     _page_size: u32,
 ) -> Result<Vec<DbSchema>, DataSourceError> {
-    use super::types::DbSchema;
-
     let raw = metadata_get_dbschemas_and_tables(
         config,
         MetadataGetDbschemasAndTablesParams {
@@ -130,8 +127,42 @@ pub async fn fetch_dbs(
             version:         s.version.and_then(|o| o),
             pipeline_status: s.pipeline_status.and_then(|o| o),
             updated_at:      s.updated_at,
+            // k8s fields default — populated by fetch_dbs_enriched
+            k8s_name:        None,
+            k8s_status:      "Unknown".to_string(),
+            k8s_ready:       "–".to_string(),
         })
         .collect();
+
+    Ok(schemas)
+}
+
+/// Fetch DBs from metadata API and enrich with live k8s status.
+pub async fn fetch_dbs_enriched(
+    config:  &MetadataConfiguration,
+    org_id:  &str,
+) -> Result<Vec<DbSchema>, DataSourceError> {
+    let mut schemas = fetch_dbs(config, org_id, 50).await?;
+
+    let deployments  = get_k8s_deployments().await;
+    let statefulsets = get_k8s_statefulsets().await;
+
+    for schema in schemas.iter_mut() {
+        let db_type  = schema.db_type.as_deref().unwrap_or("");
+        let k8s_name = db_to_k8s_name(&schema.name, db_type);
+
+        let (status, ready) = if db_is_statefulset(db_type) {
+            statefulsets.get(&k8s_name)
+        } else {
+            deployments.get(&k8s_name)
+        }
+        .map(|(s, r)| (s.clone(), r.clone()))
+        .unwrap_or_else(|| ("Not deployed".to_string(), "–".to_string()));
+
+        schema.k8s_name   = Some(k8s_name);
+        schema.k8s_status = status;
+        schema.k8s_ready  = ready;
+    }
 
     Ok(schemas)
 }
