@@ -296,12 +296,12 @@ fn spawn_forward_thread(
             let mut child:        Option<Child>   = None;
             let mut spawned_at:   Option<Instant> = None;
             let mut attempt:      u32             = 0;
-            /// Tracks when we last got a successful probe on a connected forward.
-            /// Used to detect silently-dead SPDY streams.
+            // Tracks when we last got a successful probe on a connected forward.
+            // Used to detect silently-dead SPDY streams.
             let mut last_good_probe:      Option<Instant> = None;
-            /// Number of consecutive probe failures since the last success.
-            /// Reset to 0 on any successful probe. Both this AND the elapsed
-            /// time must exceed their thresholds before we restart.
+            // Number of consecutive probe failures since the last success.
+            // Reset to 0 on any successful probe. Both this AND the elapsed
+            // time must exceed their thresholds before we restart.
             let mut consecutive_failures: u32             = 0;
 
             loop {

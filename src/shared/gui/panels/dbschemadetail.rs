@@ -60,9 +60,9 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     );
 
     if let Some(ref db_type) = schema.db_type {
-        let name_w = name.len() as f32 * 8.5;
-        painter.text(
-            egui::pos2(rect.min.x + pad + name_w + 8.0, y + 1.0),
+        let name_w = name.len() as f32 * 7.8;
+            painter.text(
+            egui::pos2(rect.min.x + pad + name_w + 6.0, y + 1.0),
             egui::Align2::LEFT_TOP,
             &format!("[{}]", db_type),
             egui::FontId::new(11.0, egui::FontFamily::Monospace),
@@ -157,7 +157,7 @@ fn draw_logs_pane(logs: Option<&[String]>, ui: &mut egui::Ui) {
         }
 
         // No matching deployment found
-        Some([]) => {
+        Some(lines) if lines.is_empty() =>{
             ui.add_space(24.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);

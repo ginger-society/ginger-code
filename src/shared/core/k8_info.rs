@@ -79,13 +79,10 @@ pub async fn is_ejected(deployment_name: &str) -> bool {
 pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
     let pod_output = tokio::process::Command::new("kubectl")
         .args(&[
-            "get",
-            "pods",
-            "-l",
-            &format!("app={}", deployment_name),
+            "get", "pods",
+            "--field-selector=status.phase=Running",
+            "-o", "custom-columns=NAME:.metadata.name",
             "--no-headers",
-            "-o",
-            "custom-columns=NAME:.metadata.name",
         ])
         .output()
         .await;
@@ -94,7 +91,7 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
         Ok(out) => String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|l| !l.is_empty())
-            .next()
+            .find(|l| l.trim().starts_with(deployment_name))
             .map(|l| l.trim().to_string()),
         Err(_) => None,
     };
