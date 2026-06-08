@@ -133,6 +133,8 @@ pub async fn copy_ssh_keys_to_dev(
                 "cp",
                 local.to_str().unwrap(),
                 &format!("{}:{}", pod_name, remote_path),
+                "-c",
+                container,
             ])
             .status()
             .await?;

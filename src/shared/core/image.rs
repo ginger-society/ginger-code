@@ -4,7 +4,7 @@
 pub fn builder_image(lang: &str) -> Result<&'static str, Box<dyn std::error::Error>> {
     match lang {
         "TS"   => Ok("gingersociety/dev-container-node:5"),
-        "Rust" => Ok("gingersociety/dev-container-rust:7"),
+        "Rust" => Ok("gingersociety/dev-container-rust:8"),
         other  => Err(format!("builder image not yet defined for lang: {}", other).into()),
     }
 }

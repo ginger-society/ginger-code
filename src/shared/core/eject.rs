@@ -101,8 +101,6 @@ fn remove_from_branch_config(deployment_name: &str) -> Result<(), Box<dyn std::e
 async fn resolve_main_container(deployment_name: &str) -> String {
     get_deployment_annotation(
         deployment_name,
-        // Single-quote bracket syntax is required by kubectl jsonpath
-        // for annotation keys that contain hyphens.
         ".spec.template.metadata.annotations['x-ginger-code-ejectable']",
     )
     .await
@@ -114,6 +112,40 @@ async fn resolve_main_container(deployment_name: &str) -> String {
         );
         deployment_name.to_string()
     })
+}
+
+/// Returns the current image of the named container inside a deployment.
+///
+/// Uses a filter expression so it works regardless of container order —
+/// unlike the fragile `.spec.template.spec.containers[0].image` approach.
+async fn get_container_image(
+    deployment_name: &str,
+    container_name:  &str,
+) -> Option<String> {
+    let path = format!(
+        ".spec.template.spec.containers[?(@.name=='{}')].image",
+        container_name
+    );
+    get_deployment_annotation(deployment_name, &path).await
+}
+
+/// Detects whether port 22 is already claimed by a container other than
+/// `main_container`. If so, the dev container must use 2222 instead.
+async fn resolve_ssh_port(deployment_name: &str, main_container: &str) -> u16 {
+    let port_22_in_use = get_deployment_annotation(
+        deployment_name,
+        ".spec.template.spec.containers[?(@.ports[0].containerPort==22)].name",
+    )
+    .await
+    .map(|name| name != main_container)
+    .unwrap_or(false);
+
+    if port_22_in_use {
+        println!("  Port 22 already claimed by another container — using 2222 for dev SSH");
+        2222
+    } else {
+        22
+    }
 }
 
 // ── Eject ─────────────────────────────────────────────────────────────────────
@@ -154,17 +186,17 @@ pub async fn eject(
     let dir_name = deployment_name.to_string();
 
     // ── Resolve which container to eject ──────────────────────────────────────
-    //
-    // For single-container deployments with no annotation this falls back to
-    // deployment_name — identical behaviour to the original containers[0] approach.
-    // For multi-container pods, the annotation names the container to target.
     let main_container = resolve_main_container(deployment_name).await;
     println!("  Main container: {}", main_container);
 
-    let original_image =
-        get_deployment_annotation(deployment_name, ".spec.template.spec.containers[0].image")
-            .await
-            .ok_or("Could not read current image from deployment")?;
+    // Read the image of the specific container being ejected, not containers[0]
+    let original_image = get_container_image(deployment_name, &main_container)
+        .await
+        .ok_or_else(|| format!(
+            "Could not read image for container '{}' in deployment '{}'",
+            main_container, deployment_name
+        ))?;
+    println!("  Original image: {}", original_image);
 
     // ── PVCs ──────────────────────────────────────────────────────────────────
     let pvc_name            = format!("{}-eject-pvc", deployment_name);
@@ -184,6 +216,12 @@ pub async fn eject(
         serde_json::json!(["sleep", "infinity"])
     };
 
+    // Detect SSH port — use 2222 if port 22 is already taken by another container
+    // (e.g. gitolite running alongside ginger-gitter-service).
+    // The dev container image reads SSH_PORT env var: `sshd -D -e -p ${SSH_PORT:-22}`
+    let ssh_port = resolve_ssh_port(deployment_name, &main_container).await;
+    println!("  SSH port: {}", ssh_port);
+
     let mut container = serde_json::json!({
         "name":    main_container,   // ← strategic merge key: only this container is patched
         "image":   image,
@@ -193,8 +231,15 @@ pub async fn eject(
             { "name": "ssh-principals", "mountPath": "/etc/ssh/auth_principals" },
         ]
     });
+
     if ssh {
-        container["ports"] = serde_json::json!([{ "containerPort": 22 }]);
+        container["ports"] = serde_json::json!([{ "containerPort": ssh_port }]);
+        // SSH_PORT tells the entrypoint which port sshd should bind to.
+        // Defaults to 22 in the image; only set explicitly when using 2222.
+        container["env"] = serde_json::json!([{
+            "name":  "SSH_PORT",
+            "value": ssh_port.to_string(),
+        }]);
     }
 
     // ── Patch deployment ──────────────────────────────────────────────────────
@@ -204,9 +249,10 @@ pub async fn eject(
                 "ginger-ejected":        "true",
                 "ginger-original-image": original_image,
                 "ginger-branch":         branch,
-                // Store the resolved container name so uneject can find it
-                // even if the Pod-template annotation changes in the meantime.
+                // Store resolved values so uneject is reliable even if the
+                // Pod-template annotations change in the meantime.
                 "ginger-main-container": main_container,
+                "ginger-ssh-port":       ssh_port.to_string(),
             }
         },
         "spec": {
@@ -259,7 +305,7 @@ pub async fn eject(
         write_ssh_principal(&final_pod, &main_container, &session_user).await?;
 
         println!("⏳ Writing pod SSH config for git push...");
-        if let Err(e) = write_pod_ssh_config(&final_pod, deployment_name).await {
+        if let Err(e) = write_pod_ssh_config(&final_pod, &main_container).await {
             eprintln!("Warning: {e}");
         }
 
@@ -270,16 +316,16 @@ pub async fn eject(
 
         if workspace_empty {
             println!("⏳ Copying SSH keys into pod for initial clone...");
-            match copy_ssh_keys_to_dev(&final_pod, deployment_name).await {
+            match copy_ssh_keys_to_dev(&final_pod, &main_container).await {
                 Err(e) => eprintln!("Warning: could not copy SSH keys into pod: {e}"),
                 Ok(()) => {
                     setup_repo_branch(
-                        &final_pod, deployment_name,
+                        &final_pod, &main_container,
                         &git_repo,
                         &git_repo,
                         &branch,
                     ).await?;
-                    if let Err(e) = delete_dev_ssh_keys(&final_pod, deployment_name).await {
+                    if let Err(e) = delete_dev_ssh_keys(&final_pod, &main_container).await {
                         eprintln!("Warning: {e}");
                     }
                 }
@@ -287,7 +333,7 @@ pub async fn eject(
         } else {
             println!("  /workspace is not empty — checking branch...");
             setup_repo_branch(
-                &final_pod, deployment_name,
+                &final_pod, &main_container,
                 &git_repo,
                 &git_repo,
                 &branch,
@@ -300,13 +346,13 @@ pub async fn eject(
 
         let forwarding_port = find_free_22xx_port()?;
 
-        if let Err(e) = daemon_register(deployment_name, 22, forwarding_port, organization_id) {
+        if let Err(e) = daemon_register(deployment_name, ssh_port, forwarding_port, organization_id) {
             eprintln!(
                 "Warning: {e}\n\
                 Register manually:\n  \
-                ginger-code register --deployment-name {} --deployment-port 22 \
+                ginger-code register --deployment-name {} --deployment-port {} \
                 --forwarding-port {}",
-                deployment_name, forwarding_port
+                deployment_name, ssh_port, forwarding_port
             );
         }
 
@@ -350,6 +396,8 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     // Strategic merge patch: only the named container is restored.
     // Sidecars are left completely unchanged.
+    // Note: `ports` is intentionally omitted so k8s retains the original
+    // port definitions from the deployment spec rather than clearing them.
     let patch = serde_json::json!({
         "metadata": {
             "annotations": {
@@ -357,6 +405,7 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
                 "ginger-original-image": null,
                 "ginger-branch":         null,
                 "ginger-main-container": null,
+                "ginger-ssh-port":       null,
             }
         },
         "spec": {
@@ -366,8 +415,8 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
                         "name":         main_container,  // ← strategic merge key
                         "image":        original_image,
                         "command":      null,
+                        "env":          null,
                         "volumeMounts": [],
-                        "ports":        [],
                     }],
                     "volumes": []
                 }
