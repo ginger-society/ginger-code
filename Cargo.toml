@@ -39,7 +39,14 @@ vte           = "0.13"
 parking_lot   = "0.12"
 image = { version = "0.24", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
-
+syntect = { version = "=5.2.0", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "html",
+    "regex-fancy",
+    "parsing",
+    "yaml-load"
+] }
 
 [package.metadata]
 organization = "ginger-society"

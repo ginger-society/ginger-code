@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::shared::core::types::DbSchema;
+use crate::shared::{core::types::DbSchema, gui::panels::log_highlight::{LogPalette, highlight_line}};
 
 use super::super::colors::{
     COLOR_BORDER, COLOR_CYAN, COLOR_DIM, COLOR_FG, COLOR_MUTED, COLOR_RED, COLOR_YELLOW,
@@ -182,27 +182,27 @@ fn draw_logs_pane(logs: Option<&[String]>, ui: &mut egui::Ui) {
 
         // Live logs
         Some(lines) => {
-            egui::ScrollArea::both()
+            let palette = LogPalette::from_monokai();
+            egui::ScrollArea::vertical()
                 .id_source("db_logs_scroll")
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     for line in lines {
-                        let color = if line.contains("ERROR") || line.contains("error") || line.contains("panic") {
-                            COLOR_RED
-                        } else if line.contains("WARN") || line.contains("warn") {
-                            COLOR_YELLOW
-                        } else {
-                            COLOR_FG
-                        };
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(line)
-                                    .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
-                                    .color(color),
-                            )
-                            .wrap(false),
-                        );
+                        let spans = highlight_line(line, &palette);
+                        let mut job = egui::text::LayoutJob::default();
+                        for span in spans {
+                            job.append(
+                                &span.text,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::new(12.0, egui::FontFamily::Monospace),
+                                    color:   span.color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        ui.label(job);
                     }
                 });
         }

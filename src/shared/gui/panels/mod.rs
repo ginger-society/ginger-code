@@ -11,6 +11,7 @@ mod tabbar;
 mod terminalpane;
 mod titlebar;
 pub mod dbschemadetail;
+mod log_highlight;
 
 pub use infostrip::{draw_info_strip, InfoStripAction};
 pub use logspane::draw_logs_pane;
