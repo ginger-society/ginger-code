@@ -231,7 +231,7 @@ pub fn spawn_db_schema_logs(
                 // get_pod_logs returns a single "No pods found" string when absent —
                 // we normalise that into our "no deployment" indicator.
                 let normalised = if lines.len() == 1
-                    && lines[0].starts_with("No pods found")
+                    && (lines[0].starts_with("No pods found") || lines[0].starts_with("No pods found for deployment"))
                 {
                     vec![]
                 } else {

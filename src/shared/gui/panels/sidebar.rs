@@ -288,6 +288,12 @@ fn draw_db_schema_row(
         egui::FontId::new(11.0, egui::FontFamily::Monospace), dot_color,
     );
 
+    painter.text(
+        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
+        egui::Align2::LEFT_TOP, &sub,
+        egui::FontId::new(10.0, egui::FontFamily::Monospace), COLOR_CYAN,
+    );
+
     painter.line_segment(
         [egui::pos2(row_rect.min.x, row_rect.max.y), row_rect.max],
         egui::Stroke::new(0.5, COLOR_BORDER),

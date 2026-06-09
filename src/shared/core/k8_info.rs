@@ -81,8 +81,8 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
         .args(&[
             "get", "pods",
             "--field-selector=status.phase=Running",
-            "-o", "custom-columns=NAME:.metadata.name",
             "--no-headers",
+            "-o", "custom-columns=NAME:.metadata.name",
         ])
         .output()
         .await;
@@ -97,7 +97,7 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
     };
 
     let Some(pod) = pod_name else {
-        return vec!["No pods found for this deployment.".to_string()];
+        return vec![format!("No pods found for deployment '{}'.", deployment_name)];
     };
 
     match tokio::process::Command::new("kubectl")
@@ -117,7 +117,6 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
         Err(e) => vec![format!("Failed to fetch logs: {}", e)],
     }
 }
-
 
 pub fn db_to_k8s_name(name: &str, db_type: &str) -> String {
     let slug = name.to_lowercase().replace(' ', "-");
