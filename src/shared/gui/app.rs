@@ -38,7 +38,6 @@ pub struct App {
     /// In-flight mount/unmount description + package index.
     mounting: Option<(usize, String)>,
     /// Index of the DB schema whose logs are currently being polled.
-    /// Used to avoid restarting the poller when the user re-clicks the same schema.
     db_log_schema_idx: Option<usize>,
     ctx:      egui::Context,
     db_log_pending_idx: Option<usize>,
@@ -68,15 +67,15 @@ impl App {
         spawn_k8s_poller(tx.clone(), ctx.clone());
 
         App {
-            state:             AppState::new(13.0, vec![]),
+            state:              AppState::new(13.0, vec![]),
             rx,
             tx,
-            loading:           true,
-            ejecting:          None,
-            mounting:          None,
-            db_log_schema_idx: None,
+            loading:            true,
+            ejecting:           None,
+            mounting:           None,
+            db_log_schema_idx:  None,
             ctx,
-            db_log_pending_idx:None
+            db_log_pending_idx: None,
         }
     }
 
@@ -85,12 +84,19 @@ impl App {
     fn select_service(&mut self, new_idx: usize) {
         let generation = self.state.switch_service(new_idx);
 
-        let svc             = &self.state.services[new_idx];
-        let meta_name       = svc.meta_name.clone();
-        let deployment_name = svc.deployment_name.clone();
-        let ejected         = svc.ejected;
+        let svc               = &self.state.services[new_idx];
+        let meta_name         = svc.meta_name.clone();
+        let deployment_name   = svc.deployment_name.clone();
+        let ejected           = svc.ejected;
+        let ejected_container = svc.ejected_container.clone();
+        let containers        = svc.containers.clone();
 
-        if ejected {
+        let has_other_containers = ejected_container.as_ref()
+            .map(|ej| containers.iter().any(|c| c != ej))
+            .unwrap_or(false);
+
+        if ejected && !has_other_containers {
+            // Single-container ejected: show dev mode message immediately
             self.state.logs = vec![
                 format!("⚡ {} is ejected — running in dev mode.", meta_name),
                 "No application logs available.".into(),
@@ -100,9 +106,6 @@ impl App {
         }
 
         if let Some(dep) = deployment_name.clone() {
-            spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep, generation);
-        }
-        if let Some(dep) = deployment_name {
             spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep.clone(), generation);
             spawn_container_fetch(self.tx.clone(), self.ctx.clone(), new_idx, dep);
         }
@@ -118,16 +121,14 @@ impl App {
 
     fn select_db_schema(&mut self, schema_idx: usize) {
         self.state.right_pane = RightPane::DbSchemaDetail(schema_idx);
-        self.state.db_logs    = vec![];  // reset to "loading" state
+        self.state.db_logs    = vec![];
 
-        // Only start a new poller if a different schema is selected
         if self.db_log_schema_idx == Some(schema_idx) {
             return;
         }
-        self.db_log_schema_idx = None;
+        self.db_log_schema_idx  = None;
         self.db_log_pending_idx = Some(schema_idx);
 
-        // Derive the deployment slug from the schema identifier (falls back to name)
         let slug = self.state.db_schemas
             .get(schema_idx)
             .and_then(|s| s.k8s_name.clone())
@@ -286,8 +287,6 @@ impl App {
     // ── Terminal helpers ──────────────────────────────────────────────────────
 
     fn open_and_connect_term(&mut self, ctx: &egui::Context) {
-        // The label should be the selected container name, falling back to
-        // the deployment name if no container is selected yet
         let label = self.state.services
             .get(self.state.selected_idx)
             .map(|svc| {
@@ -346,7 +345,6 @@ impl App {
             }
         };
 
-        // Pass selected container through to kubectl exec
         let container = self.state.services
             .get(svc_idx)
             .and_then(|s| s.selected_container.clone());
@@ -357,7 +355,7 @@ impl App {
         }
     }
 
-    // ── Drain background channel ──────────────────────────────────────────────
+    // ── Container selection ───────────────────────────────────────────────────
 
     fn select_container(&mut self, container: Option<String>) {
         let idx = self.state.selected_idx;
@@ -379,20 +377,44 @@ impl App {
         );
     }
 
+    // ── Drain background channel ──────────────────────────────────────────────
+
     fn drain_bg_channel(&mut self) {
         loop {
             match self.rx.try_recv() {
+
+                // ── Containers arrived ────────────────────────────────────────
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {
-                        svc.selected_container = containers.first().cloned();
+                        let ejected_container = svc.ejected_container.clone();
+
+                        // If ejected, default to the first non-ejected container;
+                        // otherwise just pick the first one.
+                        let default = if svc.ejected {
+                            ejected_container.as_ref()
+                                .and_then(|ej| containers.iter().find(|c| *c != ej).cloned())
+                                .or_else(|| containers.first().cloned())
+                        } else {
+                            containers.first().cloned()
+                        };
+
+                        svc.selected_container = default;
                         svc.containers         = containers;
                     }
 
-                    // If this is the active service, restart logs with the now-known container
-                    // so the initial "Defaulted container" poll is replaced immediately
+                    // Restart log poller for the active service with the
+                    // now-known (and correctly chosen) container.
                     if svc_idx == self.state.selected_idx {
                         if let Some(svc) = self.state.services.get(svc_idx) {
-                            if let (Some(dep), Some(container)) = (
+                            // Don't start log poller for ejected single-container services
+                            let ejected_container  = svc.ejected_container.clone();
+                            let has_other_containers = ejected_container.as_ref()
+                                .map(|ej| svc.containers.iter().any(|c| c != ej))
+                                .unwrap_or(false);
+
+                            if svc.ejected && !has_other_containers {
+                                // already showing dev-mode message — leave logs alone
+                            } else if let (Some(dep), Some(container)) = (
                                 svc.deployment_name.clone(),
                                 svc.selected_container.clone(),
                             ) {
@@ -406,6 +428,8 @@ impl App {
                         }
                     }
                 }
+
+                // ── Services list arrived ─────────────────────────────────────
                 Ok(BgMsg::Services(svcs)) => {
                     self.state.services     = svcs;
                     self.state.selected_idx = 0;
@@ -449,19 +473,56 @@ impl App {
                     }
                 }
 
+                // ── Ejected flag arrived ──────────────────────────────────────
                 Ok(BgMsg::EjectedFlag { idx, ejected, ejected_container }) => {
                     if let Some(svc) = self.state.services.get_mut(idx) {
-                        svc.ejected = ejected;
-                        svc.ejected_container = ejected_container;
+                        svc.ejected           = ejected;
+                        svc.ejected_container = ejected_container.clone();
+
+                        // If ejected and multi-container, steer selected_container
+                        // away from the ejected container to the first available one.
+                        if ejected {
+                            if let Some(ref ej) = ejected_container {
+                                if let Some(alt) = svc.containers.iter().find(|c| *c != ej).cloned() {
+                                    svc.selected_container = Some(alt);
+                                }
+                            }
+                        }
                     }
-                    if idx == self.state.selected_idx && ejected {
-                        let name = self.state.services.get(idx)
-                            .map(|s| s.meta_name.as_str())
-                            .unwrap_or("this service");
-                        self.state.logs = vec![
-                            format!("⚡ {} is ejected — running in dev mode.", name),
-                            "No application logs available.".into(),
-                        ];
+
+                    // Update logs for the active service
+                    if idx == self.state.selected_idx {
+                        let svc                  = self.state.services.get(idx);
+                        let is_ejected           = svc.map(|s| s.ejected).unwrap_or(false);
+                        let containers           = svc.map(|s| s.containers.clone()).unwrap_or_default();
+                        let ej_container         = svc.and_then(|s| s.ejected_container.clone());
+                        let selected_container   = svc.and_then(|s| s.selected_container.clone());
+                        let dep                  = svc.and_then(|s| s.deployment_name.clone());
+                        let name                 = svc.map(|s| s.meta_name.clone()).unwrap_or_default();
+
+                        let has_other_containers = ej_container.as_ref()
+                            .map(|ej| containers.iter().any(|c| c != ej))
+                            .unwrap_or(false);
+
+                        if is_ejected && !has_other_containers {
+                            // Single-container ejected: show dev mode message
+                            self.state.logs = vec![
+                                format!("⚡ {} is ejected — running in dev mode.", name),
+                                "No application logs available.".into(),
+                            ];
+                        } else if is_ejected && has_other_containers {
+                            // Multi-container ejected: stream logs for the
+                            // selected non-ejected container
+                            if let (Some(d), Some(container)) = (dep, selected_container) {
+                                self.state.log_generation += 1;
+                                let gen = self.state.log_generation;
+                                spawn_logs_for_container(
+                                    self.tx.clone(), self.ctx.clone(),
+                                    d, Some(container), gen,
+                                );
+                            }
+                        }
+                        // If not ejected, spawn_service_refresh already handles logs
                     }
                 }
 
@@ -472,7 +533,6 @@ impl App {
                 }
 
                 Ok(BgMsg::DbSchemaLogs { lines, schema_idx }) => {
-                    // Promote from pending → active on first message
                     if self.db_log_pending_idx == Some(schema_idx) {
                         self.db_log_schema_idx  = Some(schema_idx);
                         self.db_log_pending_idx = None;
@@ -615,10 +675,6 @@ impl eframe::App for App {
                 // ── DB schema detail ──────────────────────────────────────────
                 if let RightPane::DbSchemaDetail(idx) = self.state.right_pane {
                     if let Some(schema) = self.state.db_schemas.get(idx).cloned() {
-                        // Pass logs as Option<&[String]>:
-                        //   None      → still loading (db_logs is empty AND poller just started)
-                        //   Some([])  → poller ran, no deployment found
-                        //   Some([..])→ live lines
                         let logs_opt: Option<&[String]> = if self.db_log_schema_idx == Some(idx) {
                             Some(&self.state.db_logs)
                         } else {

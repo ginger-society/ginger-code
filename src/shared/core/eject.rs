@@ -415,7 +415,6 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
                         "name":         main_container,  // ← strategic merge key
                         "image":        original_image,
                         "command":      null,
-                        "env":          null,
                         "volumeMounts": [],
                     }],
                     "volumes": []

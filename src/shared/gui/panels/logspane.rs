@@ -134,7 +134,7 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
     painter.rect_stroke(
         right,
         egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
-        egui::Stroke::new(0.5, if is_active { COLOR_YELLOW } else { COLOR_BORDER }),
+        egui::Stroke::new(0.5, if is_active { COLOR_YELLOW } else { COLOR_MAGENTA }),
     );
     painter.text(
         right.center(),
