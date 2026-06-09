@@ -141,8 +141,6 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec
     };
 
     let mut args = vec!["logs", "--tail=500", &pod];
-    // Only add --container when explicitly requested — avoids the
-    // "Defaulted container" warning without breaking single-container pods.
     if let Some(c) = container {
         args.push("--container");
         args.push(c);
@@ -153,15 +151,10 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec
         .output()
         .await
     {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            stdout
-                .lines()
-                .chain(stderr.lines())
-                .map(|s| s.to_string())
-                .collect()
-        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect(),  // stdout only — stderr dropped entirely
         Err(e) => vec![format!("Failed to fetch logs: {}", e)],
     }
 }

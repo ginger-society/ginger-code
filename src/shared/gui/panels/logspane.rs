@@ -39,11 +39,11 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
 
 /// Returns Some(Some(name)) to switch container, Some(None) to reset to default, None if no click.
 /// Only renders anything when the service has more than one container.
-pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<Option<String>> {
+pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<String> {
     let svc = state.services.get(state.selected_idx)?;
     if svc.containers.len() <= 1 { return None; }
 
-    let mut clicked = None;
+    let mut clicked: Option<String> = None;
 
     let (bar_rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 28.0),
@@ -55,7 +55,6 @@ pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<Optio
         egui::Stroke::new(0.5, COLOR_BORDER),
     );
 
-    // Re-enter layout inside the allocated rect
     let mut child_ui = ui.child_ui(bar_rect, egui::Layout::left_to_right(egui::Align::Center));
     child_ui.add_space(8.0);
     child_ui.label(
@@ -65,17 +64,13 @@ pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<Optio
     );
     child_ui.add_space(6.0);
 
-    let default_active = svc.selected_container.is_none();
-    if chip(&mut child_ui, "default", default_active).clicked() && !default_active {
-        clicked = Some(None);
-    }
+    // Just the real container names — no "default" chip
     for name in &svc.containers {
         let is_active = svc.selected_container.as_deref() == Some(name.as_str());
         if chip(&mut child_ui, name, is_active).clicked() && !is_active {
-            clicked = Some(Some(name.clone()));
+            clicked = Some(name.clone());
         }
     }
-
     clicked
 }
 

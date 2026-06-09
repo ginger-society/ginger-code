@@ -353,7 +353,6 @@ impl App {
             svc.selected_container = container.clone();
         }
 
-        // Only restart the log stream — terminals are unaffected
         let dep = match self.state.services.get(idx)
             .and_then(|s| s.deployment_name.clone())
         {
@@ -373,10 +372,26 @@ impl App {
             match self.rx.try_recv() {
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {
-                        svc.containers = containers;
-                        // Don't auto-select — keep selected_container as None so kubectl
-                        // uses its default without the "Defaulted container" warning for
-                        // single-container pods. The chips let users override explicitly.
+                        svc.selected_container = containers.first().cloned();
+                        svc.containers         = containers;
+                    }
+
+                    // If this is the active service, restart logs with the now-known container
+                    // so the initial "Defaulted container" poll is replaced immediately
+                    if svc_idx == self.state.selected_idx {
+                        if let Some(svc) = self.state.services.get(svc_idx) {
+                            if let (Some(dep), Some(container)) = (
+                                svc.deployment_name.clone(),
+                                svc.selected_container.clone(),
+                            ) {
+                                self.state.log_generation += 1;
+                                let gen = self.state.log_generation;
+                                spawn_logs_for_container(
+                                    self.tx.clone(), self.ctx.clone(),
+                                    dep, Some(container), gen,
+                                );
+                            }
+                        }
                     }
                 }
                 Ok(BgMsg::Services(svcs)) => {
@@ -632,8 +647,8 @@ impl eframe::App for App {
                     if strip_action.open_editor_clicked { self.open_editor(); }
 
                     // Container chip bar — above tabs so both logs and terminal inherit it
-                    if let Some(container_action) = draw_container_chips(&self.state, ui) {
-                        self.select_container(container_action);
+                    if let Some(container) = draw_container_chips(&self.state, ui) {
+                        self.select_container(Some(container));
                     }
 
                     match draw_tab_bar(&self.state, ui) {
