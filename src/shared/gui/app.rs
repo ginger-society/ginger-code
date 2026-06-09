@@ -38,6 +38,7 @@ pub struct App {
     /// Used to avoid restarting the poller when the user re-clicks the same schema.
     db_log_schema_idx: Option<usize>,
     ctx:      egui::Context,
+    db_log_pending_idx: Option<usize>,
 }
 
 impl App {
@@ -72,6 +73,7 @@ impl App {
             mounting:          None,
             db_log_schema_idx: None,
             ctx,
+            db_log_pending_idx:None
         }
     }
 
@@ -115,7 +117,8 @@ impl App {
         if self.db_log_schema_idx == Some(schema_idx) {
             return;
         }
-        self.db_log_schema_idx = Some(schema_idx);
+        self.db_log_schema_idx = None;
+        self.db_log_pending_idx = Some(schema_idx);
 
         // Derive the deployment slug from the schema identifier (falls back to name)
         let slug = self.state.db_schemas
@@ -400,7 +403,11 @@ impl App {
                 }
 
                 Ok(BgMsg::DbSchemaLogs { lines, schema_idx }) => {
-                    // Only update if this is still the selected schema
+                    // Promote from pending → active on first message
+                    if self.db_log_pending_idx == Some(schema_idx) {
+                        self.db_log_schema_idx  = Some(schema_idx);
+                        self.db_log_pending_idx = None;
+                    }
                     if self.db_log_schema_idx == Some(schema_idx) {
                         self.state.db_logs = lines;
                     }
