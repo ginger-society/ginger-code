@@ -11,6 +11,8 @@ use super::bg::{
     spawn_mount,
     spawn_service_refresh,
     spawn_unmount,
+    spawn_logs_for_container,
+    spawn_container_fetch
 };
 use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
@@ -96,8 +98,12 @@ impl App {
             self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
         }
 
-        if let Some(dep) = deployment_name {
+        if let Some(dep) = deployment_name.clone() {
             spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep, generation);
+        }
+        if let Some(dep) = deployment_name {
+            spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep.clone(), generation);
+            spawn_container_fetch(self.tx.clone(), self.ctx.clone(), new_idx, dep);
         }
     }
 
@@ -335,9 +341,41 @@ impl App {
 
     // ── Drain background channel ──────────────────────────────────────────────
 
+    fn select_container(&mut self, container: Option<String>) {
+        let svc = match self.state.services.get_mut(self.state.selected_idx) {
+            Some(s) => s,
+            None    => return,
+        };
+        svc.selected_container = container.clone();
+
+        // Restart the log stream with the new container override
+        let dep = match svc.deployment_name.clone() {
+            Some(d) => d,
+            None    => return,
+        };
+        self.state.log_generation += 1;
+        let gen = self.state.log_generation;
+
+        spawn_logs_for_container(
+            self.tx.clone(),
+            self.ctx.clone(),
+            dep,
+            container,
+            gen,
+        );
+    }
+
     fn drain_bg_channel(&mut self) {
         loop {
             match self.rx.try_recv() {
+                Ok(BgMsg::Containers { svc_idx, containers }) => {
+                    if let Some(svc) = self.state.services.get_mut(svc_idx) {
+                        svc.containers = containers;
+                        // Don't auto-select — keep selected_container as None so kubectl
+                        // uses its default without the "Defaulted container" warning for
+                        // single-container pods. The chips let users override explicitly.
+                    }
+                }
                 Ok(BgMsg::Services(svcs)) => {
                     self.state.services     = svcs;
                     self.state.selected_idx = 0;
@@ -603,8 +641,14 @@ impl eframe::App for App {
                     }
 
                     match self.state.right_pane {
-                        RightPane::Logs           => draw_logs_pane(&self.state, ui),
-                        RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
+                        RightPane::Logs => {
+                            if let Some(container_action) = draw_logs_pane(&self.state, ui) {
+                                self.select_container(container_action);
+                            }
+                        }
+                        RightPane::TerminalTab(i) => {
+                            draw_terminal_pane(&mut self.state, ui, i);
+                        }
                         RightPane::PackageDetail(_) | RightPane::DbSchemaDetail(_) => {}
                     }
                 });

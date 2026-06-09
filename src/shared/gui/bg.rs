@@ -11,7 +11,7 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_logs, is_ejected}, mount, types::{DbSchema, K8sService, Package}, unmount
+    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, is_ejected}, mount, types::{DbSchema, K8sService, Package}, unmount
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -29,6 +29,8 @@ pub enum BgMsg {
     EjectResult { success: bool, message: String, idx: usize },
     /// Result of a mount or unmount operation for a package.
     MountResult { success: bool, message: String, pkg_idx: usize, mounted: bool },
+    /// Container names for a service's running pod.
+    Containers { svc_idx: usize, containers: Vec<String> },
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
@@ -129,13 +131,13 @@ pub fn spawn_service_refresh(
 
             if ejected { return; }
 
-            let lines = get_pod_logs(&deployment_name).await;
+            let lines = get_pod_logs(&deployment_name, None).await;
             let _ = tx.send(BgMsg::Logs { lines, generation });
             ctx.request_repaint();
 
             loop {
                 sleep(Duration::from_secs(2)).await;
-                let lines = get_pod_logs(&deployment_name).await;
+                let lines = get_pod_logs(&deployment_name, None).await;
                 if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
                 ctx.request_repaint();
             }
@@ -227,7 +229,7 @@ pub fn spawn_db_schema_logs(
 
         rt.block_on(async move {
             loop {
-                let lines = get_pod_logs(&slug).await;
+                let lines = get_pod_logs(&slug, None).await;
                 // get_pod_logs returns a single "No pods found" string when absent —
                 // we normalise that into our "no deployment" indicator.
                 let normalised = if lines.len() == 1
@@ -243,6 +245,47 @@ pub fn spawn_db_schema_logs(
                 }
                 ctx.request_repaint();
                 sleep(Duration::from_secs(3)).await;
+            }
+        });
+    });
+}
+
+pub fn spawn_container_fetch(
+    tx:              mpsc::Sender<BgMsg>,
+    ctx:             egui::Context,
+    svc_idx:         usize,
+    deployment_name: String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
+                let _ = tx.send(BgMsg::Containers { svc_idx, containers });
+                ctx.request_repaint();
+            }
+        });
+    });
+}
+
+pub fn spawn_logs_for_container(
+    tx:              mpsc::Sender<BgMsg>,
+    ctx:             egui::Context,
+    deployment_name: String,
+    container:       Option<String>,
+    generation:      u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            loop {
+                let lines = get_pod_logs(&deployment_name, container.as_deref()).await;
+                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
+                ctx.request_repaint();
+                sleep(Duration::from_secs(2)).await;
             }
         });
     });

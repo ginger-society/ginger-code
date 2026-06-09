@@ -76,7 +76,47 @@ pub async fn is_ejected(deployment_name: &str) -> bool {
     matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
-pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
+/// Returns (pod_name, vec_of_container_names) for the running pod of a deployment.
+/// Returns None if no running pod is found.
+pub async fn get_pod_containers(deployment_name: &str) -> Option<(String, Vec<String>)> {
+    let pod_output = tokio::process::Command::new("kubectl")
+        .args(&[
+            "get", "pods",
+            "--field-selector=status.phase=Running",
+            "--no-headers",
+            "-o", "custom-columns=NAME:.metadata.name",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let pod_name = String::from_utf8_lossy(&pod_output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .find(|l| l.trim().starts_with(deployment_name))
+        .map(|l| l.trim().to_string())?;
+
+    let container_output = tokio::process::Command::new("kubectl")
+        .args(&[
+            "get", "pod", &pod_name,
+            "-o", "jsonpath={.spec.containers[*].name}",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let containers = String::from_utf8_lossy(&container_output.stdout)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    if containers.is_empty() { None } else { Some((pod_name, containers)) }
+}
+
+/// Fetch container list for a service once — fires once per service selection.
+
+
+pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec<String> {
     let pod_output = tokio::process::Command::new("kubectl")
         .args(&[
             "get", "pods",
@@ -100,8 +140,16 @@ pub async fn get_pod_logs(deployment_name: &str) -> Vec<String> {
         return vec![format!("No pods found for deployment '{}'.", deployment_name)];
     };
 
+    let mut args = vec!["logs", "--tail=500", &pod];
+    // Only add --container when explicitly requested — avoids the
+    // "Defaulted container" warning without breaking single-container pods.
+    if let Some(c) = container {
+        args.push("--container");
+        args.push(c);
+    }
+
     match tokio::process::Command::new("kubectl")
-        .args(&["logs", "--tail=500", &pod])
+        .args(&args)
         .output()
         .await
     {

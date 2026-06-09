@@ -16,6 +16,12 @@ pub struct K8sService {
     /// Whether this deployment is currently ejected into builder mode
     pub ejected:         bool,
     pub ssh_host:        Option<String>,
+    // Container selector state
+    /// All containers in the running pod. Empty until first poll completes.
+    pub containers:           Vec<String>,
+    /// None = no override (kubectl picks default, no warning for single-container pods).
+    /// Some(name) = explicit --container flag passed to kubectl logs / exec.
+    pub selected_container:   Option<String>,
 }
 
 /// A package from the metadata service — not deployed on k8s.

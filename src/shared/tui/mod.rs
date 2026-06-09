@@ -173,7 +173,7 @@ async fn run_tui(
                         .unwrap_or((None, String::new()))
                 };
                 if let Some(dep) = dep_name {
-                    let lines = get_pod_logs(&dep).await;
+                    let lines = get_pod_logs(&dep, None).await;
                     logs.lock().unwrap().insert(meta_name, lines);
                 }
                 sleep(Duration::from_secs(2)).await;
@@ -664,7 +664,7 @@ fn maybe_start_db_poller(
                 break;
             }
 
-            let lines = get_pod_logs(&slug).await;
+            let lines = get_pod_logs(&slug, None).await;
             let result = if lines.len() == 1 && lines[0].starts_with("No pods found") {
                 Some(vec![])
             } else {
