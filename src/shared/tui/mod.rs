@@ -582,34 +582,35 @@ fn maybe_start_db_poller(
     db_log_gen:     &Arc<Mutex<u64>>,
 ) {
     if *db_log_schema == Some(idx) {
-        return; // already polling this schema, nothing to do
+        return;
     }
 
     *db_log_schema = Some(idx);
 
-    // Bump the generation — the old task will see a mismatch and exit.
     let my_gen = {
         let mut g = db_log_gen.lock().unwrap();
         *g += 1;
         *g
     };
 
-    // Reset to "loading" state immediately so the UI shows the spinner.
     *db_logs.lock().unwrap() = None;
 
+    // Use k8s_name directly — already computed during fetch_dbs_enriched
     let slug = db_schemas
         .get(idx)
-        .and_then(|s| s.identifier.clone())
-        .unwrap_or_else(|| db_schemas.get(idx).map(|s| s.name.clone()).unwrap_or_default())
-        .to_lowercase()
-        .replace('_', "-");
+        .and_then(|s| s.k8s_name.clone())
+        .unwrap_or_default();
+
+    if slug.is_empty() {
+        *db_logs.lock().unwrap() = Some(vec![]);
+        return;
+    }
 
     let db_logs_arc = Arc::clone(db_logs);
     let gen_arc     = Arc::clone(db_log_gen);
 
     tokio::spawn(async move {
         loop {
-            // Exit if a newer poller has been started.
             if *gen_arc.lock().unwrap() != my_gen {
                 break;
             }
@@ -621,7 +622,6 @@ fn maybe_start_db_poller(
                 Some(lines)
             };
 
-            // Check generation again before writing to avoid a race.
             if *gen_arc.lock().unwrap() == my_gen {
                 *db_logs_arc.lock().unwrap() = result;
             }

@@ -482,9 +482,31 @@ fn draw_sidebar(
                 Style::default().fg(Color::DarkGray)
             };
 
+            // Replace the current db schema ListItem push with:
+            let k8s_dot = match schema.k8s_status.as_str() {
+                "Running"      => "● ",
+                "Degraded"     => "◐ ",
+                "Pending"      => "○ ",
+                "Not deployed" => "· ",
+                _              => "✗ ",
+            };
+            let k8s_dot_color = match schema.k8s_status.as_str() {
+                "Running"            => Color::Green,
+                "Degraded"|"Pending" => Color::Yellow,
+                _                    => Color::DarkGray,
+            };
+
+            let dot_style = if is_sel {
+                Style::default().bg(Color::Yellow).fg(k8s_dot_color)
+            } else if is_cur {
+                Style::default().bg(Color::DarkGray).fg(k8s_dot_color)
+            } else {
+                Style::default().fg(k8s_dot_color)
+            };
+
             items.push(ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled("⬡ ", icon_style),
+                    Span::styled(k8s_dot, dot_style),
                     Span::styled(schema.name.clone(), name_style),
                     fill(is_sel, is_cur),
                 ]),
@@ -857,6 +879,21 @@ fn draw_db_schema_detail(
             ),
         ]),
     ];
+    // After the identifier/tables/org line, add:
+    info_lines.push(Line::from(vec![
+        Span::styled("k8s: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &schema.k8s_status,
+            Style::default().fg(match schema.k8s_status.as_str() {
+                "Running"            => Color::Green,
+                "Degraded"|"Pending" => Color::Yellow,
+                _                    => Color::DarkGray,
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled("ready: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&schema.k8s_ready, Style::default().fg(Color::Gray)),
+    ]));
 
     if let Some(ref desc) = schema.description {
         if !desc.is_empty() {
