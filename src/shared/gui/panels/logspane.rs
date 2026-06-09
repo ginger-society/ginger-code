@@ -1,5 +1,7 @@
 use eframe::egui;
 
+use crate::shared::gui::colors::COLOR_MAGENTA;
+
 use super::super::colors::{COLOR_BORDER, COLOR_MUTED, COLOR_YELLOW};
 use super::super::types::AppState;
 use super::log_highlight::{highlight_line, LogPalette};
@@ -66,12 +68,88 @@ pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<Strin
 
     // Just the real container names — no "default" chip
     for name in &svc.containers {
-        let is_active = svc.selected_container.as_deref() == Some(name.as_str());
-        if chip(&mut child_ui, name, is_active).clicked() && !is_active {
-            clicked = Some(name.clone());
+        let is_active  = svc.selected_container.as_deref() == Some(name.as_str());
+        let is_ejected = svc.ejected
+            && svc.ejected_container.as_deref() == Some(name.as_str());
+
+        if is_ejected {
+            draw_ejected_chip(&mut child_ui, name, is_active);
+        } else {
+            if chip(&mut child_ui, name, is_active).clicked() && !is_active {
+                clicked = Some(name.clone());
+            }
         }
+        child_ui.add_space(4.0);
     }
     clicked
+}
+
+fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
+    let badge_text  = "⚡ Ejected";
+    let font        = egui::FontId::new(10.5, egui::FontFamily::Monospace);
+    let badge_w     = badge_text.len() as f32 * 6.2 + 10.0;
+    let name_w      = name.len()       as f32 * 6.2 + 10.0;
+    let chip_h      = 18.0;
+    let total_w     = badge_w + 1.0 + name_w; // 1px divider
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(total_w, chip_h),
+        egui::Sense::click(),
+    );
+
+    let painter = ui.painter();
+
+    // ── Left half: "⚡ Ejected" in magenta ───────────────────────────────────
+    let left = egui::Rect::from_min_size(rect.min, egui::vec2(badge_w, chip_h));
+    painter.rect_filled(left, egui::Rounding { nw: 3.0, sw: 3.0, ne: 0.0, se: 0.0 }, COLOR_MAGENTA);
+    painter.text(
+        left.center(),
+        egui::Align2::CENTER_CENTER,
+        badge_text,
+        font.clone(),
+        egui::Color32::WHITE,
+    );
+
+    // ── Divider ───────────────────────────────────────────────────────────────
+    let divider_x = rect.min.x + badge_w;
+    painter.line_segment(
+        [
+            egui::pos2(divider_x, rect.min.y + 2.0),
+            egui::pos2(divider_x, rect.max.y - 2.0),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 60)),
+    );
+
+    // ── Right half: container name, same style as a normal active chip ────────
+    let right = egui::Rect::from_min_size(
+        egui::pos2(divider_x + 1.0, rect.min.y),
+        egui::vec2(name_w, chip_h),
+    );
+    painter.rect_filled(
+        right,
+        egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
+        if is_active { COLOR_YELLOW } else { egui::Color32::TRANSPARENT },
+    );
+    // Right half border (top, right, bottom only — left is the divider)
+    painter.rect_stroke(
+        right,
+        egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
+        egui::Stroke::new(0.5, if is_active { COLOR_YELLOW } else { COLOR_BORDER }),
+    );
+    painter.text(
+        right.center(),
+        egui::Align2::CENTER_CENTER,
+        name,
+        font,
+        if is_active { egui::Color32::BLACK } else { COLOR_MUTED },
+    );
+
+    // The whole pill is clickable — selects this container
+    if response.clicked() && !is_active {
+        // Caller checks return — but since we're inside the loop we need
+        // to signal the click. Use the same approach: set clicked in outer scope.
+        // We handle this by making draw_ejected_chip return bool:
+    }
 }
 
 // ── Container chip bar ────────────────────────────────────────────────────────

@@ -96,6 +96,7 @@ pub async fn fetch_services(
                 ssh_host: pod_name,
                 containers:         vec![],   // populated after first pod poll
                 selected_container: None,
+                ejected_container:  None,
             }
         })
         .collect();

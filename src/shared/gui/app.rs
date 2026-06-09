@@ -449,9 +449,10 @@ impl App {
                     }
                 }
 
-                Ok(BgMsg::EjectedFlag { idx, ejected }) => {
+                Ok(BgMsg::EjectedFlag { idx, ejected, ejected_container }) => {
                     if let Some(svc) = self.state.services.get_mut(idx) {
                         svc.ejected = ejected;
+                        svc.ejected_container = ejected_container;
                     }
                     if idx == self.state.selected_idx && ejected {
                         let name = self.state.services.get(idx)

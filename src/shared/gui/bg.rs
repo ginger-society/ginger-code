@@ -11,7 +11,7 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, is_ejected}, mount, types::{DbSchema, K8sService, Package}, unmount
+    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, is_ejected}, k8s_ops::get_deployment_annotation, mount, types::{DbSchema, K8sService, Package}, unmount
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ pub enum BgMsg {
     Packages(Vec<Package>),
     DbSchemas(Vec<DbSchema>),
     K8sStatuses(HashMap<String, (String, String)>),
-    EjectedFlag { idx: usize, ejected: bool },
+    EjectedFlag { idx: usize, ejected: bool, ejected_container: Option<String> },
     Logs { lines: Vec<String>, generation: u64 },
     /// Logs for the selected DB schema deployment (empty vec = no deployment found).
     DbSchemaLogs { lines: Vec<String>, schema_idx: usize },
@@ -126,7 +126,18 @@ pub fn spawn_service_refresh(
 
         rt.block_on(async move {
             let ejected = is_ejected(&deployment_name).await;
-            let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+
+            // Read which container was ejected from the deployment annotation
+            let ejected_container = if ejected {
+                get_deployment_annotation(
+                    &deployment_name,
+                    ".metadata.annotations['ginger-main-container']",
+                ).await
+            } else {
+                None
+            };
+
+            let _ = tx.send(BgMsg::EjectedFlag { idx, ejected, ejected_container });
             ctx.request_repaint();
 
             if ejected { return; }
@@ -158,7 +169,15 @@ pub fn spawn_bulk_ejected_check(
         rt.block_on(async move {
             for (idx, deployment_name) in services {
                 let ejected = is_ejected(&deployment_name).await;
-                let _ = tx.send(BgMsg::EjectedFlag { idx, ejected });
+                let ejected_container = if ejected {
+                    get_deployment_annotation(
+                        &deployment_name,
+                        ".metadata.annotations['ginger-main-container']",
+                    ).await
+                } else {
+                    None
+                };
+                let _ = tx.send(BgMsg::EjectedFlag { idx, ejected, ejected_container });
                 ctx.request_repaint();
             }
         });
