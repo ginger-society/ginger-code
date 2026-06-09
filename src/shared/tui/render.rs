@@ -226,7 +226,7 @@ pub fn draw(
             right_chunks[1]
         }
         SidebarItem::DbSchema(db_idx) => {
-            draw_db_schema_detail(f, chunks[1], db_schemas.get(*db_idx), db_logs, focus);
+            draw_db_schema_detail(f, chunks[1], db_schemas.get(*db_idx), db_logs, focus, scroll_offset, auto_scroll);
             right_chunks[1]
         }
         SidebarItem::Service(svc_idx) => {
@@ -828,6 +828,8 @@ fn draw_db_schema_detail(
     schema:     Option<&DbSchema>,
     db_logs:    Option<&[String]>,
     focus:      &Focus,
+    scroll_offset: usize,    
+    auto_scroll:   bool, 
 ) {
     let Some(schema) = schema else {
         f.render_widget(
@@ -972,7 +974,7 @@ fn draw_db_schema_detail(
             let num_lines  = log_text.lines().count();
             let height     = chunks[1].height.saturating_sub(2) as usize;
             let max_scroll = num_lines.saturating_sub(height);
-            let offset     = max_scroll;
+            let offset = if auto_scroll { max_scroll } else { scroll_offset.min(max_scroll) };
 
             let inner_area = Rect { width: chunks[1].width.saturating_sub(1), ..chunks[1] };
 

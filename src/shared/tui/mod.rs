@@ -49,14 +49,13 @@ pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
     session_user:    &str,
 ) {
-
     let org_id = match fetch_current_workspace(&metadata_config).await {
-                Ok(id) => id,
-                Err(e) => {
-                    eprintln!("Workspace fetch error: {e:?}");
-                    exit(1);
-                }
-             };
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Workspace fetch error: {e:?}");
+            exit(1);
+        }
+    };
 
     let packages: Vec<Package> =
         match data_source::fetch_packages(metadata_config, &org_id, "stage").await {
@@ -119,12 +118,8 @@ async fn run_tui(
     let logs:        Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
     let svc_log_idx: Arc<Mutex<usize>>           = Arc::new(Mutex::new(0));
 
-    // DB schema logs — written by a background task, read by the render loop.
-    // None = no deployment found / not yet fetched.
-    // The `u64` generation is bumped each time the user selects a different
-    // schema so the old task's writes are discarded immediately.
-    let db_logs:        Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
-    let db_log_gen:     Arc<Mutex<u64>>                 = Arc::new(Mutex::new(0));
+    let db_logs:    Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+    let db_log_gen: Arc<Mutex<u64>>                 = Arc::new(Mutex::new(0));
 
     // ── Background: k8s status + ejected flags ────────────────────────────────
     {
@@ -193,8 +188,10 @@ async fn run_tui(
     let mut scroll_offset:  usize         = 0;
     let mut popup:          Option<Popup> = None;
     let mut sidebar_scroll: usize         = 0;
-    // Which schema index the current background poller is serving.
     let mut db_log_schema:  Option<usize> = None;
+    // Tracks the last known max_scroll for db logs so the first Up keypress
+    // starts from the bottom rather than from 0.
+    let mut db_last_max_scroll: usize     = 0;
 
     loop {
         let services_snap   = services.lock().unwrap().clone();
@@ -214,8 +211,6 @@ async fn run_tui(
                 (None, false, false, false)
             };
 
-        // db_logs_opt: None while waiting for the first result from the poller,
-        // Some(slice) once the poller has written at least once.
         let db_logs_opt: Option<&[String]> = match sidebar_item {
             SidebarItem::DbSchema(i) if db_log_schema == Some(i) => {
                 db_logs_snap.as_deref()
@@ -225,15 +220,30 @@ async fn run_tui(
 
         // ── Draw ──────────────────────────────────────────────────────────────
         terminal.draw(|f| {
-            if let Some(svc) = selected_svc {
-                let log_text   = logs_snap.get(&svc.meta_name).map(|l| l.join("\n")).unwrap_or_default();
-                let max_scroll = log_text.lines().count()
-                    .saturating_sub(f.size().height.saturating_sub(10) as usize);
-                if auto_scroll {
-                    scroll_offset = max_scroll;
-                } else {
-                    scroll_offset = scroll_offset.min(max_scroll);
-                    if scroll_offset >= max_scroll { auto_scroll = true; }
+            // Only run the service log auto-scroll logic when viewing a service.
+            if let SidebarItem::Service(_) = sidebar_item {
+                if let Some(svc) = selected_svc {
+                    let log_text   = logs_snap.get(&svc.meta_name).map(|l| l.join("\n")).unwrap_or_default();
+                    let max_scroll = log_text.lines().count()
+                        .saturating_sub(f.size().height.saturating_sub(10) as usize);
+                    if auto_scroll {
+                        scroll_offset = max_scroll;
+                    } else {
+                        scroll_offset = scroll_offset.min(max_scroll);
+                        if scroll_offset >= max_scroll { auto_scroll = true; }
+                    }
+                }
+            }
+
+            // Track db log max_scroll so keyboard scrolling starts from the right position.
+            if let SidebarItem::DbSchema(_) = sidebar_item {
+                if let Some(lines) = db_logs_snap.as_deref() {
+                    let height = f.size().height.saturating_sub(10) as usize;
+                    db_last_max_scroll = lines.len().saturating_sub(height);
+                    // While auto_scroll is on, keep scroll_offset pinned to bottom.
+                    if auto_scroll {
+                        scroll_offset = db_last_max_scroll;
+                    }
                 }
             }
 
@@ -286,7 +296,8 @@ async fn run_tui(
                             match &item {
                                 SidebarItem::Service(i) => {
                                     *svc_log_idx.lock().unwrap() = *i;
-                                    auto_scroll = true;
+                                    auto_scroll   = true;
+                                    scroll_offset = 0;
                                 }
                                 SidebarItem::DbSchema(i) => {
                                     maybe_start_db_poller(
@@ -294,19 +305,31 @@ async fn run_tui(
                                         &mut db_log_schema,
                                         &db_logs, &db_log_gen,
                                     );
+                                    auto_scroll   = true;
+                                    scroll_offset = 0;
                                 }
                                 SidebarItem::Package(_) => {}
                             }
                             sidebar_item = item;
-                        } else if matches!(sidebar_item, SidebarItem::Service(_)) {
+                        } else if matches!(sidebar_item, SidebarItem::Service(_) | SidebarItem::DbSchema(_)) {
                             focus = Focus::Logs;
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        if focus == Focus::Logs { auto_scroll = false; scroll_offset = scroll_offset.saturating_sub(3); }
+                        if focus == Focus::Logs {
+                            // On first scroll up from auto_scroll, snap to bottom first.
+                            if auto_scroll {
+                                scroll_offset = db_last_max_scroll;
+                            }
+                            auto_scroll   = false;
+                            scroll_offset = scroll_offset.saturating_sub(3);
+                        }
                     }
                     MouseEventKind::ScrollDown => {
-                        if focus == Focus::Logs { scroll_offset += 3; }
+                        if focus == Focus::Logs {
+                            auto_scroll   = false;
+                            scroll_offset += 3;
+                        }
                     }
                     _ => {}
                 }
@@ -436,16 +459,25 @@ async fn run_tui(
 
                     KeyCode::Up | KeyCode::Char('k') => {
                         if focus == Focus::Logs {
+                            // If auto_scroll was on, snap scroll_offset to the
+                            // actual bottom before decrementing so the first Up
+                            // keypress feels immediate rather than doing nothing.
+                            if auto_scroll {
+                                scroll_offset = db_last_max_scroll;
+                            }
                             auto_scroll   = false;
                             scroll_offset = scroll_offset.saturating_sub(1);
                         } else {
                             let prev = sidebar_prev(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
                             if let SidebarItem::Service(i) = prev {
                                 *svc_log_idx.lock().unwrap() = i;
-                                auto_scroll = true;
+                                auto_scroll   = true;
+                                scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = prev {
                                 maybe_start_db_poller(i, &db_schemas_snap, &mut db_log_schema, &db_logs, &db_log_gen);
+                                auto_scroll   = true;
+                                scroll_offset = 0;
                             }
                             sidebar_item = prev;
                         }
@@ -459,19 +491,42 @@ async fn run_tui(
                             let next = sidebar_next(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
                             if let SidebarItem::Service(i) = next {
                                 *svc_log_idx.lock().unwrap() = i;
-                                auto_scroll = true;
+                                auto_scroll   = true;
+                                scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = next {
                                 maybe_start_db_poller(i, &db_schemas_snap, &mut db_log_schema, &db_logs, &db_log_gen);
+                                auto_scroll   = true;
+                                scroll_offset = 0;
                             }
                             sidebar_item = next;
                         }
                     }
 
-                    KeyCode::PageDown => { if focus == Focus::Logs { auto_scroll = true; } }
-                    KeyCode::PageUp   => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                    KeyCode::Char('g') => { if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; } }
-                    KeyCode::Char('G') => { if focus == Focus::Logs { auto_scroll = true; } }
+                    KeyCode::PageDown => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = true;
+                            scroll_offset = db_last_max_scroll;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = false;
+                            scroll_offset = 0;
+                        }
+                    }
+                    KeyCode::Char('g') => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = false;
+                            scroll_offset = 0;
+                        }
+                    }
+                    KeyCode::Char('G') => {
+                        if focus == Focus::Logs {
+                            auto_scroll   = true;
+                            scroll_offset = db_last_max_scroll;
+                        }
+                    }
 
                     KeyCode::Char('m') => {
                         if let SidebarItem::Package(pkg_i) = sidebar_item {
@@ -569,11 +624,6 @@ async fn run_tui(
    DB SCHEMA LOG POLLER
    ================================================================ */
 
-/// Spawn a background task that polls `kubectl logs` for the schema at `idx`
-/// every 3 seconds and writes results into `db_logs`.
-///
-/// A generation counter ensures that if the user navigates away and back,
-/// the old task's stale writes are silently dropped.
 fn maybe_start_db_poller(
     idx:            usize,
     db_schemas:     &[DbSchema],
@@ -595,7 +645,6 @@ fn maybe_start_db_poller(
 
     *db_logs.lock().unwrap() = None;
 
-    // Use k8s_name directly — already computed during fetch_dbs_enriched
     let slug = db_schemas
         .get(idx)
         .and_then(|s| s.k8s_name.clone())
