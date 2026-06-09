@@ -6,15 +6,9 @@ use super::log_highlight::{highlight_line, LogPalette};
 
 /// Returns Some(Some(name)) to switch to a container, Some(None) to reset to default.
 /// Returns None if no chip was clicked.
-pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) -> Option<Option<String>> {
-    let Some(svc) = state.services.get(state.selected_idx) else { return None; };
-
-    let mut action = None;
-
-    // ── Container selector (only when multiple containers exist) ──────────────
-    if svc.containers.len() > 1 {
-        action = draw_container_chips(&svc.containers, svc.selected_container.as_deref(), ui);
-    }
+// logspane.rs — draw_logs_pane no longer handles chips, just logs
+pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
+    let Some(_svc) = state.services.get(state.selected_idx) else { return; };
 
     let font_size = state.font_size;
     let palette   = LogPalette::from_monokai();
@@ -41,58 +35,52 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) -> Option<Option<Stri
                 ui.label(job);
             }
         });
-
-    action
 }
 
-// ── Container chip bar ────────────────────────────────────────────────────────
+/// Returns Some(Some(name)) to switch container, Some(None) to reset to default, None if no click.
+/// Only renders anything when the service has more than one container.
+pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<Option<String>> {
+    let svc = state.services.get(state.selected_idx)?;
+    if svc.containers.len() <= 1 { return None; }
 
-fn draw_container_chips(
-    containers:         &[String],
-    selected_container: Option<&str>,
-    ui:                 &mut egui::Ui,
-) -> Option<Option<String>> {
     let mut clicked = None;
 
     let (bar_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 26.0),
+        egui::vec2(ui.available_width(), 28.0),
         egui::Sense::hover(),
     );
-    ui.painter().rect_filled(
-        bar_rect,
-        0.0,
-        egui::Color32::from_rgb(22, 22, 22),
-    );
+    ui.painter().rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(22, 22, 22));
     ui.painter().line_segment(
         [bar_rect.left_bottom(), bar_rect.right_bottom()],
         egui::Stroke::new(0.5, COLOR_BORDER),
     );
 
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("container:")
-                .font(egui::FontId::new(10.5, egui::FontFamily::Monospace))
-                .color(COLOR_MUTED),
-        );
-        ui.add_space(6.0);
+    // Re-enter layout inside the allocated rect
+    let mut child_ui = ui.child_ui(bar_rect, egui::Layout::left_to_right(egui::Align::Center));
+    child_ui.add_space(8.0);
+    child_ui.label(
+        egui::RichText::new("container:")
+            .font(egui::FontId::new(10.5, egui::FontFamily::Monospace))
+            .color(COLOR_MUTED),
+    );
+    child_ui.add_space(6.0);
 
-        // "default" chip — clears the override
-        let default_active = selected_container.is_none();
-        if chip(ui, "default", default_active).clicked() && !default_active {
-            clicked = Some(None);
+    let default_active = svc.selected_container.is_none();
+    if chip(&mut child_ui, "default", default_active).clicked() && !default_active {
+        clicked = Some(None);
+    }
+    for name in &svc.containers {
+        let is_active = svc.selected_container.as_deref() == Some(name.as_str());
+        if chip(&mut child_ui, name, is_active).clicked() && !is_active {
+            clicked = Some(Some(name.clone()));
         }
-
-        for name in containers {
-            let is_active = selected_container == Some(name.as_str());
-            if chip(ui, name, is_active).clicked() && !is_active {
-                clicked = Some(Some(name.clone()));
-            }
-        }
-    });
+    }
 
     clicked
 }
+
+// ── Container chip bar ────────────────────────────────────────────────────────
+
 
 fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let text = egui::RichText::new(label)

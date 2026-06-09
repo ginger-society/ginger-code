@@ -24,6 +24,7 @@ use super::terminal::{spawn_kubectl, TermPerformer};
 use super::types::{AppState, RightPane, TermState};
 use crate::shared::core::eject::{eject, uneject};
 use crate::shared::core::image::pkg_to_slug;
+use crate::shared::gui::panels::draw_container_chips;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -333,7 +334,12 @@ impl App {
             }
         };
 
-        match spawn_kubectl(&dep_name, rows, cols, performer, ctx.clone()) {
+        // Pass selected container through to kubectl exec
+        let container = self.state.services
+            .get(svc_idx)
+            .and_then(|s| s.selected_container.clone());
+
+        match spawn_kubectl(&dep_name, rows, cols, performer, ctx.clone(), container) {
             Ok(session) => self.state.term_tabs[tab_idx].state = TermState::Connected(session),
             Err(e)      => self.state.term_tabs[tab_idx].state = TermState::Error(e.to_string()),
         }
@@ -342,26 +348,23 @@ impl App {
     // ── Drain background channel ──────────────────────────────────────────────
 
     fn select_container(&mut self, container: Option<String>) {
-        let svc = match self.state.services.get_mut(self.state.selected_idx) {
-            Some(s) => s,
-            None    => return,
-        };
-        svc.selected_container = container.clone();
+        let idx = self.state.selected_idx;
+        if let Some(svc) = self.state.services.get_mut(idx) {
+            svc.selected_container = container.clone();
+        }
 
-        // Restart the log stream with the new container override
-        let dep = match svc.deployment_name.clone() {
+        // Only restart the log stream — terminals are unaffected
+        let dep = match self.state.services.get(idx)
+            .and_then(|s| s.deployment_name.clone())
+        {
             Some(d) => d,
             None    => return,
         };
         self.state.log_generation += 1;
         let gen = self.state.log_generation;
-
         spawn_logs_for_container(
-            self.tx.clone(),
-            self.ctx.clone(),
-            dep,
-            container,
-            gen,
+            self.tx.clone(), self.ctx.clone(),
+            dep, container, gen,
         );
     }
 
@@ -624,10 +627,14 @@ impl eframe::App for App {
 
                 ui.vertical(|ui| {
                     let strip_action = draw_info_strip(&self.state, self.ejecting.as_deref(), ui);
-
                     if strip_action.eject_clicked       { self.run_eject(ctx); }
                     if strip_action.uneject_clicked     { self.run_uneject(ctx); }
                     if strip_action.open_editor_clicked { self.open_editor(); }
+
+                    // Container chip bar — above tabs so both logs and terminal inherit it
+                    if let Some(container_action) = draw_container_chips(&self.state, ui) {
+                        self.select_container(container_action);
+                    }
 
                     match draw_tab_bar(&self.state, ui) {
                         Some(TabBarAction::SwitchToLogs)    => self.state.right_pane = RightPane::Logs,
@@ -641,14 +648,8 @@ impl eframe::App for App {
                     }
 
                     match self.state.right_pane {
-                        RightPane::Logs => {
-                            if let Some(container_action) = draw_logs_pane(&self.state, ui) {
-                                self.select_container(container_action);
-                            }
-                        }
-                        RightPane::TerminalTab(i) => {
-                            draw_terminal_pane(&mut self.state, ui, i);
-                        }
+                        RightPane::Logs           => draw_logs_pane(&self.state, ui),
+                        RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
                         RightPane::PackageDetail(_) | RightPane::DbSchemaDetail(_) => {}
                     }
                 });

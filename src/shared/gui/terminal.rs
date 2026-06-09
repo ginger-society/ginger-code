@@ -372,9 +372,9 @@ pub fn spawn_kubectl(
     cols:      u16,
     performer: Arc<Mutex<TermPerformer>>,
     ctx:       egui::Context,
+    container: Option<String>,
 ) -> Result<SshSession, Box<dyn std::error::Error>> {
 
-    // ── Find the first running pod matching the deployment prefix ─────────────
     let pod_output = std::process::Command::new("kubectl")
         .args([
             "get", "pods",
@@ -392,7 +392,6 @@ pub fn spawn_kubectl(
         .ok_or_else(|| format!("No running pod found with prefix '{}'", prefix))?
         .to_string();
 
-    // ── Open a local PTY ──────────────────────────────────────────────────────
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
@@ -401,23 +400,6 @@ pub fn spawn_kubectl(
         pixel_height: 0,
     })?;
 
-    // ── Build the kubectl exec command ────────────────────────────────────────
-    //
-    // Core problem: `kubectl exec -i` connects stdin/stdout as plain pipes.
-    // Inside the pod there is no real TTY, so:
-    //   • stty fails silently (ENOTTY — can't ioctl a pipe)
-    //   • the kernel keeps stdin in canonical/line-buffered mode
-    //   • nano/htop/vim receive keypresses only after Enter
-    //
-    // Fix: use `script -q -c '...' /dev/null` as a PTY wrapper.
-    // `script` allocates a real pseudo-TTY inside the pod and execs the
-    // shell inside it.  Everything that follows now has a real tty:
-    //   • stty / TIOCSWINSZ work correctly
-    //   • the kernel switches to raw mode for interactive apps
-    //   • SIGWINCH is delivered on resize
-    //
-    // We inline the size + env setup into the -c command so the very first
-    // prompt already knows the correct dimensions — no deferred init needed.
     let shell_cmd = format!(
         "export COLUMNS={cols} LINES={rows} TERM=xterm-256color PYTHONDONTWRITEBYTECODE=1; \
          stty rows {rows} cols {cols}; \
@@ -426,12 +408,16 @@ pub fn spawn_kubectl(
         rows = rows,
     );
 
+    // Use the selected container if provided, otherwise fall back to the
+    // deployment prefix (existing single-container behaviour).
+    let container_name = container.as_deref().unwrap_or(&prefix);
+
     let mut cmd = CommandBuilder::new("kubectl");
     cmd.arg("exec");
     cmd.arg("-i");
     cmd.arg(&pod_name);
-    cmd.arg("-c");
-    cmd.arg(&prefix);
+    cmd.arg("--container");
+    cmd.arg(container_name);
     cmd.arg("--");
     cmd.arg("script");
     cmd.arg("-q");
@@ -439,16 +425,12 @@ pub fn spawn_kubectl(
     cmd.arg(&shell_cmd);
     cmd.arg("/dev/null");
 
-    // ── Spawn inside the PTY slave ────────────────────────────────────────────
     let _child     = pair.slave.spawn_command(cmd)?;
     let writer     = pair.master.take_writer()?;
     let mut reader = pair.master.try_clone_reader()?;
 
-    // No deferred init thread needed — size and shell mode are configured
-    // inside shell_cmd before `sh -i` starts.
     let writer_arc = Arc::new(Mutex::new(writer));
 
-    // ── Background reader thread → VTE parser ────────────────────────────────
     thread::spawn(move || {
         let mut parser = vte::Parser::new();
         let mut buf    = [0u8; 4096];

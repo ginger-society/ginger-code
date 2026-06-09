@@ -14,7 +14,7 @@ pub mod dbschemadetail;
 mod log_highlight;
 
 pub use infostrip::{draw_info_strip, InfoStripAction};
-pub use logspane::draw_logs_pane;
+pub use logspane::{draw_logs_pane, draw_container_chips};
 pub use packagedetail::{draw_package_detail, PackageDetailAction};
 pub use sidebar::draw_service_list;
 pub use statusbar::draw_statusbar;
