@@ -134,19 +134,35 @@ impl AppState {
         }
     }
 
-    pub fn open_term_tab(&mut self, rows: usize, cols: usize) -> Option<usize> {
-        if self.term_tabs.len() >= MAX_TERM_TABS {
-            return None;
-        }
-        let svc   = &self.services[self.selected_idx];
-        let n     = self.term_tabs.iter()
-            .filter(|t| t.service_idx == self.selected_idx)
-            .count() + 1;
-        let short = svc.meta_name.split('/').last().unwrap_or(&svc.meta_name);
-        let label = if n == 1 { short.to_string() } else { format!("{} #{}", short, n) };
-
-        self.term_tabs.push(TermTab::new(label, self.selected_idx, rows, cols));
+    // Replace open_term_tab with open_term_tab_with_label:
+    pub fn open_term_tab_with_label(
+        &mut self,
+        rows:  usize,
+        cols:  usize,
+        label: String,
+    ) -> Option<usize> {
+        if self.term_tabs.len() >= MAX_TERM_TABS { return None; }
+        let svc_idx = self.selected_idx;
+        self.term_tabs.push(TermTab {
+            label,
+            service_idx:  svc_idx,
+            term_rows:    rows,
+            term_cols:    cols,
+            state:        TermState::Idle,
+            performer:    Arc::new(Mutex::new(TermPerformer::new(rows, cols))),
+            scrollback:   vec![],
+            scrollback_arc: None,
+            scroll_offset: 0,
+            sel_start:    None,
+            sel_end:      None,
+            dragging:     false,
+        });
         Some(self.term_tabs.len() - 1)
+    }
+
+    pub fn open_term_tab(&mut self, rows: usize, cols: usize) -> Option<usize> {
+        let label = "terminal".to_string();
+        self.open_term_tab_with_label(rows, cols, label)
     }
 
     pub fn close_term_tab(&mut self, idx: usize) {

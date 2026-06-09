@@ -286,7 +286,19 @@ impl App {
     // ── Terminal helpers ──────────────────────────────────────────────────────
 
     fn open_and_connect_term(&mut self, ctx: &egui::Context) {
-        let tab_idx = match self.state.open_term_tab(24, 80) {
+        // The label should be the selected container name, falling back to
+        // the deployment name if no container is selected yet
+        let label = self.state.services
+            .get(self.state.selected_idx)
+            .map(|svc| {
+                svc.selected_container
+                    .clone()
+                    .or_else(|| svc.deployment_name.clone())
+                    .unwrap_or_else(|| "terminal".to_string())
+            })
+            .unwrap_or_else(|| "terminal".to_string());
+
+        let tab_idx = match self.state.open_term_tab_with_label(24, 80, label) {
             Some(i) => i,
             None    => return,
         };
