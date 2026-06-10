@@ -54,6 +54,8 @@ enum TuiMsg {
     DbLogs { lines: Vec<String>, generation: u64 },
     /// Container list resolved for `svc_idx`.
     Containers { svc_idx: usize, containers: Vec<String> },
+    /// Container list resolved for a DB schema.
+    DbContainers { schema_idx: usize, containers: Vec<String> },
 }
 
 /* ================================================================
@@ -191,6 +193,24 @@ fn spawn_container_fetch(
         rt.block_on(async move {
             if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
                 let _ = tx.send(TuiMsg::Containers { svc_idx, containers });
+            }
+        });
+    });
+}
+
+fn spawn_db_container_fetch(
+    tx:         std::sync::mpsc::Sender<TuiMsg>,
+    slug:       String,
+    schema_idx: usize,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&slug).await {
+                let _ = tx.send(TuiMsg::DbContainers { schema_idx, containers });
             }
         });
     });
@@ -438,8 +458,70 @@ async fn run_tui(
                                 }
                             }
                         }
+                    } else {
+                        // Non-ejected service: if no container selected yet,
+                        // default to the first container and (re)start the stream.
+                        if !container_selection.contains_key(&svc_idx) {
+                            if let Some(first) = containers.first() {
+                                container_selection.insert(svc_idx, 0);
+
+                                let is_active = matches!(sidebar_item, SidebarItem::Service(i) if i == svc_idx);
+                                if is_active {
+                                    let dep = {
+                                        let svcs = services.lock().unwrap();
+                                        svcs.get(svc_idx)
+                                            .and_then(|s| s.deployment_name.clone())
+                                    };
+                                    if let Some(dep) = dep {
+                                        {
+                                            let svcs = services.lock().unwrap();
+                                            if let Some(svc) = svcs.get(svc_idx) {
+                                                logs.lock().unwrap().remove(&svc.meta_name);
+                                            }
+                                        }
+                                        svc_log_generation += 1;
+                                        spawn_service_log_stream(
+                                            bg_tx.clone(),
+                                            dep,
+                                            Some(first.clone()),
+                                            svc_log_generation,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+
+                // ── DB container list resolved ────────────────────────────────
+                Ok(TuiMsg::DbContainers { schema_idx, containers }) => {
+                    // Only act if this is still the schema we're viewing.
+                    if db_log_schema == Some(schema_idx) {
+                        // Pick the first container and restart the log stream
+                        // with it so the API receives a concrete container name.
+                        if let Some(first_container) = containers.first().cloned() {
+                            db_log_generation += 1;
+                            *db_logs.lock().unwrap() = None; // clear stale "looking…" state
+
+                            let slug = db_schemas
+                                .lock()
+                                .unwrap()
+                                .get(schema_idx)
+                                .and_then(|s| s.k8s_name.clone())
+                                .unwrap_or_default();
+
+                            if !slug.is_empty() {
+                                spawn_db_log_stream(
+                                    bg_tx.clone(),
+                                    slug,
+                                    Some(first_container),
+                                    db_log_generation,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 Err(_) => break,
             }
         }
@@ -1120,7 +1202,29 @@ fn switch_service_logs(
     let Some(dep) = svc.deployment_name.clone() else { return };
 
     let container_idx = *container_selection.get(&svc_i).unwrap_or(&0);
-    let container     = svc.containers.get(container_idx).cloned();
+
+    // If the service is ejected and we haven't resolved a non-ejected container
+    // yet (containers list is empty), don't start a log stream — just fetch
+    // the container list. The Containers message handler will start the stream.
+    if svc.ejected && svc.containers.is_empty() {
+        spawn_container_fetch(bg_tx.clone(), dep, svc_i);
+        return;
+    }
+
+    // For an ejected service, only stream if the selected container is NOT
+    // the ejected one.
+    let container = svc.containers.get(container_idx).cloned();
+    let is_ejected_container = svc.ejected
+        && svc.ejected_container.as_deref() == container.as_deref();
+
+    if is_ejected_container {
+        // Clear any stale logs so the render layer shows the dev-mode splash.
+        logs.lock().unwrap().remove(&svc.meta_name);
+        if svc.containers.is_empty() {
+            spawn_container_fetch(bg_tx.clone(), dep, svc_i);
+        }
+        return;
+    }
 
     *svc_log_generation += 1;
     spawn_service_log_stream(
@@ -1165,6 +1269,16 @@ fn maybe_start_db_stream(
         return;
     }
 
+    // Start a container fetch first — the DbContainers message handler will
+    // start the actual log stream once we know a real container name.
+    // This mirrors the GUI's spawn_db_container_fetch → BgMsg::DbContainers
+    // → spawn_db_schema_logs flow.
+    spawn_db_container_fetch(bg_tx.clone(), slug.clone(), idx);
+
+    // Also kick off an initial log stream without a container name as a
+    // fallback, in case the pod has only one (unnamed) container.  The
+    // DbContainers handler will bump db_log_generation and restart it with
+    // the real name moments later, so this fallback stream will be discarded.
     spawn_db_log_stream(bg_tx.clone(), slug, None, *db_log_generation);
 }
 
