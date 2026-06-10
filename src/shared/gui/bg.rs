@@ -32,6 +32,7 @@ pub enum BgMsg {
     /// Container names for a service's running pod.
     Containers { svc_idx: usize, containers: Vec<String> },
     TransitioningSet(std::collections::HashSet<String>),
+    DbContainers { schema_idx: usize, containers: Vec<String> },
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
@@ -244,6 +245,7 @@ pub fn spawn_db_schema_logs(
     ctx:        egui::Context,
     schema_idx: usize,
     slug:       String,
+    container:  Option<String>,    // ← new
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -251,9 +253,7 @@ pub fn spawn_db_schema_logs(
 
         rt.block_on(async move {
             loop {
-                let lines = get_pod_logs(&slug, None).await;
-                // get_pod_logs returns a single "No pods found" string when absent —
-                // we normalise that into our "no deployment" indicator.
+                let lines = get_pod_logs(&slug, container.as_deref()).await;
                 let normalised = if lines.len() == 1
                     && (lines[0].starts_with("No pods found") || lines[0].starts_with("No pods found for deployment"))
                 {
@@ -267,6 +267,25 @@ pub fn spawn_db_schema_logs(
                 }
                 ctx.request_repaint();
                 sleep(Duration::from_secs(3)).await;
+            }
+        });
+    });
+}
+
+pub fn spawn_db_container_fetch(
+    tx:         mpsc::Sender<BgMsg>,
+    ctx:        egui::Context,
+    schema_idx: usize,
+    slug:       String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&slug).await {
+                let _ = tx.send(BgMsg::DbContainers { schema_idx, containers });
+                ctx.request_repaint();
             }
         });
     });

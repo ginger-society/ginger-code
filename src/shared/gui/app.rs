@@ -12,7 +12,8 @@ use super::bg::{
     spawn_service_refresh,
     spawn_unmount,
     spawn_logs_for_container,
-    spawn_container_fetch
+    spawn_container_fetch,
+    spawn_db_container_fetch
 };
 use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
@@ -116,11 +117,15 @@ impl App {
         self.state.right_pane = RightPane::PackageDetail(pkg_idx);
     }
 
+
+
     // ── DB schema selection ───────────────────────────────────────────────────
 
     fn select_db_schema(&mut self, schema_idx: usize) {
-        self.state.right_pane = RightPane::DbSchemaDetail(schema_idx);
-        self.state.db_logs    = vec![];
+        self.state.right_pane  = RightPane::DbSchemaDetail(schema_idx);
+        self.state.db_logs     = vec![];
+        self.state.db_containers        = vec![];     // ← reset
+        self.state.db_selected_container = None;      // ← reset
 
         if self.db_log_schema_idx == Some(schema_idx) {
             return;
@@ -134,10 +139,36 @@ impl App {
             .unwrap_or_default();
 
         spawn_db_schema_logs(
-            self.tx.clone(),
-            self.ctx.clone(),
-            schema_idx,
-            slug,
+            self.tx.clone(), self.ctx.clone(),
+            schema_idx, slug.clone(),
+            None,    // ← no container override initially
+        );
+
+        // Fetch containers for the tab bar
+        if !slug.is_empty() {
+            spawn_db_container_fetch(
+                self.tx.clone(), self.ctx.clone(),
+                schema_idx, slug,
+            );
+        }
+    }
+
+    fn select_db_container(&mut self, schema_idx: usize, container: String) {
+        self.state.db_selected_container = Some(container.clone());
+        self.state.db_logs = vec![];
+
+        self.db_log_schema_idx  = None;
+        self.db_log_pending_idx = Some(schema_idx);
+
+        let slug = self.state.db_schemas
+            .get(schema_idx)
+            .and_then(|s| s.k8s_name.clone())
+            .unwrap_or_default();
+
+        spawn_db_schema_logs(
+            self.tx.clone(), self.ctx.clone(),
+            schema_idx, slug,
+            Some(container),
         );
     }
 
@@ -413,7 +444,30 @@ impl App {
     fn drain_bg_channel(&mut self) {
         loop {
             match self.rx.try_recv() {
+                Ok(BgMsg::DbContainers { schema_idx, containers }) => {
+                    // Only apply if this is still the active schema
+                    if matches!(self.state.right_pane, RightPane::DbSchemaDetail(i) if i == schema_idx) {
+                        self.state.db_selected_container = containers.first().cloned();
+                        self.state.db_containers = containers;
 
+                        // Restart log poller with the now-known first container
+                        if let Some(container) = self.state.db_selected_container.clone() {
+                            self.db_log_schema_idx  = None;
+                            self.db_log_pending_idx = Some(schema_idx);
+
+                            let slug = self.state.db_schemas
+                                .get(schema_idx)
+                                .and_then(|s| s.k8s_name.clone())
+                                .unwrap_or_default();
+
+                            spawn_db_schema_logs(
+                                self.tx.clone(), self.ctx.clone(),
+                                schema_idx, slug,
+                                Some(container),
+                            );
+                        }
+                    }
+                }
                 Ok(BgMsg::TransitioningSet(set)) => {
                     for svc in &mut self.state.services {
                         if let Some(ref dep) = svc.deployment_name {
@@ -704,7 +758,16 @@ impl eframe::App for App {
                         } else {
                             None
                         };
-                        draw_db_schema_detail(&schema, logs_opt, ui);
+
+                        // Pass container state into the detail panel
+                        let containers        = self.state.db_containers.clone();
+                        let selected_container = self.state.db_selected_container.clone();
+
+                        if let Some(container) = draw_db_schema_detail(
+                            &schema, logs_opt, &containers, selected_container.as_deref(), ui,
+                        ) {
+                            self.select_db_container(idx, container);
+                        }
                     }
                     return;
                 }

@@ -99,6 +99,8 @@ pub struct AppState {
     pub logs:            Vec<String>,
     /// Live logs for the currently selected DB schema deployment (if any).
     pub db_logs:         Vec<String>,
+    pub db_containers:        Vec<String>,        
+    pub db_selected_container: Option<String>,
     pub term_tabs:       Vec<TermTab>,
     pub tabs_by_service: HashMap<usize, Vec<TermTab>>,
     pub active_term:     usize,
@@ -131,6 +133,8 @@ impl AppState {
             blink:           true,
             blink_timer:     0.0,
             raised_on_open:  false,
+            db_containers:         Vec::new(),    
+            db_selected_container: None,   
         }
     }
 
