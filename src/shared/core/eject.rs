@@ -20,7 +20,9 @@
 //! which keeps single-container deployments working with zero config.
 
 use std::fs;
-
+use k8s_openapi::api::apps::v1::Deployment;
+use kube::api::{Patch, PatchParams, PostParams};
+use kube::{Api, Client};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::shared::core::{
@@ -30,8 +32,7 @@ use crate::shared::core::{
     },
     image::{builder_image, meta_to_repo_name, supports_ssh},
     k8s_ops::{
-        apply_pvc, get_deployment_annotation, is_workspace_empty, wait_for_pod_scheduled,
-        write_ssh_principal,
+        apply_pvc, get_deployment_annotation, is_workspace_empty, wait_for_pod_ready, wait_for_pod_scheduled, write_ssh_principal
     },
     port::find_free_22xx_port,
     ssh_config::{add_source_ssh_config, add_ssh_config, remove_ssh_config},
@@ -269,18 +270,17 @@ pub async fn eject(
         }
     });
 
-    let status = tokio::process::Command::new("kubectl")
-        .args([
-            "patch", "deployment", deployment_name,
-            "--type", "strategic",
-            "-p", &patch.to_string(),
-        ])
-        .status()
-        .await?;
+    let client = Client::try_default().await.expect("kube client");
+    let api: Api<Deployment> = Api::default_namespaced(client);
 
-    if !status.success() {
-        return Err(format!("kubectl patch failed for {}", deployment_name).into());
-    }
+    api.patch(
+        deployment_name,
+        &PatchParams::apply("ginger-code").force(),
+        &Patch::Strategic(patch),   // `patch` is already the serde_json::Value you built
+    )
+    .await
+    .map_err(|e| format!("patch failed for {}: {}", deployment_name, e))?;
+
     println!("✓ Patched {} → {} (branch: {})", deployment_name, image, branch);
 
     if ssh {
@@ -293,13 +293,8 @@ pub async fn eject(
 
         let final_pod = wait_for_pod_scheduled(deployment_name).await?;
 
-        tokio::process::Command::new("kubectl")
-            .args([
-                "wait", &format!("pod/{}", final_pod),
-                "--for=condition=Ready", "--timeout=300s",
-            ])
-            .status()
-            .await?;
+        wait_for_pod_ready(&final_pod).await?;
+        
         println!("✓ Pod ready: {}", final_pod);
 
         write_ssh_principal(&final_pod, &main_container, &session_user).await?;
@@ -423,18 +418,17 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
         }
     });
 
-    let status = tokio::process::Command::new("kubectl")
-        .args([
-            "patch", "deployment", deployment_name,
-            "--type", "strategic",
-            "-p", &patch.to_string(),
-        ])
-        .status()
-        .await?;
+    let client = Client::try_default().await.expect("kube client");
+    let api: Api<Deployment> = Api::default_namespaced(client);
 
-    if !status.success() {
-        return Err(format!("kubectl patch failed for {}", deployment_name).into());
-    }
+    api.patch(
+        deployment_name,
+        &PatchParams::apply("ginger-code").force(),
+        &Patch::Strategic(patch),   // `patch` is already the serde_json::Value you built
+    )
+    .await
+    .map_err(|e| format!("patch failed for {}: {}", deployment_name, e))?;
+
     println!("✓ Unejected {} → restored {}", deployment_name, original_image);
 
     if let Err(e) = remove_from_branch_config(deployment_name) {

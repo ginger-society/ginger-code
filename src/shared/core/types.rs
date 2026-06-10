@@ -19,7 +19,7 @@ pub struct K8sService {
     // Container selector state
     /// All containers in the running pod. Empty until first poll completes.
     pub containers:           Vec<String>,
-    /// None = no override (kubectl picks default, no warning for single-container pods).
+    /// None = no override
     /// Some(name) = explicit --container flag passed to kubectl logs / exec.
     pub selected_container:   Option<String>,
     pub ejected_container:    Option<String>,

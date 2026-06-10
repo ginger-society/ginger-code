@@ -1,55 +1,33 @@
+use crate::shared::core::k8s_exec::{exec_in_pod, sh_exec, sh_output};
+
 // ── Git binary discovery ──────────────────────────────────────────────────────
 
 pub async fn find_git_in_pod(pod_name: &str, container: &str) -> String {
-    let probe = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
-            pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            "command -v git 2>/dev/null || \
-             find /usr/local/bin /usr/bin /nix/var/nix/profiles/default/bin \
-                  /home/dev/.nix-profile/bin /root/.nix-profile/bin \
-                  -name git -type f 2>/dev/null | head -1",
-        ])
-        .output()
-        .await;
+    let cmd = "command -v git 2>/dev/null || \
+               find /usr/local/bin /usr/bin /nix/var/nix/profiles/default/bin \
+                    /home/dev/.nix-profile/bin /root/.nix-profile/bin \
+                    -name git -type f 2>/dev/null | head -1";
 
-    match probe {
-        Ok(out) => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if path.is_empty() { "git".to_string() } else { path }
-        }
-        Err(_) => "git".to_string(),
-    }
+    sh_output(pod_name, container, cmd)
+        .await
+        .unwrap_or_else(|| "git".to_string())
 }
 
-// ── SSH config inside the pod (for git push) ──────────────────────────────────
+// ── SSH config inside the pod ─────────────────────────────────────────────────
 
-/// Write a permanent `/home/dev/.ssh/config` that points `source` at
-/// `source.gingersociety.org:3333`.  Idempotent — safe to call on every eject/mount.
 pub async fn write_pod_ssh_config(
     pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let setup = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
-            pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            "mkdir -p /home/dev/.ssh && chmod 700 /home/dev/.ssh && chown dev:dev /home/dev/.ssh",
-        ])
-        .status()
-        .await?;
+    let setup_cmd = "mkdir -p /home/dev/.ssh && \
+                     chmod 700 /home/dev/.ssh && \
+                     chown dev:dev /home/dev/.ssh";
 
-    if !setup.success() {
+    let ok = sh_exec(pod_name, container, setup_cmd)
+        .await
+        .map_err(|e| format!("Failed to create /home/dev/.ssh in pod: {e}"))?;
+
+    if !ok {
         return Err("Failed to create /home/dev/.ssh in pod".into());
     }
 
@@ -60,26 +38,19 @@ pub async fn write_pod_ssh_config(
          StrictHostKeyChecking no\n\
          UserKnownHostsFile /dev/null\n";
 
-    let write = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
-            pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            &format!(
-                "printf '%s' '{}' > /home/dev/.ssh/config && \
-                 chmod 600 /home/dev/.ssh/config && \
-                 chown dev:dev /home/dev/.ssh/config",
-                pod_ssh_config
-            ),
-        ])
-        .status()
-        .await?;
+    // Use printf to write the config — avoids heredoc quoting issues via exec.
+    let write_cmd = format!(
+        "printf '%s' '{}' > /home/dev/.ssh/config && \
+         chmod 600 /home/dev/.ssh/config && \
+         chown dev:dev /home/dev/.ssh/config",
+        pod_ssh_config
+    );
 
-    if write.success() {
+    let ok = sh_exec(pod_name, container, &write_cmd)
+        .await
+        .map_err(|e| format!("Failed to write SSH config into pod: {e}"))?;
+
+    if ok {
         println!("  ✓ Permanent git SSH config written into pod (/home/dev/.ssh/config)");
     } else {
         eprintln!("  Warning: failed to write SSH config into pod");
@@ -90,28 +61,31 @@ pub async fn write_pod_ssh_config(
 // ── Temporary key copy / cleanup ──────────────────────────────────────────────
 
 /// Copy `~/.ssh/id_ed25519{,.pub,-cert.pub}` into the pod for the initial clone.
+/// Uses `exec_in_pod` with stdin to stream file bytes directly — no `kubectl cp`.
 pub async fn copy_ssh_keys_to_dev(
     pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::{Api, Client};
+    use kube::api::AttachParams;
+    use tokio::io::AsyncWriteExt;
+
+    let client = Client::try_default().await.expect("kube client");
+    let api: Api<Pod> = Api::default_namespaced(client);
+
     let home    = dirs::home_dir().ok_or("Could not locate home directory")?;
     let ssh_dir = home.join(".ssh");
 
-    let mkdir = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
-            pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            "mkdir -p /home/dev/.ssh && chmod 700 /home/dev/.ssh && chown dev:dev /home/dev/.ssh",
-        ])
-        .status()
-        .await?;
+    // Ensure target dir exists first
+    let ok = sh_exec(
+        pod_name, container,
+        "mkdir -p /home/dev/.ssh && chmod 700 /home/dev/.ssh && chown dev:dev /home/dev/.ssh",
+    )
+    .await
+    .map_err(|e| format!("Failed to create /home/dev/.ssh: {e}"))?;
 
-    if !mkdir.success() {
+    if !ok {
         return Err("Failed to create /home/dev/.ssh in pod".into());
     }
 
@@ -128,64 +102,66 @@ pub async fn copy_ssh_keys_to_dev(
             continue;
         }
 
-        let cp = tokio::process::Command::new("kubectl")
-            .args([
-                "cp",
-                local.to_str().unwrap(),
-                &format!("{}:{}", pod_name, remote_path),
-                "-c",
-                container,
-            ])
-            .status()
-            .await?;
+        let contents = std::fs::read(&local)?;
 
-        if !cp.success() {
-            eprintln!("  Warning: failed to copy {} into pod", filename);
-            continue;
+        // Stream file bytes into the pod via stdin of `tee`
+        let ap = AttachParams {
+            container: Some(container.to_string()),
+            stdin:     true,
+            stdout:    false,
+            stderr:    false,
+            tty:       false,
+            ..Default::default()
+        };
+
+        let write_cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat > {remote_path}"),
+        ];
+
+        let mut attached = api.exec(pod_name, write_cmd, &ap).await
+            .map_err(|e| format!("exec failed for {filename}: {e}"))?;
+
+        if let Some(mut stdin) = attached.stdin() {
+            stdin.write_all(&contents).await?;
+            // Drop stdin to signal EOF to the cat process
         }
 
-        tokio::process::Command::new("kubectl")
-            .args([
-                "exec",
-                pod_name,
-                "-c",
-                container,
-                "--",
-                "sh",
-                "-c",
-                &format!("chmod {perms} {remote_path} && chown dev:dev {remote_path}"),
-            ])
-            .status()
-            .await?;
+        // Wait for completion
+        if let Some(status) = attached.take_status() {
+            status.await;
+        }
+
+        // Fix permissions and ownership
+        sh_exec(
+            pod_name, container,
+            &format!("chmod {perms} {remote_path} && chown dev:dev {remote_path}"),
+        )
+        .await
+        .ok();
 
         println!("  ✓ Copied {} → pod:{}", filename, remote_path);
     }
+
     Ok(())
 }
 
 /// Remove the temporary key files copied by [`copy_ssh_keys_to_dev`].
-/// Leaves `/home/dev/.ssh/config` intact.
 pub async fn delete_dev_ssh_keys(
     pod_name:  &str,
     container: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rm = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
-            pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            "rm -f /home/dev/.ssh/id_ed25519 \
-                    /home/dev/.ssh/id_ed25519.pub \
-                    /home/dev/.ssh/id_ed25519-cert.pub",
-        ])
-        .status()
-        .await?;
+    let ok = sh_exec(
+        pod_name, container,
+        "rm -f /home/dev/.ssh/id_ed25519 \
+                /home/dev/.ssh/id_ed25519.pub \
+                /home/dev/.ssh/id_ed25519-cert.pub",
+    )
+    .await
+    .map_err(|e| format!("Failed to remove SSH keys: {e}"))?;
 
-    if rm.success() {
+    if ok {
         println!("✓ Temporary SSH keys removed from pod (/home/dev/.ssh keys wiped)");
     } else {
         eprintln!(
@@ -200,24 +176,11 @@ pub async fn delete_dev_ssh_keys(
 
 // ── Clone + branch checkout ───────────────────────────────────────────────────
 
-/// Ensure `/workspace/<dir_name>` exists on `branch`, cloning from
-/// `source:<git_repo>.git` if needed.
-///
-/// Two names are required because they differ:
-/// * `git_repo` — the gitolite remote name, org-prefixed
-///               e.g. `"ginger-society-ginger-db"`
-/// * `dir_name` — the local workspace directory (slug only, no org prefix)
-///               e.g. `"ginger-db"`
-///
-/// Three cases handled transparently:
-/// 1. `/workspace/<dir_name>` absent  → clone into it, then checkout branch.
-/// 2. Directory present, branch missing → checkout or create branch.
-/// 3. Directory present, branch already active → no-op.
 pub async fn setup_repo_branch(
     pod_name:  &str,
     container: &str,
-    git_repo:  &str,   // gitolite remote:  "ginger-society-ginger-db"
-    dir_name:  &str,   // local directory:  "ginger-db"
+    git_repo:  &str,
+    dir_name:  &str,
     branch:    &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let git = find_git_in_pod(pod_name, container).await;
@@ -270,75 +233,89 @@ fi
         branch   = branch,
     );
 
-    // Write the script into the pod
-    let write_cmd = format!(
-        "cat > /tmp/ginger_setup.sh << 'GINGER_EOF'\n{}\nGINGER_EOF\nchmod +x /tmp/ginger_setup.sh",
-        script
-    );
+    // Write script into pod via stdin
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::{Api, Client};
+    use kube::api::AttachParams;
+    use tokio::io::AsyncWriteExt;
 
-    let write_out = tokio::process::Command::new("kubectl")
-        .args([
-            "exec",
+    let client = Client::try_default().await.expect("kube client");
+    let api: Api<Pod> = Api::default_namespaced(client);
+
+    let write_ap = AttachParams {
+        container: Some(container.to_string()),
+        stdin:     true,
+        stdout:    false,
+        stderr:    false,
+        tty:       false,
+        ..Default::default()
+    };
+
+    let mut write_attached = api
+        .exec(
             pod_name,
-            "-c",
-            container,
-            "--",
-            "sh",
-            "-c",
-            &write_cmd,
-        ])
-        .output()
-        .await?;
-
-    if !write_out.status.success() {
-        return Err(format!(
-            "Failed to write setup script into pod: {}",
-            String::from_utf8_lossy(&write_out.stderr).trim()
+            vec!["sh", "-c", "cat > /tmp/ginger_setup.sh && chmod +x /tmp/ginger_setup.sh"],
+            &write_ap,
         )
-        .into());
+        .await
+        .map_err(|e| format!("Failed to write setup script: {e}"))?;
+
+    if let Some(mut stdin) = write_attached.stdin() {
+        stdin.write_all(script.as_bytes()).await?;
+    }
+    if let Some(status) = write_attached.take_status() {
+        status.await;
     }
 
     println!("  ✓ Setup script written to pod, executing...");
 
-    let exec_out = tokio::time::timeout(
+    // Execute the script as dev user
+    let exec_ap = AttachParams {
+        container: Some(container.to_string()),
+        stdin:     false,
+        stdout:    true,
+        stderr:    true,
+        tty:       false,
+        ..Default::default()
+    };
+
+    let exec_fut = api.exec(
+        pod_name,
+        vec!["su", "dev", "-s", "/bin/sh", "/tmp/ginger_setup.sh"],
+        &exec_ap,
+    );
+
+    let mut exec_attached = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        tokio::process::Command::new("kubectl")
-            .args([
-                "exec",
-                pod_name,
-                "-c",
-                container,
-                "--",
-                "su",
-                "dev",
-                "-s",
-                "/bin/sh",
-                "/tmp/ginger_setup.sh",
-            ])
-            .output(),
+        exec_fut,
     )
     .await
     .map_err(|_| "Setup script timed out after 120s")?
     .map_err(|e| format!("Failed to execute setup script: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&exec_out.stdout);
-    let stderr = String::from_utf8_lossy(&exec_out.stderr);
+    use tokio::io::AsyncReadExt;
 
-    for line in stdout.lines() {
-        println!("  {}", line);
-    }
+    let stdout = match exec_attached.stdout() {
+        Some(mut r) => { let mut b = Vec::new(); r.read_to_end(&mut b).await?; String::from_utf8_lossy(&b).into_owned() }
+        None => String::new(),
+    };
+    let stderr = match exec_attached.stderr() {
+        Some(mut r) => { let mut b = Vec::new(); r.read_to_end(&mut b).await?; String::from_utf8_lossy(&b).into_owned() }
+        None => String::new(),
+    };
+
+    let success = match exec_attached.take_status() {
+        Some(s) => s.await.and_then(|s| s.status).map(|s| s == "Success").unwrap_or(false),
+        None    => true,
+    };
+
+    for line in stdout.lines() { println!("  {}", line); }
     if !stderr.trim().is_empty() {
-        for line in stderr.lines() {
-            eprintln!("  [stderr] {}", line);
-        }
+        for line in stderr.lines() { eprintln!("  [stderr] {}", line); }
     }
 
-    if !exec_out.status.success() {
-        return Err(format!(
-            "Setup script failed (exit {:?})",
-            exec_out.status.code()
-        )
-        .into());
+    if !success {
+        return Err(format!("Setup script failed").into());
     }
 
     if stdout.contains("checked-out-remote") {
@@ -346,10 +323,7 @@ fi
     } else if stdout.contains("checked-out-local") {
         println!("✓ Checked out existing local branch '{}' in {}", branch, workspace_repo);
     } else if stdout.contains("created-new") {
-        println!(
-            "✓ Created new branch '{}' in {} (push with: git push -u origin {})",
-            branch, workspace_repo, branch
-        );
+        println!("✓ Created new branch '{}' in {} (push with: git push -u origin {})", branch, workspace_repo, branch);
     }
 
     Ok(())

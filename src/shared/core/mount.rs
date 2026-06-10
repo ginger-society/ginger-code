@@ -11,7 +11,9 @@
 //! name so gitolite can find the repo: `source:ginger-society-iamservice.git`.
 
 use std::fs;
-
+use k8s_openapi::api::apps::v1::Deployment;
+use kube::api::{Patch, PatchParams, PostParams};
+use kube::{Api, Client};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::shared::core::{
@@ -160,20 +162,20 @@ pub async fn mount(
         }
     });
 
-    let mut apply = tokio::process::Command::new("kubectl")
-        .args(["apply", "-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
+    let client = Client::try_default().await.expect("kube client");
+    let api: Api<Deployment> = Api::default_namespaced(client);
 
-    if let Some(mut stdin) = apply.stdin.take() {
-        stdin
-            .write_all(serde_json::to_string_pretty(&deployment_manifest)?.as_bytes())
-            .await?;
-    }
-    let apply_status = apply.wait().await?;
-    if !apply_status.success() {
-        return Err(format!("kubectl apply failed for deployment '{}'", slug).into());
-    }
+    // Deserialise the manifest we already built as serde_json::Value into the typed struct
+    let deployment: Deployment = serde_json::from_value(deployment_manifest)?;
+
+    // SSA (server-side apply) is idempotent — safe to re-run
+    api.patch(
+        &slug,
+        &PatchParams::apply("ginger-code").force(),
+        &Patch::Apply(&deployment),
+    )
+    .await
+    .map_err(|e| format!("kubectl apply failed for deployment '{}': {}", slug, e))?;
     println!("✓ Deployment '{}' created with image {}", slug, image);
 
     if ssh {

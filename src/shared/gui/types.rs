@@ -49,6 +49,7 @@ pub enum RightPane {
 
 pub enum TermState {
     Idle,
+    Connecting,
     Connected(SshSession),
     Error(String),
 }

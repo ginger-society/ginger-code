@@ -13,18 +13,18 @@ use super::bg::{
     spawn_unmount,
     spawn_service_logs,
     spawn_container_fetch,
-    spawn_db_container_fetch
+    spawn_db_container_fetch,
 };
 use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
     draw_db_schema_detail, draw_info_strip, draw_logs_pane, draw_package_detail,
-    draw_service_list, draw_statusbar, draw_tab_bar, draw_terminal_pane, draw_titlebar,
+    draw_service_list, draw_tab_bar, draw_terminal_pane, draw_titlebar,
     TabBarAction,
 };
-use super::terminal::{spawn_kubectl, TermPerformer};
+use super::terminal::TermPerformer;
 use super::types::{AppState, RightPane, TermState};
 use crate::shared::core::eject::{eject, uneject};
-use crate::shared::core::image::pkg_to_slug;
+use crate::shared::core::k8s_exec::attach_to_pod;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -33,17 +33,19 @@ pub struct App {
     rx:       mpsc::Receiver<BgMsg>,
     tx:       mpsc::Sender<BgMsg>,
     loading:  bool,
-    /// In-flight eject/uneject description (shown in the service info strip).
     ejecting: Option<String>,
-    /// In-flight mount/unmount description + package index.
     mounting: Option<(usize, String)>,
-    /// Index of the DB schema whose logs are currently being polled.
     ctx:      egui::Context,
+    pub rt: tokio::runtime::Runtime,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // ── Fonts ─────────────────────────────────────────────────────────────
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build Tokio runtime");
+
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "mono".to_owned(),
@@ -65,13 +67,14 @@ impl App {
         spawn_k8s_poller(tx.clone(), ctx.clone());
 
         App {
-            state:              AppState::new(13.0, vec![]),
+            state:    AppState::new(13.0, vec![]),
             rx,
             tx,
-            loading:            true,
-            ejecting:           None,
-            mounting:           None,
+            loading:  true,
+            ejecting: None,
+            mounting: None,
             ctx,
+            rt
         }
     }
 
@@ -105,16 +108,14 @@ impl App {
         self.state.right_pane = RightPane::PackageDetail(pkg_idx);
     }
 
-
-
     // ── DB schema selection ───────────────────────────────────────────────────
 
     fn select_db_schema(&mut self, schema_idx: usize) {
-        self.state.right_pane             = RightPane::DbSchemaDetail(schema_idx);
-        self.state.db_logs                = vec![];
-        self.state.db_containers          = vec![];
-        self.state.db_selected_container  = None;
-        self.state.db_log_generation     += 1;
+        self.state.right_pane            = RightPane::DbSchemaDetail(schema_idx);
+        self.state.db_logs               = vec![];
+        self.state.db_containers         = vec![];
+        self.state.db_selected_container = None;
+        self.state.db_log_generation    += 1;
 
         let slug = self.state.db_schemas
             .get(schema_idx)
@@ -137,9 +138,9 @@ impl App {
     }
 
     fn select_db_container(&mut self, schema_idx: usize, container: String) {
-        self.state.db_selected_container  = Some(container.clone());
-        self.state.db_logs                = vec![];
-        self.state.db_log_generation     += 1;    // ← kills the previous poller
+        self.state.db_selected_container = Some(container.clone());
+        self.state.db_logs               = vec![];
+        self.state.db_log_generation    += 1;
 
         let gen  = self.state.db_log_generation;
         let slug = self.state.db_schemas
@@ -199,7 +200,6 @@ impl App {
             "vscode-remote://ssh-remote+{}/workspace/{}-{}",
             alias, pkg.organization_id, pkg.identifier,
         );
-        println!("Opening VS Code for package: {}", remote_uri);
 
         std::thread::spawn(move || {
             match std::process::Command::new("code")
@@ -218,8 +218,6 @@ impl App {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
         if svc.ejected { return; }
 
-        // Close all terminal tabs — the pod is about to restart and every
-        // existing session will be forcibly disconnected anyway.
         self.state.term_tabs.clear();
         self.state.right_pane  = RightPane::Logs;
         self.state.active_term = 0;
@@ -254,9 +252,6 @@ impl App {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
         if !svc.ejected { return; }
 
-
-        // Close all terminal tabs — the pod is about to restart and every
-        // existing session will be forcibly disconnected anyway.
         self.state.term_tabs.clear();
         self.state.right_pane  = RightPane::Logs;
         self.state.active_term = 0;
@@ -295,7 +290,6 @@ impl App {
             "vscode-remote://ssh-remote+{}-local/workspace/{}-{}",
             dep, svc.organization_id, dep,
         );
-        println!("Opening VS Code: {}", remote_uri);
 
         std::thread::spawn(move || {
             match std::process::Command::new("code")
@@ -339,26 +333,8 @@ impl App {
         let rows    = tab.term_rows as u16;
         let cols    = tab.term_cols as u16;
 
-        let _host = match self.state.services.get(svc_idx).and_then(|s| s.ssh_host.as_ref()) {
-            Some(h) => h.clone(),
-            None => {
-                if let Some(t) = self.state.term_tabs.get_mut(tab_idx) {
-                    t.state = TermState::Error("No SSH host configured for this service".into());
-                }
-                return;
-            }
-        };
-
-        let sink      = Arc::new(Mutex::new(Vec::new()));
-        let performer = Arc::new(Mutex::new(
-            TermPerformer::new(rows as usize, cols as usize)
-                .with_sink(Arc::clone(&sink)),
-        ));
-
-        self.state.term_tabs[tab_idx].performer      = Arc::clone(&performer);
-        self.state.term_tabs[tab_idx].scrollback_arc = Some(Arc::clone(&sink));
-
-        let dep_name = match self.state.services.get(svc_idx)
+        let dep_name = match self.state.services
+            .get(svc_idx)
             .and_then(|s| s.deployment_name.as_ref())
         {
             Some(d) => d.clone(),
@@ -373,15 +349,40 @@ impl App {
             .get(svc_idx)
             .and_then(|s| s.selected_container.clone());
 
-        match spawn_kubectl(&dep_name, rows, cols, performer, ctx.clone(), container) {
-            Ok(session) => self.state.term_tabs[tab_idx].state = TermState::Connected(session),
-            Err(e)      => self.state.term_tabs[tab_idx].state = TermState::Error(e.to_string()),
-        }
+        let sink      = Arc::new(Mutex::new(Vec::new()));
+        let performer = Arc::new(Mutex::new(
+            TermPerformer::new(rows as usize, cols as usize)
+                .with_sink(Arc::clone(&sink)),
+        ));
+
+        self.state.term_tabs[tab_idx].performer      = Arc::clone(&performer);
+        self.state.term_tabs[tab_idx].scrollback_arc = Some(Arc::clone(&sink));
+        // Mark as connecting so the UI can show a spinner
+        self.state.term_tabs[tab_idx].state = TermState::Connecting;
+
+        let tx  = self.tx.clone();
+        let ctx = ctx.clone();
+
+        // attach_to_pod is async — drive it on the tokio runtime that's already
+        // running for the rest of the kube-rs work.
+        self.rt.spawn(async move {
+            match attach_to_pod(&dep_name, rows, cols, performer, ctx.clone(), container).await {
+                Ok(session) => {
+                    let _ = tx.send(BgMsg::TermConnected { tab_idx, session });
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::TermError {
+                        tab_idx,
+                        message: e.to_string(),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        });
     }
 
     // ── Container selection ───────────────────────────────────────────────────
 
-    // In select_container, replace the spawn_service_logs call:
     fn select_container(&mut self, container: Option<String>) {
         let idx = self.state.selected_idx;
         if let Some(svc) = self.state.services.get_mut(idx) {
@@ -393,7 +394,6 @@ impl App {
                 && container.as_deref() == svc.ejected_container.as_deref();
 
             if selected_is_ejected {
-                // ── Bump generation to kill any running log poller ────────────
                 self.state.log_generation += 1;
                 self.state.logs = vec![
                     format!("⚡ {} is ejected — running in dev mode.", svc.meta_name),
@@ -418,13 +418,26 @@ impl App {
     fn drain_bg_channel(&mut self) {
         loop {
             match self.rx.try_recv() {
+                // ── Terminal session ready ────────────────────────────────────
+                Ok(BgMsg::TermConnected { tab_idx, session }) => {
+                    if let Some(tab) = self.state.term_tabs.get_mut(tab_idx) {
+                        tab.state = TermState::Connected(session);
+                    }
+                }
+
+                Ok(BgMsg::TermError { tab_idx, message }) => {
+                    if let Some(tab) = self.state.term_tabs.get_mut(tab_idx) {
+                        tab.state = TermState::Error(message);
+                    }
+                }
+
                 Ok(BgMsg::DbContainers { schema_idx, containers }) => {
                     if matches!(self.state.right_pane, RightPane::DbSchemaDetail(i) if i == schema_idx) {
                         self.state.db_selected_container = containers.first().cloned();
                         self.state.db_containers         = containers;
 
                         if let Some(container) = self.state.db_selected_container.clone() {
-                            self.state.db_log_generation += 1;    // ← kills the container=None poller
+                            self.state.db_log_generation += 1;
                             let gen  = self.state.db_log_generation;
                             let slug = self.state.db_schemas
                                 .get(schema_idx)
@@ -438,6 +451,7 @@ impl App {
                         }
                     }
                 }
+
                 Ok(BgMsg::TransitioningSet(set)) => {
                     for svc in &mut self.state.services {
                         if let Some(ref dep) = svc.deployment_name {
@@ -445,15 +459,10 @@ impl App {
                         }
                     }
                 }
-                // ── Containers arrived ────────────────────────────────────────
+
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {
-                        // Only override if ejected_container is known; otherwise wait
-                        // for EjectedFlag before selecting a default.
                         let default = if svc.ejected && svc.ejected_container.is_none() {
-                            // EjectedFlag not yet received — don't start log polling yet
-                            // (EjectedFlag handler will call spawn_container_fetch again
-                            //  which re-triggers this path once ejected_container is known)
                             None
                         } else {
                             containers.iter()
@@ -469,14 +478,12 @@ impl App {
                         let container = self.state.services
                             .get(svc_idx)
                             .and_then(|s| s.selected_container.clone());
-                        // Only call select_container if we have a resolved container
                         if container.is_some() {
                             self.select_container(container);
                         }
                     }
                 }
 
-                // ── Services list arrived ─────────────────────────────────────
                 Ok(BgMsg::Services(svcs)) => {
                     self.state.services     = svcs;
                     self.state.selected_idx = 0;
@@ -520,7 +527,6 @@ impl App {
                     }
                 }
 
-                // ── Ejected flag arrived ──────────────────────────────────────
                 Ok(BgMsg::EjectedFlag { idx, ejected, ejected_container }) => {
                     if let Some(svc) = self.state.services.get_mut(idx) {
                         svc.ejected           = ejected;
@@ -535,10 +541,7 @@ impl App {
                             "No application logs available.".into(),
                         ];
                     }
-                    
-                    // NEW: if containers are already loaded, re-resolve the default now that
-                    // ejected_container is known — this handles the race where Containers
-                    // arrived before EjectedFlag.
+
                     let containers_already_loaded = self.state.services
                         .get(idx)
                         .map(|s| !s.containers.is_empty())
@@ -556,7 +559,6 @@ impl App {
                         }
                         self.select_container(container);
                     } else {
-                        // Containers not yet loaded — trigger the fetch as before
                         if let Some(dep) = self.state.services.get(idx)
                             .and_then(|s| s.deployment_name.clone())
                         {
@@ -629,7 +631,6 @@ impl eframe::App for App {
 
         self.drain_bg_channel();
 
-        // ── Raise window on first frame ───────────────────────────────────────
         if !self.state.raised_on_open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -642,7 +643,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         }
 
-        // ── Cursor blink ──────────────────────────────────────────────────────
         let t = ctx.input(|i| i.time);
         if t - self.state.blink_timer > 0.5 {
             self.state.blink       = !self.state.blink;
@@ -655,7 +655,6 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
-        // ── Sync terminal scrollback ──────────────────────────────────────────
         for tab in &mut self.state.term_tabs {
             if let Some(ref sink) = tab.scrollback_arc {
                 let mut s = sink.lock();
@@ -663,19 +662,12 @@ impl eframe::App for App {
             }
         }
 
-        // ── Title bar ─────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("titlebar")
             .exact_height(28.0)
             .frame(egui::Frame::none())
             .show(ctx, |ui| draw_titlebar(&self.state, ui, ctx));
 
-        // ── Status bar ────────────────────────────────────────────────────────
-        egui::TopBottomPanel::bottom("statusbar")
-            .exact_height(20.0)
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| draw_statusbar(&self.state, ui));
 
-        // ── Sidebar ───────────────────────────────────────────────────────────
         egui::SidePanel::left("sidebar")
             .exact_width(220.0)
             .resizable(false)
@@ -696,7 +688,6 @@ impl eframe::App for App {
                 }
             });
 
-        // ── Main panel ────────────────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(COLOR_BG))
             .show(ctx, |ui| {
@@ -707,18 +698,14 @@ impl eframe::App for App {
                     return;
                 }
 
-                // ── DB schema detail ──────────────────────────────────────────
-                // In update(), the DbSchemaDetail render block:
                 if let RightPane::DbSchemaDetail(idx) = self.state.right_pane {
                     if let Some(schema) = self.state.db_schemas.get(idx).cloned() {
-                        // Show logs as soon as we have any — generation ensures they're current
-                        let logs_opt: Option<&[String]> = if self.state.db_log_generation > 0
-                            && !self.state.db_logs.is_empty()
-                        {
-                            Some(&self.state.db_logs)
-                        } else {
-                            None   // still shows "Looking for deployment…"
-                        };
+                        let logs_opt: Option<&[String]> =
+                            if self.state.db_log_generation > 0 && !self.state.db_logs.is_empty() {
+                                Some(&self.state.db_logs)
+                            } else {
+                                None
+                            };
 
                         let containers         = self.state.db_containers.clone();
                         let selected_container = self.state.db_selected_container.clone();
@@ -732,7 +719,6 @@ impl eframe::App for App {
                     return;
                 }
 
-                // ── Package detail view ───────────────────────────────────────
                 if let RightPane::PackageDetail(pkg_idx) = self.state.right_pane {
                     if let Some(pkg) = self.state.packages.get(pkg_idx).cloned() {
                         let mounting_msg = self.mounting.as_ref()
@@ -748,7 +734,6 @@ impl eframe::App for App {
                     return;
                 }
 
-                // ── Service view (logs / terminal) ────────────────────────────
                 if self.state.services.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(COLOR_CYAN, "No services found.");
@@ -769,7 +754,6 @@ impl eframe::App for App {
                             self.state.right_pane = RightPane::Logs;
                         }
                         Some(TabBarAction::OpenTermForContainer(name)) => {
-                            // Set the container first so open_and_connect_term picks it up
                             if let Some(svc) = self.state.services.get_mut(self.state.selected_idx) {
                                 svc.selected_container = Some(name);
                             }

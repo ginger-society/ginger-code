@@ -41,7 +41,7 @@ pub fn draw_terminal_pane(state: &mut AppState, ui: &mut egui::Ui, tab_idx: usiz
                 .color(super::super::colors::COLOR_RED));
             return;
         }
-        TermState::Idle => {
+        TermState::Idle | TermState::Connecting => {
             ui.label(egui::RichText::new("Connecting…")
                 .font(egui::FontId::new(font_size, egui::FontFamily::Monospace))
                 .color(super::super::colors::COLOR_MUTED));

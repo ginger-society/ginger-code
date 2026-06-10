@@ -1,9 +1,7 @@
 use eframe::egui;
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
-use std::thread;
 
 use super::colors::{ansi256, ANSI_COLORS, COLOR_BG, COLOR_FG};
 
@@ -129,7 +127,10 @@ impl TermPerformer {
                 22 => self.bold = false,
                 30..=37 => self.current_fg = ANSI_COLORS[(params[i] - 30) as usize],
                 38 if params.get(i+1) == Some(&5) => {
-                    if let Some(&idx) = params.get(i+2) { self.current_fg = ansi256(idx as u8); i += 2; }
+                    if let Some(&idx) = params.get(i+2) {
+                        self.current_fg = ansi256(idx as u8);
+                        i += 2;
+                    }
                 }
                 38 if params.get(i+1) == Some(&2) => {
                     if let (Some(&r), Some(&g), Some(&b)) =
@@ -142,7 +143,10 @@ impl TermPerformer {
                 39 => self.current_fg = COLOR_FG,
                 40..=47  => self.current_bg = ANSI_COLORS[(params[i] - 40) as usize],
                 48 if params.get(i+1) == Some(&5) => {
-                    if let Some(&idx) = params.get(i+2) { self.current_bg = ansi256(idx as u8); i += 2; }
+                    if let Some(&idx) = params.get(i+2) {
+                        self.current_bg = ansi256(idx as u8);
+                        i += 2;
+                    }
                 }
                 48 if params.get(i+1) == Some(&2) => {
                     if let (Some(&r), Some(&g), Some(&b)) =
@@ -175,9 +179,9 @@ impl vte::Perform for TermPerformer {
                     self.cursor_row = (self.cursor_row + 1).min(self.rows - 1);
                 }
             }
-            8  => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
-            7  => {}
-            _  => {}
+            8 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
+            7 => {}
+            _ => {}
         }
     }
 
@@ -318,8 +322,7 @@ impl vte::Perform for TermPerformer {
                     }
                 }
             }
-            'b' => {}
-            'h' | 'l' => {}
+            'b' | 'h' | 'l' => {}
             _ => {}
         }
     }
@@ -345,109 +348,43 @@ impl vte::Perform for TermPerformer {
     }
 }
 
-// ── SSH / kubectl session ─────────────────────────────────────────────────────
+// ── Session ───────────────────────────────────────────────────────────────────
+//
+// `SshSession` is now a thin wrapper around a writer channel.
+// The kube-rs attach path (attach_to_pod in k8s_exec.rs) is the only
+// construction path — portable_pty / spawn_kubectl have been removed.
+//
+// Resize sends an in-band ANSI sequence into the pod's stdin because
+// this version of kube-rs does not expose a terminal-size watch channel
+// on AttachedProcess. The sequence `\x1b[8;<rows>;<cols>t` is understood
+// by most shells/PTYs as a window-resize notification, and we follow it
+// with a stty call for shells that don't handle the ANSI sequence.
 
 pub struct SshSession {
-    pub writer:   Arc<Mutex<Box<dyn Write + Send>>>,
-    _pty_pair:    portable_pty::PtyPair,
+    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 impl SshSession {
-    /// Notify the local PTY master of a size change (sends SIGWINCH to the
-    /// local kubectl process). Also returns the new dimensions so the caller
-    /// can send an in-band resize notification to the shell inside the pod.
-    pub fn resize(&self, rows: u16, cols: u16) {
-        let _ = self._pty_pair.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width:  0,
-            pixel_height: 0,
-        });
+    /// Constructed by `k8s_exec::attach_to_pod`.
+    pub fn from_kube(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+        Self { writer }
     }
-}
 
-pub fn spawn_kubectl(
-    deployment_name: &str,
-    rows:      u16,
-    cols:      u16,
-    performer: Arc<Mutex<TermPerformer>>,
-    ctx:       egui::Context,
-    container: Option<String>,
-) -> Result<SshSession, Box<dyn std::error::Error>> {
-
-    let pod_output = std::process::Command::new("kubectl")
-        .args([
-            "get", "pods",
-            "--field-selector=status.phase=Running",
-            "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}",
-        ])
-        .output()?;
-
-    let stdout = String::from_utf8(pod_output.stdout)?;
-    let prefix = deployment_name.to_lowercase().replace('_', "-");
-
-    let pod_name = stdout
-        .lines()
-        .find(|line| line.starts_with(&prefix))
-        .ok_or_else(|| format!("No running pod found with prefix '{}'", prefix))?
-        .to_string();
-
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width:  0,
-        pixel_height: 0,
-    })?;
-
-    let shell_cmd = format!(
-        "export COLUMNS={cols} LINES={rows} TERM=xterm-256color PYTHONDONTWRITEBYTECODE=1; \
-         stty rows {rows} cols {cols}; \
-         exec /bin/sh -i",
-        cols = cols,
-        rows = rows,
-    );
-
-    // Use the selected container if provided, otherwise fall back to the
-    // deployment prefix (existing single-container behaviour).
-    let container_name = container.as_deref().unwrap_or(&prefix);
-
-    let mut cmd = CommandBuilder::new("kubectl");
-    cmd.arg("exec");
-    cmd.arg("-i");
-    cmd.arg(&pod_name);
-    cmd.arg("--container");
-    cmd.arg(container_name);
-    cmd.arg("--");
-    cmd.arg("script");
-    cmd.arg("-q");
-    cmd.arg("-c");
-    cmd.arg(&shell_cmd);
-    cmd.arg("/dev/null");
-
-    let _child     = pair.slave.spawn_command(cmd)?;
-    let writer     = pair.master.take_writer()?;
-    let mut reader = pair.master.try_clone_reader()?;
-
-    let writer_arc = Arc::new(Mutex::new(writer));
-
-    thread::spawn(move || {
-        let mut parser = vte::Parser::new();
-        let mut buf    = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut p = performer.lock();
-                    for &b in &buf[..n] { parser.advance(&mut *p, b); }
-                    drop(p);
-                    ctx.request_repaint();
-                }
-            }
-        }
-    });
-
-    Ok(SshSession { writer: writer_arc, _pty_pair: pair })
+    /// Send an in-band terminal resize notification into the pod.
+    ///
+    /// Two mechanisms are used for maximum compatibility:
+    ///   1. ANSI `\x1b[8;<rows>;<cols>t` — handled by xterm-compatible terminals.
+    ///   2. `stty rows <r> cols <c>` — handled by the shell directly.
+    pub fn resize(&self, rows: u16, cols: u16) {
+        let mut w = self.writer.lock();
+        // ANSI window resize sequence
+        let ansi = format!("\x1b[8;{};{}t", rows, cols);
+        let _ = w.write_all(ansi.as_bytes());
+        // Follow with stty for shells that ignore the ANSI sequence
+        let stty = format!("stty rows {} cols {} 2>/dev/null\n", rows, cols);
+        let _ = w.write_all(stty.as_bytes());
+        let _ = w.flush();
+    }
 }
 
 // ── Key → char helper ─────────────────────────────────────────────────────────

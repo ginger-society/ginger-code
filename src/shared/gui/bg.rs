@@ -33,6 +33,14 @@ pub enum BgMsg {
     Containers { svc_idx: usize, containers: Vec<String> },
     TransitioningSet(std::collections::HashSet<String>),
     DbContainers { schema_idx: usize, containers: Vec<String> },
+    TermConnected {
+        tab_idx: usize,
+        session: crate::shared::gui::terminal::SshSession,
+    },
+    TermError {
+        tab_idx: usize,
+        message: String,
+    },
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
