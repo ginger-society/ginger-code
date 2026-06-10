@@ -2,13 +2,13 @@
 name = "ginger-code"
 version = "0.1.0"
 edition = "2021"
-# default-run = "ginger-code-cli"
+default-run = "ginger-code-cli"
 description = "ginger code "
 
 
-# [[bin]]
-# name = "ginger-code"
-# path = "src/main.rs"
+[[bin]]
+name = "ginger-code"
+path = "src/main.rs"
 
 [[bin]]
 name = "ginger-code-cli"

@@ -15,8 +15,8 @@ use crate::shared::core::data_source::{self, fetch_current_workspace};
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{
@@ -25,13 +25,14 @@ use crossterm::{
     },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::sync::mpsc as async_mpsc;
 use tokio::time::sleep;
 
 use MetadataService::apis::configuration::Configuration as MetadataConfiguration;
 
 use crate::shared::core::{
     eject::{eject, uneject},
-    k8_info::{get_k8s_deployments, is_ejected},
+    k8_info::{get_k8s_deployments, get_pod_containers, is_ejected, stream_pod_logs},
     mount::{mount, unmount},
     types::{DbSchema, K8sService, Package},
 };
@@ -43,13 +44,172 @@ use self::{
 };
 
 /* ================================================================
+   INTERNAL CHANNEL MESSAGES
+   ================================================================ */
+
+enum TuiMsg {
+    /// A new batch of log lines for a service (generation-gated).
+    ServiceLogs { lines: Vec<String>, generation: u64 },
+    /// A new batch of log lines for a DB schema (generation-gated).
+    DbLogs { lines: Vec<String>, generation: u64 },
+    /// Container list resolved for `svc_idx`.
+    Containers { svc_idx: usize, containers: Vec<String> },
+}
+
+/* ================================================================
+   LOG STREAMER  (mirrors bg.rs spawn_service_logs)
+   ================================================================ */
+
+/// Spawn a background thread that streams pod logs and sends
+/// `TuiMsg::ServiceLogs` on every new line.  Retries on stream end.
+/// Stops when `tx` is dropped.
+fn spawn_service_log_stream(
+    tx:              std::sync::mpsc::Sender<TuiMsg>,
+    deployment_name: String,
+    container:       Option<String>,
+    generation:      u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+                let dep  = deployment_name.clone();
+                let cont = container.clone();
+                tokio::spawn(async move {
+                    stream_pod_logs(&dep, cont, line_tx).await;
+                });
+                loop {
+                    match line_rx.recv().await {
+                        None => break,
+                        Some(line) => {
+                            lines.push(line);
+                            if lines.len() > 2000 {
+                                lines.drain(0..500);
+                            }
+                            if tx
+                                .send(TuiMsg::ServiceLogs {
+                                    lines:      lines.clone(),
+                                    generation,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                // Stream ended — check still wanted, then reconnect.
+                if tx
+                    .send(TuiMsg::ServiceLogs {
+                        lines:      lines.clone(),
+                        generation,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+/// Same as above but sends `TuiMsg::DbLogs`.
+fn spawn_db_log_stream(
+    tx:         std::sync::mpsc::Sender<TuiMsg>,
+    slug:       String,
+    container:  Option<String>,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+                let dep  = slug.clone();
+                let cont = container.clone();
+                tokio::spawn(async move {
+                    stream_pod_logs(&dep, cont, line_tx).await;
+                });
+                loop {
+                    match line_rx.recv().await {
+                        None => break,
+                        Some(line) => {
+                            lines.push(line);
+                            if lines.len() > 2000 {
+                                lines.drain(0..500);
+                            }
+                            let normalised =
+                                if lines.len() == 1 && lines[0].starts_with("No pods found") {
+                                    vec![]
+                                } else {
+                                    lines.clone()
+                                };
+                            if tx
+                                .send(TuiMsg::DbLogs {
+                                    lines:      normalised,
+                                    generation,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if tx
+                    .send(TuiMsg::DbLogs {
+                        lines:      lines.clone(),
+                        generation,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+/// Fetch container names once and send `TuiMsg::Containers`.
+fn spawn_container_fetch(
+    tx:              std::sync::mpsc::Sender<TuiMsg>,
+    deployment_name: String,
+    svc_idx:         usize,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
+                let _ = tx.send(TuiMsg::Containers { svc_idx, containers });
+            }
+        });
+    });
+}
+
+/* ================================================================
    ENTRY POINT
    ================================================================ */
 pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
     session_user:    &str,
 ) {
-    let org_id = match fetch_current_workspace(&metadata_config).await {
+    let org_id = match fetch_current_workspace(metadata_config).await {
         Ok(id) => id,
         Err(e) => {
             eprintln!("Workspace fetch error: {e:?}");
@@ -90,7 +250,9 @@ pub async fn fetch_metadata_and_process(
             }
         };
 
-    if let Err(e) = run_tui(initial_services, packages, initial_db_schemas, session_user).await {
+    if let Err(e) =
+        run_tui(initial_services, packages, initial_db_schemas, session_user).await
+    {
         eprintln!("TUI error: {}", e);
         exit(1);
     }
@@ -112,16 +274,26 @@ async fn run_tui(
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let services:    Arc<Mutex<Vec<K8sService>>> = Arc::new(Mutex::new(initial_services));
-    let packages:    Arc<Mutex<Vec<Package>>>    = Arc::new(Mutex::new(initial_packages));
-    let db_schemas:  Arc<Mutex<Vec<DbSchema>>>   = Arc::new(Mutex::new(initial_db_schemas));
-    let logs:        Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let svc_log_idx: Arc<Mutex<usize>>           = Arc::new(Mutex::new(0));
+    // ── Shared state ──────────────────────────────────────────────────────────
+    let services:   Arc<Mutex<Vec<K8sService>>> = Arc::new(Mutex::new(initial_services));
+    let packages:   Arc<Mutex<Vec<Package>>>    = Arc::new(Mutex::new(initial_packages));
+    let db_schemas: Arc<Mutex<Vec<DbSchema>>>   = Arc::new(Mutex::new(initial_db_schemas));
 
-    let db_logs:    Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
-    let db_log_gen: Arc<Mutex<u64>>                 = Arc::new(Mutex::new(0));
+    // ── Internal channel for background → UI messages ─────────────────────────
+    let (bg_tx, bg_rx) = std::sync::mpsc::channel::<TuiMsg>();
 
-    // ── Background: k8s status + ejected flags ────────────────────────────────
+    // ── Log state ─────────────────────────────────────────────────────────────
+    // Service logs (keyed by meta_name so switching back is instant).
+    let logs: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Generation counter: bump when we want old streamers to stop updating.
+    let mut svc_log_generation: u64 = 0;
+
+    // DB logs
+    let db_logs:       Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+    let mut db_log_generation: u64 = 0;
+    let mut db_log_schema: Option<usize> = None;
+
+    // ── Background: k8s status + ejected flags every 5 s ─────────────────────
     {
         let services = services.clone();
         tokio::spawn(async move {
@@ -141,9 +313,11 @@ async fn run_tui(
                         }
                     }
                 }
+                // Refresh ejected flags.
                 let deps: Vec<(usize, String)> = {
                     let svcs = services.lock().unwrap();
-                    svcs.iter().enumerate()
+                    svcs.iter()
+                        .enumerate()
                         .filter_map(|(i, s)| s.deployment_name.clone().map(|d| (i, d)))
                         .collect()
                 };
@@ -158,57 +332,105 @@ async fn run_tui(
         });
     }
 
-    // ── Background: stream logs for the active service ────────────────────────
+    // ── UI state ──────────────────────────────────────────────────────────────
+    let mut focus:           Focus       = Focus::Sidebar;
+    let mut sidebar_item:    SidebarItem = SidebarItem::Service(0);
+    let mut auto_scroll:     bool        = true;
+    let mut scroll_offset:   usize       = 0;
+    let mut popup:           Option<Popup> = None;
+    let mut sidebar_scroll:  usize       = 0;
+    let mut db_last_max_scroll: usize    = 0;
+
+    // Container selection per service: svc_idx → selected container index.
+    let mut container_selection: HashMap<usize, usize> = HashMap::new();
+
+    // Kick off the initial service log stream (index 0).
     {
-        let services    = services.clone();
-        let logs        = logs.clone();
-        let svc_log_idx = svc_log_idx.clone();
-        tokio::spawn(async move {
-            loop {
-                let (dep_name, meta_name) = {
-                    let svcs = services.lock().unwrap();
-                    let idx  = *svc_log_idx.lock().unwrap();
-                    svcs.get(idx)
-                        .map(|s| (s.deployment_name.clone(), s.meta_name.clone()))
-                        .unwrap_or((None, String::new()))
-                };
-                if let Some(dep) = dep_name {
-                    let lines = get_pod_logs(&dep, None).await;
-                    logs.lock().unwrap().insert(meta_name, lines);
-                }
-                sleep(Duration::from_secs(2)).await;
+        let svcs = services.lock().unwrap();
+        if let Some(svc) = svcs.first() {
+            if let Some(ref dep) = svc.deployment_name {
+                svc_log_generation += 1;
+                spawn_service_log_stream(
+                    bg_tx.clone(),
+                    dep.clone(),
+                    None,
+                    svc_log_generation,
+                );
+                // Also kick off container fetch for service 0.
+                spawn_container_fetch(bg_tx.clone(), dep.clone(), 0);
             }
-        });
+        }
     }
 
-    // ── UI state ──────────────────────────────────────────────────────────────
-    let mut focus:          Focus         = Focus::Sidebar;
-    let mut sidebar_item:   SidebarItem   = SidebarItem::Service(0);
-    let mut auto_scroll:    bool          = true;
-    let mut scroll_offset:  usize         = 0;
-    let mut popup:          Option<Popup> = None;
-    let mut sidebar_scroll: usize         = 0;
-    let mut db_log_schema:  Option<usize> = None;
-    // Tracks the last known max_scroll for db logs so the first Up keypress
-    // starts from the bottom rather than from 0.
-    let mut db_last_max_scroll: usize     = 0;
-
     loop {
+        // ── Drain background messages ─────────────────────────────────────────
+        loop {
+            match bg_rx.try_recv() {
+                Ok(TuiMsg::ServiceLogs { lines, generation }) => {
+                    if generation == svc_log_generation {
+                        // Store under the current service's meta_name.
+                        let key = {
+                            let svcs = services.lock().unwrap();
+                            if let SidebarItem::Service(i) = sidebar_item {
+                                svcs.get(i).map(|s| s.meta_name.clone())
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(k) = key {
+                            logs.lock().unwrap().insert(k, lines);
+                        }
+                    }
+                }
+                Ok(TuiMsg::DbLogs { lines, generation }) => {
+                    if generation == db_log_generation {
+                        *db_logs.lock().unwrap() = Some(lines);
+                    }
+                }
+                Ok(TuiMsg::Containers { svc_idx, containers }) => {
+                    let mut svcs = services.lock().unwrap();
+                    if let Some(svc) = svcs.get_mut(svc_idx) {
+                        svc.containers = containers;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // ── Snapshot for drawing ──────────────────────────────────────────────
         let services_snap   = services.lock().unwrap().clone();
         let packages_snap   = packages.lock().unwrap().clone();
         let db_schemas_snap = db_schemas.lock().unwrap().clone();
         let logs_snap       = logs.lock().unwrap().clone();
         let db_logs_snap    = db_logs.lock().unwrap().clone();
 
+        // Derive UI flags from current sidebar selection.
         let (selected_svc, has_deployment, has_lang, is_ejected_now) =
             if let SidebarItem::Service(i) = sidebar_item {
                 let svc      = services_snap.get(i);
-                let has_dep  = svc.map(|s| s.status != "Not deployed" && s.status != "Unknown").unwrap_or(false);
+                let has_dep  = svc
+                    .map(|s| s.status != "Not deployed" && s.status != "Unknown")
+                    .unwrap_or(false);
                 let has_lang = svc.and_then(|s| s.lang.as_ref()).is_some();
                 let ejected  = svc.map(|s| s.ejected).unwrap_or(false);
                 (svc, has_dep, has_lang, ejected)
             } else {
                 (None, false, false, false)
+            };
+
+        // Compute the active container index for the current service.
+        let (active_container_idx, active_container_name): (usize, Option<String>) =
+            if let SidebarItem::Service(i) = sidebar_item {
+                let svcs = &services_snap;
+                if let Some(svc) = svcs.get(i) {
+                    let idx = *container_selection.get(&i).unwrap_or(&0);
+                    let name = svc.containers.get(idx).cloned();
+                    (idx, name)
+                } else {
+                    (0, None)
+                }
+            } else {
+                (0, None)
             };
 
         let db_logs_opt: Option<&[String]> = match sidebar_item {
@@ -220,27 +442,31 @@ async fn run_tui(
 
         // ── Draw ──────────────────────────────────────────────────────────────
         terminal.draw(|f| {
-            // Only run the service log auto-scroll logic when viewing a service.
             if let SidebarItem::Service(_) = sidebar_item {
                 if let Some(svc) = selected_svc {
-                    let log_text   = logs_snap.get(&svc.meta_name).map(|l| l.join("\n")).unwrap_or_default();
-                    let max_scroll = log_text.lines().count()
+                    let log_text = logs_snap
+                        .get(&svc.meta_name)
+                        .map(|l| l.join("\n"))
+                        .unwrap_or_default();
+                    let max_scroll = log_text
+                        .lines()
+                        .count()
                         .saturating_sub(f.size().height.saturating_sub(10) as usize);
                     if auto_scroll {
                         scroll_offset = max_scroll;
                     } else {
                         scroll_offset = scroll_offset.min(max_scroll);
-                        if scroll_offset >= max_scroll { auto_scroll = true; }
+                        if scroll_offset >= max_scroll {
+                            auto_scroll = true;
+                        }
                     }
                 }
             }
 
-            // Track db log max_scroll so keyboard scrolling starts from the right position.
             if let SidebarItem::DbSchema(_) = sidebar_item {
                 if let Some(lines) = db_logs_snap.as_deref() {
                     let height = f.size().height.saturating_sub(10) as usize;
                     db_last_max_scroll = lines.len().saturating_sub(height);
-                    // While auto_scroll is on, keep scroll_offset pinned to bottom.
                     if auto_scroll {
                         scroll_offset = db_last_max_scroll;
                     }
@@ -262,6 +488,8 @@ async fn run_tui(
                 has_lang,
                 is_ejected_now,
                 popup.as_ref(),
+                active_container_idx,
+                active_container_name.as_deref(),
             );
             sidebar_scroll = drawn.sidebar_scroll;
         })?;
@@ -269,14 +497,17 @@ async fn run_tui(
         /* ================================================================
            INPUT
            ================================================================ */
-        if !event::poll(Duration::from_millis(100))? { continue; }
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
 
         match event::read()? {
-
             /* ── Mouse ──────────────────────────────────────────────────── */
             Event::Mouse(mouse) => {
                 if popup.is_some() {
-                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) { popup = None; }
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        popup = None;
+                    }
                     continue;
                 }
                 match mouse.kind {
@@ -286,7 +517,9 @@ async fn run_tui(
                             let term      = terminal.size()?;
                             let root_h    = term.height.saturating_sub(2);
                             let sidebar_w = term.width * 35 / 100;
-                            ratatui::layout::Rect { x: 0, y: 0, width: sidebar_w, height: root_h }
+                            ratatui::layout::Rect {
+                                x: 0, y: 0, width: sidebar_w, height: root_h,
+                            }
                         };
                         if let Some(item) = render::click_sidebar_item(
                             col, row, sidebar_area, sidebar_scroll,
@@ -295,15 +528,25 @@ async fn run_tui(
                             focus = Focus::Sidebar;
                             match &item {
                                 SidebarItem::Service(i) => {
-                                    *svc_log_idx.lock().unwrap() = *i;
+                                    switch_service_logs(
+                                        *i,
+                                        &services_snap,
+                                        &mut svc_log_generation,
+                                        &container_selection,
+                                        &bg_tx,
+                                        &logs,
+                                    );
                                     auto_scroll   = true;
                                     scroll_offset = 0;
                                 }
                                 SidebarItem::DbSchema(i) => {
-                                    maybe_start_db_poller(
-                                        *i, &db_schemas_snap,
+                                    maybe_start_db_stream(
+                                        *i,
+                                        &db_schemas_snap,
                                         &mut db_log_schema,
-                                        &db_logs, &db_log_gen,
+                                        &mut db_log_generation,
+                                        &db_logs,
+                                        &bg_tx,
                                     );
                                     auto_scroll   = true;
                                     scroll_offset = 0;
@@ -311,13 +554,15 @@ async fn run_tui(
                                 SidebarItem::Package(_) => {}
                             }
                             sidebar_item = item;
-                        } else if matches!(sidebar_item, SidebarItem::Service(_) | SidebarItem::DbSchema(_)) {
+                        } else if matches!(
+                            sidebar_item,
+                            SidebarItem::Service(_) | SidebarItem::DbSchema(_)
+                        ) {
                             focus = Focus::Logs;
                         }
                     }
                     MouseEventKind::ScrollUp => {
                         if focus == Focus::Logs {
-                            // On first scroll up from auto_scroll, snap to bottom first.
                             if auto_scroll {
                                 scroll_offset = db_last_max_scroll;
                             }
@@ -337,8 +582,12 @@ async fn run_tui(
 
             /* ── Keyboard ───────────────────────────────────────────────── */
             Event::Key(key) => {
+                // ── Popup handling ────────────────────────────────────────
                 if let Some(ref mut p) = popup {
-                    if p.action == PopupAction::ShellBlocked { popup = None; continue; }
+                    if p.action == PopupAction::ShellBlocked {
+                        popup = None;
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Left  | KeyCode::Char('h') => p.selected = 0,
                         KeyCode::Right | KeyCode::Char('l') => p.selected = 1,
@@ -366,9 +615,17 @@ async fn run_tui(
                                                     let r = if ejected {
                                                         uneject(&dep_name).await
                                                     } else {
-                                                        eject(&dep_name, lang.as_deref().unwrap_or(""), &meta, &org).await
+                                                        eject(
+                                                            &dep_name,
+                                                            lang.as_deref().unwrap_or(""),
+                                                            &meta,
+                                                            &org,
+                                                        )
+                                                        .await
                                                     };
-                                                    if let Err(e) = r { eprintln!("Error: {e}"); }
+                                                    if let Err(e) = r {
+                                                        eprintln!("Error: {e}");
+                                                    }
                                                     sleep(Duration::from_secs(2)).await;
                                                     enter_tui(&mut terminal)?;
                                                     continue;
@@ -382,17 +639,21 @@ async fn run_tui(
                                         if let SidebarItem::Package(pkg_i) = sidebar_item {
                                             let (org, id, lang) = {
                                                 let pkgs = packages.lock().unwrap();
-                                                pkgs.get(pkg_i).map(|p| (
-                                                    p.organization_id.clone(),
-                                                    p.identifier.clone(),
-                                                    p.lang.clone(),
-                                                )).unwrap_or_default()
+                                                pkgs.get(pkg_i)
+                                                    .map(|p| (
+                                                        p.organization_id.clone(),
+                                                        p.identifier.clone(),
+                                                        p.lang.clone(),
+                                                    ))
+                                                    .unwrap_or_default()
                                             };
                                             popup = None;
                                             leave_tui(&mut terminal)?;
                                             match mount(&org, &id, &lang).await {
                                                 Ok(()) => {
-                                                    if let Some(p) = packages.lock().unwrap().get_mut(pkg_i) {
+                                                    if let Some(p) =
+                                                        packages.lock().unwrap().get_mut(pkg_i)
+                                                    {
                                                         p.mounted = true;
                                                     }
                                                     println!("✓ Mounted dev container for {id}");
@@ -411,16 +672,20 @@ async fn run_tui(
                                         if let SidebarItem::Package(pkg_i) = sidebar_item {
                                             let (org, id) = {
                                                 let pkgs = packages.lock().unwrap();
-                                                pkgs.get(pkg_i).map(|p| (
-                                                    p.organization_id.clone(),
-                                                    p.identifier.clone(),
-                                                )).unwrap_or_default()
+                                                pkgs.get(pkg_i)
+                                                    .map(|p| (
+                                                        p.organization_id.clone(),
+                                                        p.identifier.clone(),
+                                                    ))
+                                                    .unwrap_or_default()
                                             };
                                             popup = None;
                                             leave_tui(&mut terminal)?;
                                             match unmount(&org, &id).await {
                                                 Ok(()) => {
-                                                    if let Some(p) = packages.lock().unwrap().get_mut(pkg_i) {
+                                                    if let Some(p) =
+                                                        packages.lock().unwrap().get_mut(pkg_i)
+                                                    {
                                                         p.mounted = false;
                                                     }
                                                     println!("✓ Unmounted dev container for {id}");
@@ -444,38 +709,124 @@ async fn run_tui(
                     continue;
                 }
 
+                // ── Normal key handling ───────────────────────────────────
                 match key.code {
+                    // ── Quit ─────────────────────────────────────────────
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        popup = Some(Popup { service_name: String::new(), action: PopupAction::Quit, selected: 1 });
+                        popup = Some(Popup {
+                            service_name: String::new(),
+                            action:       PopupAction::Quit,
+                            selected:     1,
+                        });
                     }
 
-                    KeyCode::Left => { focus = Focus::Sidebar; }
-
-                    KeyCode::Right => {
-                        if matches!(sidebar_item, SidebarItem::Service(_) | SidebarItem::DbSchema(_)) {
+                    // ── Panel focus ───────────────────────────────────────
+                    KeyCode::Left
+                        if key.modifiers != KeyModifiers::SHIFT =>
+                    {
+                        focus = Focus::Sidebar;
+                    }
+                    KeyCode::Right
+                        if key.modifiers != KeyModifiers::SHIFT =>
+                    {
+                        if matches!(
+                            sidebar_item,
+                            SidebarItem::Service(_) | SidebarItem::DbSchema(_)
+                        ) {
                             focus = Focus::Logs;
                         }
                     }
 
+                    // ── Container tab navigation: Shift + ← / → ──────────
+                    KeyCode::Left
+                        if key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        if let SidebarItem::Service(svc_i) = sidebar_item {
+                            let svcs = services.lock().unwrap();
+                            if let Some(svc) = svcs.get(svc_i) {
+                                if svc.containers.len() > 1 {
+                                    let cur =
+                                        *container_selection.get(&svc_i).unwrap_or(&0);
+                                    let next = if cur == 0 {
+                                        svc.containers.len() - 1
+                                    } else {
+                                        cur - 1
+                                    };
+                                    drop(svcs);
+                                    select_container(
+                                        svc_i,
+                                        next,
+                                        &services.lock().unwrap(),
+                                        &mut container_selection,
+                                        &mut svc_log_generation,
+                                        &bg_tx,
+                                        &logs,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Right
+                        if key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        if let SidebarItem::Service(svc_i) = sidebar_item {
+                            let svcs = services.lock().unwrap();
+                            if let Some(svc) = svcs.get(svc_i) {
+                                if svc.containers.len() > 1 {
+                                    let cur =
+                                        *container_selection.get(&svc_i).unwrap_or(&0);
+                                    let next = (cur + 1) % svc.containers.len();
+                                    drop(svcs);
+                                    select_container(
+                                        svc_i,
+                                        next,
+                                        &services.lock().unwrap(),
+                                        &mut container_selection,
+                                        &mut svc_log_generation,
+                                        &bg_tx,
+                                        &logs,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Sidebar navigation ────────────────────────────────
                     KeyCode::Up | KeyCode::Char('k') => {
                         if focus == Focus::Logs {
-                            // If auto_scroll was on, snap scroll_offset to the
-                            // actual bottom before decrementing so the first Up
-                            // keypress feels immediate rather than doing nothing.
                             if auto_scroll {
                                 scroll_offset = db_last_max_scroll;
                             }
                             auto_scroll   = false;
                             scroll_offset = scroll_offset.saturating_sub(1);
                         } else {
-                            let prev = sidebar_prev(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
+                            let prev = sidebar_prev(
+                                &sidebar_item,
+                                &services_snap,
+                                &packages_snap,
+                                &db_schemas_snap,
+                            );
                             if let SidebarItem::Service(i) = prev {
-                                *svc_log_idx.lock().unwrap() = i;
+                                switch_service_logs(
+                                    i,
+                                    &services_snap,
+                                    &mut svc_log_generation,
+                                    &container_selection,
+                                    &bg_tx,
+                                    &logs,
+                                );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = prev {
-                                maybe_start_db_poller(i, &db_schemas_snap, &mut db_log_schema, &db_logs, &db_log_gen);
+                                maybe_start_db_stream(
+                                    i,
+                                    &db_schemas_snap,
+                                    &mut db_log_schema,
+                                    &mut db_log_generation,
+                                    &db_logs,
+                                    &bg_tx,
+                                );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
                             }
@@ -488,14 +839,33 @@ async fn run_tui(
                             auto_scroll   = false;
                             scroll_offset += 1;
                         } else {
-                            let next = sidebar_next(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
+                            let next = sidebar_next(
+                                &sidebar_item,
+                                &services_snap,
+                                &packages_snap,
+                                &db_schemas_snap,
+                            );
                             if let SidebarItem::Service(i) = next {
-                                *svc_log_idx.lock().unwrap() = i;
+                                switch_service_logs(
+                                    i,
+                                    &services_snap,
+                                    &mut svc_log_generation,
+                                    &container_selection,
+                                    &bg_tx,
+                                    &logs,
+                                );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = next {
-                                maybe_start_db_poller(i, &db_schemas_snap, &mut db_log_schema, &db_logs, &db_log_gen);
+                                maybe_start_db_stream(
+                                    i,
+                                    &db_schemas_snap,
+                                    &mut db_log_schema,
+                                    &mut db_log_generation,
+                                    &db_logs,
+                                    &bg_tx,
+                                );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
                             }
@@ -503,6 +873,7 @@ async fn run_tui(
                         }
                     }
 
+                    // ── Scroll jump ───────────────────────────────────────
                     KeyCode::PageDown => {
                         if focus == Focus::Logs {
                             auto_scroll   = true;
@@ -528,18 +899,24 @@ async fn run_tui(
                         }
                     }
 
+                    // ── Mount / unmount ───────────────────────────────────
                     KeyCode::Char('m') => {
                         if let SidebarItem::Package(pkg_i) = sidebar_item {
                             if let Some(pkg) = packages_snap.get(pkg_i) {
                                 popup = Some(Popup {
                                     service_name: pkg.identifier.clone(),
-                                    action:       if pkg.mounted { PopupAction::Unmount } else { PopupAction::Mount },
-                                    selected:     0,
+                                    action:       if pkg.mounted {
+                                        PopupAction::Unmount
+                                    } else {
+                                        PopupAction::Mount
+                                    },
+                                    selected: 0,
                                 });
                             }
                         }
                     }
 
+                    // ── VS Code ───────────────────────────────────────────
                     KeyCode::Char('c') => {
                         match sidebar_item {
                             SidebarItem::Package(pkg_i) => {
@@ -548,7 +925,9 @@ async fn run_tui(
                                         let alias = format!("{}-local", pkg.identifier);
                                         let uri   = format!(
                                             "vscode-remote://ssh-remote+{}/workspace/{}-{}",
-                                            alias, pkg.organization_id, pkg.identifier,
+                                            alias,
+                                            pkg.organization_id,
+                                            pkg.identifier,
                                         );
                                         open_vscode(&mut terminal, &uri).await?;
                                     }
@@ -571,6 +950,7 @@ async fn run_tui(
                         }
                     }
 
+                    // ── Shell ─────────────────────────────────────────────
                     KeyCode::Char('s') => {
                         if let SidebarItem::Service(svc_i) = sidebar_item {
                             if let Some(svc) = services_snap.get(svc_i) {
@@ -592,14 +972,19 @@ async fn run_tui(
                         }
                     }
 
+                    // ── Eject / uneject ───────────────────────────────────
                     KeyCode::Char('e') => {
                         if has_deployment && has_lang {
                             if let SidebarItem::Service(svc_i) = sidebar_item {
                                 if let Some(svc) = services_snap.get(svc_i) {
                                     popup = Some(Popup {
                                         service_name: svc.meta_name.clone(),
-                                        action:       if svc.ejected { PopupAction::Uneject } else { PopupAction::Eject },
-                                        selected:     0,
+                                        action:       if svc.ejected {
+                                            PopupAction::Uneject
+                                        } else {
+                                            PopupAction::Eject
+                                        },
+                                        selected: 0,
                                     });
                                 }
                             }
@@ -615,34 +1000,103 @@ async fn run_tui(
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
 /* ================================================================
-   DB SCHEMA LOG POLLER
+   CONTAINER SELECTION HELPER
    ================================================================ */
 
-fn maybe_start_db_poller(
-    idx:            usize,
-    db_schemas:     &[DbSchema],
-    db_log_schema:  &mut Option<usize>,
-    db_logs:        &Arc<Mutex<Option<Vec<String>>>>,
-    db_log_gen:     &Arc<Mutex<u64>>,
+/// Switch the active container for `svc_i`, bump the log generation,
+/// and start a new log stream for the chosen container.
+fn select_container(
+    svc_i:                usize,
+    container_idx:        usize,
+    services:             &[K8sService],
+    container_selection:  &mut HashMap<usize, usize>,
+    svc_log_generation:   &mut u64,
+    bg_tx:                &std::sync::mpsc::Sender<TuiMsg>,
+    logs:                 &Arc<Mutex<HashMap<String, Vec<String>>>>,
+) {
+    let Some(svc) = services.get(svc_i) else { return };
+    let Some(dep) = svc.deployment_name.clone() else { return };
+    let container = svc.containers.get(container_idx).cloned();
+
+    container_selection.insert(svc_i, container_idx);
+
+    // Clear the cached log for this service so the pane shows fresh output.
+    logs.lock().unwrap().remove(&svc.meta_name);
+
+    *svc_log_generation += 1;
+    spawn_service_log_stream(
+        bg_tx.clone(),
+        dep,
+        container,
+        *svc_log_generation,
+    );
+}
+
+/* ================================================================
+   SERVICE LOG SWITCH HELPER
+   ================================================================ */
+
+/// Switch to a different service: bump generation, start a new stream
+/// for the service's currently-selected container.
+fn switch_service_logs(
+    svc_i:               usize,
+    services:            &[K8sService],
+    svc_log_generation:  &mut u64,
+    container_selection: &HashMap<usize, usize>,
+    bg_tx:               &std::sync::mpsc::Sender<TuiMsg>,
+    logs:                &Arc<Mutex<HashMap<String, Vec<String>>>>,
+) {
+    let Some(svc) = services.get(svc_i) else { return };
+    let Some(dep) = svc.deployment_name.clone() else { return };
+
+    // If we already have cached lines for this service don't clear them —
+    // the user will see last known output instantly while new lines arrive.
+
+    let container_idx = *container_selection.get(&svc_i).unwrap_or(&0);
+    let container     = svc.containers.get(container_idx).cloned();
+
+    *svc_log_generation += 1;
+    spawn_service_log_stream(
+        bg_tx.clone(),
+        dep.clone(),
+        container,
+        *svc_log_generation,
+    );
+
+    // Kick off a container fetch if we don't have the list yet.
+    if svc.containers.is_empty() {
+        spawn_container_fetch(bg_tx.clone(), dep, svc_i);
+    }
+}
+
+/* ================================================================
+   DB SCHEMA LOG STREAM HELPER
+   ================================================================ */
+
+fn maybe_start_db_stream(
+    idx:              usize,
+    db_schemas:       &[DbSchema],
+    db_log_schema:    &mut Option<usize>,
+    db_log_generation: &mut u64,
+    db_logs:          &Arc<Mutex<Option<Vec<String>>>>,
+    bg_tx:            &std::sync::mpsc::Sender<TuiMsg>,
 ) {
     if *db_log_schema == Some(idx) {
         return;
     }
 
     *db_log_schema = Some(idx);
-
-    let my_gen = {
-        let mut g = db_log_gen.lock().unwrap();
-        *g += 1;
-        *g
-    };
-
+    *db_log_generation += 1;
     *db_logs.lock().unwrap() = None;
 
     let slug = db_schemas
@@ -655,36 +1109,18 @@ fn maybe_start_db_poller(
         return;
     }
 
-    let db_logs_arc = Arc::clone(db_logs);
-    let gen_arc     = Arc::clone(db_log_gen);
-
-    tokio::spawn(async move {
-        loop {
-            if *gen_arc.lock().unwrap() != my_gen {
-                break;
-            }
-
-            let lines = get_pod_logs(&slug, None).await;
-            let result = if lines.len() == 1 && lines[0].starts_with("No pods found") {
-                Some(vec![])
-            } else {
-                Some(lines)
-            };
-
-            if *gen_arc.lock().unwrap() == my_gen {
-                *db_logs_arc.lock().unwrap() = result;
-            }
-
-            sleep(Duration::from_secs(3)).await;
-        }
-    });
+    spawn_db_log_stream(bg_tx.clone(), slug, None, *db_log_generation);
 }
 
 /* ================================================================
    SIDEBAR NAVIGATION HELPERS
    ================================================================ */
 
-fn sidebar_total(services: &[K8sService], packages: &[Package], db_schemas: &[DbSchema]) -> usize {
+fn sidebar_total(
+    services:   &[K8sService],
+    packages:   &[Package],
+    db_schemas: &[DbSchema],
+) -> usize {
     services.len() + packages.len() + db_schemas.len()
 }
 
@@ -714,8 +1150,8 @@ fn sidebar_next(
 ) -> SidebarItem {
     let total = sidebar_total(services, packages, db_schemas);
     if total == 0 { return current.clone(); }
-    let flat  = sidebar_flat(current, services.len(), packages.len());
-    let next  = (flat + 1).min(total - 1);
+    let flat = sidebar_flat(current, services.len(), packages.len());
+    let next = (flat + 1).min(total - 1);
     sidebar_from_flat(next, services.len(), packages.len())
 }
 
@@ -725,9 +1161,15 @@ fn sidebar_prev(
     packages:   &[Package],
     db_schemas: &[DbSchema],
 ) -> SidebarItem {
-    if sidebar_total(services, packages, db_schemas) == 0 { return current.clone(); }
+    if sidebar_total(services, packages, db_schemas) == 0 {
+        return current.clone();
+    }
     let flat = sidebar_flat(current, services.len(), packages.len());
-    sidebar_from_flat(flat.saturating_sub(1), services.len(), packages.len())
+    sidebar_from_flat(
+        flat.saturating_sub(1),
+        services.len(),
+        packages.len(),
+    )
 }
 
 /* ================================================================
@@ -738,8 +1180,13 @@ fn leave_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture,
-        Clear(ClearType::All), MoveTo(0, 0))?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
     terminal.show_cursor()?;
     io::stdout().flush()?;
     Ok(())
@@ -749,7 +1196,11 @@ fn enter_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     terminal.hide_cursor()?;
     terminal.clear()?;
     Ok(())
@@ -762,7 +1213,10 @@ async fn open_vscode<B: ratatui::backend::Backend + io::Write>(
     leave_tui(terminal)?;
     println!("Opening VS Code: {}", remote_uri);
     match tokio::process::Command::new("code")
-        .arg("--folder-uri").arg(remote_uri).status().await
+        .arg("--folder-uri")
+        .arg(remote_uri)
+        .status()
+        .await
     {
         Ok(s) if s.success() => println!("✓ VS Code launched"),
         Ok(s)  => eprintln!("VS Code exited: {s}"),
