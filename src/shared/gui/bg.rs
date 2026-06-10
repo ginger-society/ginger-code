@@ -24,7 +24,7 @@ pub enum BgMsg {
     EjectedFlag { idx: usize, ejected: bool, ejected_container: Option<String> },
     Logs { lines: Vec<String>, generation: u64 },
     /// Logs for the selected DB schema deployment (empty vec = no deployment found).
-    DbSchemaLogs { lines: Vec<String>, schema_idx: usize },
+    DbSchemaLogs { lines: Vec<String>, schema_idx: usize, generation: u64 },
     Error(String),
     EjectResult { success: bool, message: String, idx: usize },
     /// Result of a mount or unmount operation for a package.
@@ -245,7 +245,8 @@ pub fn spawn_db_schema_logs(
     ctx:        egui::Context,
     schema_idx: usize,
     slug:       String,
-    container:  Option<String>,    // ← new
+    container:  Option<String>,
+    generation: u64,              // ← new
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -255,14 +256,19 @@ pub fn spawn_db_schema_logs(
             loop {
                 let lines = get_pod_logs(&slug, container.as_deref()).await;
                 let normalised = if lines.len() == 1
-                    && (lines[0].starts_with("No pods found") || lines[0].starts_with("No pods found for deployment"))
+                    && (lines[0].starts_with("No pods found")
+                        || lines[0].starts_with("No pods found for deployment"))
                 {
                     vec![]
                 } else {
                     lines
                 };
 
-                if tx.send(BgMsg::DbSchemaLogs { lines: normalised, schema_idx }).is_err() {
+                if tx.send(BgMsg::DbSchemaLogs {
+                    lines: normalised,
+                    schema_idx,
+                    generation,     // ← forward
+                }).is_err() {
                     break;
                 }
                 ctx.request_repaint();

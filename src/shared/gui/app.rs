@@ -38,9 +38,7 @@ pub struct App {
     /// In-flight mount/unmount description + package index.
     mounting: Option<(usize, String)>,
     /// Index of the DB schema whose logs are currently being polled.
-    db_log_schema_idx: Option<usize>,
     ctx:      egui::Context,
-    db_log_pending_idx: Option<usize>,
 }
 
 impl App {
@@ -73,9 +71,7 @@ impl App {
             loading:            true,
             ejecting:           None,
             mounting:           None,
-            db_log_schema_idx:  None,
             ctx,
-            db_log_pending_idx: None,
         }
     }
 
@@ -122,29 +118,24 @@ impl App {
     // ── DB schema selection ───────────────────────────────────────────────────
 
     fn select_db_schema(&mut self, schema_idx: usize) {
-        self.state.right_pane  = RightPane::DbSchemaDetail(schema_idx);
-        self.state.db_logs     = vec![];
-        self.state.db_containers        = vec![];     // ← reset
-        self.state.db_selected_container = None;      // ← reset
-
-        if self.db_log_schema_idx == Some(schema_idx) {
-            return;
-        }
-        self.db_log_schema_idx  = None;
-        self.db_log_pending_idx = Some(schema_idx);
+        self.state.right_pane             = RightPane::DbSchemaDetail(schema_idx);
+        self.state.db_logs                = vec![];
+        self.state.db_containers          = vec![];
+        self.state.db_selected_container  = None;
+        self.state.db_log_generation     += 1;
 
         let slug = self.state.db_schemas
             .get(schema_idx)
             .and_then(|s| s.k8s_name.clone())
             .unwrap_or_default();
 
+        let gen = self.state.db_log_generation;
+
         spawn_db_schema_logs(
             self.tx.clone(), self.ctx.clone(),
-            schema_idx, slug.clone(),
-            None,    // ← no container override initially
+            schema_idx, slug.clone(), None, gen,
         );
 
-        // Fetch containers for the tab bar
         if !slug.is_empty() {
             spawn_db_container_fetch(
                 self.tx.clone(), self.ctx.clone(),
@@ -154,12 +145,11 @@ impl App {
     }
 
     fn select_db_container(&mut self, schema_idx: usize, container: String) {
-        self.state.db_selected_container = Some(container.clone());
-        self.state.db_logs = vec![];
+        self.state.db_selected_container  = Some(container.clone());
+        self.state.db_logs                = vec![];
+        self.state.db_log_generation     += 1;    // ← kills the previous poller
 
-        self.db_log_schema_idx  = None;
-        self.db_log_pending_idx = Some(schema_idx);
-
+        let gen  = self.state.db_log_generation;
         let slug = self.state.db_schemas
             .get(schema_idx)
             .and_then(|s| s.k8s_name.clone())
@@ -167,8 +157,7 @@ impl App {
 
         spawn_db_schema_logs(
             self.tx.clone(), self.ctx.clone(),
-            schema_idx, slug,
-            Some(container),
+            schema_idx, slug, Some(container), gen,
         );
     }
 
@@ -445,16 +434,13 @@ impl App {
         loop {
             match self.rx.try_recv() {
                 Ok(BgMsg::DbContainers { schema_idx, containers }) => {
-                    // Only apply if this is still the active schema
                     if matches!(self.state.right_pane, RightPane::DbSchemaDetail(i) if i == schema_idx) {
                         self.state.db_selected_container = containers.first().cloned();
-                        self.state.db_containers = containers;
+                        self.state.db_containers         = containers;
 
-                        // Restart log poller with the now-known first container
                         if let Some(container) = self.state.db_selected_container.clone() {
-                            self.db_log_schema_idx  = None;
-                            self.db_log_pending_idx = Some(schema_idx);
-
+                            self.state.db_log_generation += 1;    // ← kills the container=None poller
+                            let gen  = self.state.db_log_generation;
                             let slug = self.state.db_schemas
                                 .get(schema_idx)
                                 .and_then(|s| s.k8s_name.clone())
@@ -462,8 +448,7 @@ impl App {
 
                             spawn_db_schema_logs(
                                 self.tx.clone(), self.ctx.clone(),
-                                schema_idx, slug,
-                                Some(container),
+                                schema_idx, slug, Some(container), gen,
                             );
                         }
                     }
@@ -610,12 +595,8 @@ impl App {
                     }
                 }
 
-                Ok(BgMsg::DbSchemaLogs { lines, schema_idx }) => {
-                    if self.db_log_pending_idx == Some(schema_idx) {
-                        self.db_log_schema_idx  = Some(schema_idx);
-                        self.db_log_pending_idx = None;
-                    }
-                    if self.db_log_schema_idx == Some(schema_idx) {
+                Ok(BgMsg::DbSchemaLogs { lines, schema_idx, generation }) => {
+                    if generation == self.state.db_log_generation {
                         self.state.db_logs = lines;
                     }
                 }
@@ -751,16 +732,19 @@ impl eframe::App for App {
                 }
 
                 // ── DB schema detail ──────────────────────────────────────────
+                // In update(), the DbSchemaDetail render block:
                 if let RightPane::DbSchemaDetail(idx) = self.state.right_pane {
                     if let Some(schema) = self.state.db_schemas.get(idx).cloned() {
-                        let logs_opt: Option<&[String]> = if self.db_log_schema_idx == Some(idx) {
+                        // Show logs as soon as we have any — generation ensures they're current
+                        let logs_opt: Option<&[String]> = if self.state.db_log_generation > 0
+                            && !self.state.db_logs.is_empty()
+                        {
                             Some(&self.state.db_logs)
                         } else {
-                            None
+                            None   // still shows "Looking for deployment…"
                         };
 
-                        // Pass container state into the detail panel
-                        let containers        = self.state.db_containers.clone();
+                        let containers         = self.state.db_containers.clone();
                         let selected_container = self.state.db_selected_container.clone();
 
                         if let Some(container) = draw_db_schema_detail(

@@ -101,6 +101,7 @@ pub struct AppState {
     pub db_logs:         Vec<String>,
     pub db_containers:        Vec<String>,        
     pub db_selected_container: Option<String>,
+    pub db_log_generation:     u64,
     pub term_tabs:       Vec<TermTab>,
     pub tabs_by_service: HashMap<usize, Vec<TermTab>>,
     pub active_term:     usize,
@@ -135,6 +136,7 @@ impl AppState {
             raised_on_open:  false,
             db_containers:         Vec::new(),    
             db_selected_container: None,   
+            db_log_generation: 0,
         }
     }
 
