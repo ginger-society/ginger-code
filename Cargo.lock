@@ -2135,6 +2135,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -2396,6 +2397,7 @@ dependencies = [
  "dirs 6.0.0",
  "eframe",
  "egui",
+ "futures",
  "ginger-shared-rs",
  "image",
  "indexmap 2.1.0",
@@ -6672,6 +6674,7 @@ checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "slab",

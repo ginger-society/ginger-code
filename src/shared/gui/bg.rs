@@ -11,7 +11,7 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, get_transitioning_deployments, is_ejected}, k8s_ops::get_deployment_annotation, mount, types::{DbSchema, K8sService, Package}, unmount
+    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_transitioning_deployments, is_ejected}, k8s_ops::get_deployment_annotation, mount, types::{DbSchema, K8sService, Package}, unmount
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -226,43 +226,7 @@ pub fn spawn_unmount(
 /// Poll logs for a DB schema's deployment (by identifier slug).
 /// Sends `DbSchemaLogs` with an empty vec if no deployment exists.
 /// Runs until the sender is dropped (i.e. the user switches away).
-pub fn spawn_db_schema_logs(
-    tx:         mpsc::Sender<BgMsg>,
-    ctx:        egui::Context,
-    schema_idx: usize,
-    slug:       String,
-    container:  Option<String>,
-    generation: u64,              // ← new
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().expect("tokio rt");
 
-        rt.block_on(async move {
-            loop {
-                let lines = get_pod_logs(&slug, container.clone()).await;
-                let normalised = if lines.len() == 1
-                    && (lines[0].starts_with("No pods found")
-                        || lines[0].starts_with("No pods found for deployment"))
-                {
-                    vec![]
-                } else {
-                    lines
-                };
-
-                if tx.send(BgMsg::DbSchemaLogs {
-                    lines: normalised,
-                    schema_idx,
-                    generation,     // ← forward
-                }).is_err() {
-                    break;
-                }
-                ctx.request_repaint();
-                sleep(Duration::from_secs(3)).await;
-            }
-        });
-    });
-}
 
 pub fn spawn_db_container_fetch(
     tx:         mpsc::Sender<BgMsg>,
@@ -301,28 +265,34 @@ pub fn spawn_container_fetch(
         });
     });
 }
+pub use spawn_service_logs as spawn_logs_for_container;
 
-pub fn spawn_logs_for_container(
-    tx:              mpsc::Sender<BgMsg>,
-    ctx:             egui::Context,
-    deployment_name: String,
-    container:       Option<String>,
-    generation:      u64,
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().expect("tokio rt");
 
-        rt.block_on(async move {
-            loop {
-                let lines = get_pod_logs(&deployment_name, container.clone()).await;
-                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
-                ctx.request_repaint();
-                sleep(Duration::from_secs(2)).await;
-            }
-        });
-    });
-}
+// ── Replacement log spawners for bg.rs ───────────────────────────────────────
+//
+// Drop-in replacements for spawn_service_logs, spawn_logs_for_container,
+// and spawn_db_schema_logs. Everything else in bg.rs stays the same.
+//
+// How it works:
+//   1. An unbounded channel (line_tx / line_rx) is created per spawn call.
+//   2. A tokio task calls stream_pod_logs, which seeds 500 tail lines then
+//      follows live. Each line is sent on line_tx.
+//   3. A second tokio task drains line_rx, appends to a local Vec<String>,
+//      sends a BgMsg::Logs (snapshot of all lines so far) on every new line,
+//      and requests a repaint.
+//   4. When the stream ends (pod restart, container switch, generation bump)
+//      stream_pod_logs returns. The spawner sleeps 2 s and retries — the
+//      line_rx drain task exits when line_tx is dropped (i.e. on retry or
+//      when the outer thread exits because the mpsc::Sender was dropped).
+//
+// Generation gating (same as before):
+//   BgMsg::Logs carries `generation`; app.rs drops messages whose generation
+//   doesn't match the current one, killing stale pollers automatically.
+
+use tokio::sync::mpsc as async_mpsc;
+
+use crate::shared::core::k8_info::stream_pod_logs;
+
 
 pub fn spawn_service_logs(
     tx:              mpsc::Sender<BgMsg>,
@@ -336,10 +306,113 @@ pub fn spawn_service_logs(
             .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+
             loop {
-                let lines = get_pod_logs(&deployment_name, container.clone()).await;
-                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
-                ctx.request_repaint();
+                // Fresh channel each attempt so old line_tx drops cleanly.
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+
+                // Stream task — runs until pod stream ends or line_tx is dropped.
+                let dep   = deployment_name.clone();
+                let cont  = container.clone();
+                tokio::spawn(async move {
+                    stream_pod_logs(&dep, cont, line_tx).await;
+                });
+
+                // Drain task — forwards each line to the UI immediately.
+                loop {
+                    match line_rx.recv().await {
+                        None => break, // stream ended
+                        Some(line) => {
+                            lines.push(line);
+                            // Cap buffer so the UI doesn't grow unbounded.
+                            if lines.len() > 2000 {
+                                lines.drain(0..500);
+                            }
+                            if tx.send(BgMsg::Logs {
+                                lines: lines.clone(),
+                                generation,
+                            }).is_err() {
+                                return; // app closed
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+
+                // Stream ended (pod restarted etc.) — check if still wanted,
+                // then wait before reconnecting.
+                if tx.send(BgMsg::Logs { lines: lines.clone(), generation }).is_err() {
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+// ── spawn_db_schema_logs ──────────────────────────────────────────────────────
+
+pub fn spawn_db_schema_logs(
+    tx:         mpsc::Sender<BgMsg>,
+    ctx:        egui::Context,
+    schema_idx: usize,
+    slug:       String,
+    container:  Option<String>,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+
+            loop {
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+
+                let dep  = slug.clone();
+                let cont = container.clone();
+                tokio::spawn(async move {
+                    stream_pod_logs(&dep, cont, line_tx).await;
+                });
+
+                loop {
+                    match line_rx.recv().await {
+                        None => break,
+                        Some(line) => {
+                            lines.push(line);
+                            if lines.len() > 2000 {
+                                lines.drain(0..500);
+                            }
+                            // Normalise "no pods" sentinel to empty vec so the
+                            // UI shows "No deployment found" rather than an error.
+                            let normalised = if lines.len() == 1
+                                && lines[0].starts_with("No pods found")
+                            {
+                                vec![]
+                            } else {
+                                lines.clone()
+                            };
+                            if tx.send(BgMsg::DbSchemaLogs {
+                                lines: normalised,
+                                schema_idx,
+                                generation,
+                            }).is_err() {
+                                return;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+
+                if tx.send(BgMsg::DbSchemaLogs {
+                    lines: lines.clone(),
+                    schema_idx,
+                    generation,
+                }).is_err() {
+                    return;
+                }
                 sleep(Duration::from_secs(2)).await;
             }
         });

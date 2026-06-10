@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use tokio::io::AsyncBufReadExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{Api, Client};
-use kube::api::ListParams;
+use kube::api::{ListParams, LogParams};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 // ── Client helper ─────────────────────────────────────────────────────────────
 
@@ -13,8 +15,6 @@ async fn client() -> Client {
 
 // ── meta_to_deployment_name ───────────────────────────────────────────────────
 
-/// "@ginger-society/dev-portal"  → "dev-portal"
-/// "@ginger-society/IAMService"  → "iamservice"
 pub fn meta_to_deployment_name(meta_name: &str) -> String {
     meta_name
         .split('/')
@@ -51,7 +51,6 @@ pub async fn is_ejected(deployment_name: &str) -> bool {
 
 // ── get_k8s_deployments ───────────────────────────────────────────────────────
 
-/// Returns map: deployment_name → (status, ready_string)
 pub async fn get_k8s_deployments() -> HashMap<String, (String, String)> {
     let api: Api<Deployment> = Api::default_namespaced(client().await);
     let Ok(list) = api.list(&ListParams::default()).await else {
@@ -112,10 +111,8 @@ pub async fn get_k8s_statefulsets() -> HashMap<String, (String, String)> {
 
 // ── resolve_pod_name ──────────────────────────────────────────────────────────
 //
-// Shared by get_pod_containers and get_pod_logs.
+// Shared by get_pod_containers and stream_pod_logs.
 // Tries label selectors first, falls back to pod-name prefix matching.
-// This is necessary for Helm-managed StatefulSets (e.g. my-db-postgresql-0)
-// which don't carry an `app=` label.
 
 async fn resolve_pod_name(deployment_name: &str) -> Option<String> {
     let api: Api<Pod> = Api::default_namespaced(client().await);
@@ -179,40 +176,62 @@ pub async fn get_pod_containers(deployment_name: &str) -> Option<(String, Vec<St
     if containers.is_empty() { None } else { Some((pod_name, containers)) }
 }
 
-// ── get_pod_logs — kubectl shell-out using resolved pod name ──────────────────
+// ── stream_pod_logs ───────────────────────────────────────────────────────────
+//
+// Streams log lines for `deployment_name` into `line_tx`.
+// - Seeds with the last 500 lines via `tail_lines: Some(500)`.
+// - Then follows the live stream (`follow: true`) until the sender is dropped
+//   or the pod stream ends, at which point it returns so the caller can retry.
+//
+// The caller is responsible for the retry/reconnect loop (see bg.rs).
 
-pub async fn get_pod_logs(deployment_name: &str, container: Option<String>) -> Vec<String> {
+pub async fn stream_pod_logs(
+    deployment_name: &str,
+    container:       Option<String>,
+    line_tx:         tokio::sync::mpsc::UnboundedSender<String>,
+) {
     let pod_name = match resolve_pod_name(deployment_name).await {
         Some(p) => p,
-        None    => return vec![format!("No pods found for deployment '{}'.", deployment_name)],
+        None => return,
     };
 
-    let mut args: Vec<String> = vec![
-        "logs".into(),
-        "--tail=500".into(),
-        pod_name,
-    ];
-    if let Some(ref c) = container {
-        args.push("--container".into());
-        args.push(c.clone());
-    }
+    let api: Api<Pod> = Api::default_namespaced(client().await);
 
-    match tokio::process::Command::new("kubectl")
-        .args(&args)
-        .output()
-        .await
-    {
-        Ok(out) => {
-            if !out.stderr.is_empty() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                return vec![format!("kubectl logs error: {}", err.trim())];
-            }
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(|s| s.to_string())
-                .collect()
+    let params = LogParams {
+        follow:     true,
+        tail_lines: Some(500),
+        container:  container.clone(),
+        ..Default::default()
+    };
+
+    let stream = match api.log_stream(&pod_name, &params).await {
+        Ok(s)  => s,
+        Err(e) => {
+            let _ = line_tx.send(format!("log stream error: {}", e));
+            return;
         }
-        Err(e) => vec![format!("Failed to fetch logs: {}", e)],
+    };
+
+    let reader = tokio::io::BufReader::new(stream.compat());
+    let mut lines = reader.lines();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if line_tx.send(line).is_err() {
+                    // Receiver dropped — container switched or app closed.
+                    return;
+                }
+            }
+            Ok(None) => {
+                // Stream ended cleanly (pod restarted / completed).
+                return;
+            }
+            Err(e) => {
+                let _ = line_tx.send(format!("log stream error: {}", e));
+                return;
+            }
+        }
     }
 }
 
