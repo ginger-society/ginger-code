@@ -23,6 +23,7 @@ pub struct K8sService {
     /// Some(name) = explicit --container flag passed to kubectl logs / exec.
     pub selected_container:   Option<String>,
     pub ejected_container:    Option<String>,
+    pub transitioning: bool,
 }
 
 /// A package from the metadata service — not deployed on k8s.

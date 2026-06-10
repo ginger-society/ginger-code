@@ -207,6 +207,12 @@ impl App {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
         if svc.ejected { return; }
 
+        // Close all terminal tabs — the pod is about to restart and every
+        // existing session will be forcibly disconnected anyway.
+        self.state.term_tabs.clear();
+        self.state.right_pane  = RightPane::Logs;
+        self.state.active_term = 0;
+
         let Some(dep)  = svc.deployment_name.clone() else { return };
         let Some(lang) = svc.lang.clone()            else { return };
 
@@ -236,6 +242,13 @@ impl App {
     fn run_uneject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
         if !svc.ejected { return; }
+
+
+        // Close all terminal tabs — the pod is about to restart and every
+        // existing session will be forcibly disconnected anyway.
+        self.state.term_tabs.clear();
+        self.state.right_pane  = RightPane::Logs;
+        self.state.active_term = 0;
 
         let Some(dep) = svc.deployment_name.clone() else { return };
         let meta_name = svc.meta_name.clone();
@@ -383,6 +396,13 @@ impl App {
         loop {
             match self.rx.try_recv() {
 
+                Ok(BgMsg::TransitioningSet(set)) => {
+                    for svc in &mut self.state.services {
+                        if let Some(ref dep) = svc.deployment_name {
+                            svc.transitioning = set.contains(dep);
+                        }
+                    }
+                }
                 // ── Containers arrived ────────────────────────────────────────
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {

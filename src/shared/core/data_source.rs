@@ -97,6 +97,7 @@ pub async fn fetch_services(
                 containers:         vec![],   // populated after first pod poll
                 selected_container: None,
                 ejected_container:  None,
+                transitioning: false
             }
         })
         .collect();

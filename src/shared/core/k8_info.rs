@@ -206,3 +206,39 @@ pub async fn get_k8s_statefulsets() -> HashMap<String, (String, String)> {
     }
     map
 }
+
+
+/// Returns the set of deployment names (via `app=` label) that have at least
+/// one pod in a transient state: Terminating, ContainerCreating, Pending.
+pub async fn get_transitioning_deployments() -> std::collections::HashSet<String> {
+    let out = tokio::process::Command::new("kubectl")
+        .args(&[
+            "get", "pods",
+            "--no-headers",
+            "-o", "custom-columns=\
+                APP:.metadata.labels.app,\
+                PHASE:.status.phase,\
+                DELETED:.metadata.deletionTimestamp",
+        ])
+        .output()
+        .await;
+
+    let mut set = std::collections::HashSet::new();
+    let Ok(out) = out else { return set };
+
+    for line in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+    {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+        let app     = parts[0];
+        let phase   = parts[1]; // "Running", "Pending", "Succeeded", "Failed"
+        let deleted = parts[2]; // "<none>" or a timestamp
+
+        if deleted != "<none>" || phase == "Pending" {
+            set.insert(app.to_string());
+        }
+    }
+    set
+}

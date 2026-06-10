@@ -11,7 +11,7 @@ use ginger_shared_rs::utils::get_token_from_file_storage;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
-    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, is_ejected}, k8s_ops::get_deployment_annotation, mount, types::{DbSchema, K8sService, Package}, unmount
+    data_source::{fetch_current_workspace, fetch_dbs, fetch_dbs_enriched, fetch_packages, fetch_services}, k8_info::{get_k8s_deployments, get_pod_containers, get_pod_logs, get_transitioning_deployments, is_ejected}, k8s_ops::get_deployment_annotation, mount, types::{DbSchema, K8sService, Package}, unmount
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -31,6 +31,7 @@ pub enum BgMsg {
     MountResult { success: bool, message: String, pkg_idx: usize, mounted: bool },
     /// Container names for a service's running pod.
     Containers { svc_idx: usize, containers: Vec<String> },
+    TransitioningSet(std::collections::HashSet<String>),
 }
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
@@ -103,8 +104,10 @@ pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
 
         rt.block_on(async move {
             loop {
-                let deployments = get_k8s_deployments().await;
+                let deployments    = get_k8s_deployments().await;
+                let transitioning  = get_transitioning_deployments().await;   // ← new
                 let _ = tx.send(BgMsg::K8sStatuses(deployments));
+                let _ = tx.send(BgMsg::TransitioningSet(transitioning));       // ← new
                 ctx.request_repaint();
                 sleep(Duration::from_secs(5)).await;
             }

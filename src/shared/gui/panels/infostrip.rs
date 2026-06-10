@@ -132,6 +132,38 @@ pub fn draw_info_strip(
         COLOR_MUTED,
     );
 
+    // After painting the deploy/lang text, before the eject button:
+
+    if svc.transitioning {
+        let t    = ui.input(|i| i.time);
+        let dots = match ((t * 3.0) as usize) % 4 { 0=>"", 1=>".", 2=>"..", _=>"..." };
+        
+        // Badge rect — sits left of the eject/uneject button(s)
+        let badge_text  = format!("⟳ Please wait a moment while updating{}", dots);
+        let badge_w     = badge_text.len() as f32 * 6.5 + 10.0;
+        let right_edge  = eject_btn_rect
+            .or(uneject_btn_rect)
+            .map(|r| r.min.x)
+            .unwrap_or(rect.max.x);
+        
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(right_edge - badge_w - 8.0, btn_y),
+            egui::vec2(badge_w, btn_h),
+        );
+        
+        // Pulse: alpha oscillates between 40% and 90%
+        
+        painter.text(
+            badge_rect.center(), egui::Align2::CENTER_CENTER,
+            &badge_text,
+            egui::FontId::new(10.0, egui::FontFamily::Monospace),
+            egui::Color32::WHITE,
+        );
+        
+        // Keep repainting for the animation
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
     // ── Eject button ──────────────────────────────────────────────────────────
     if let (Some(r), Some(resp)) = (eject_btn_rect, &eject_resp) {
         let color = if resp.hovered() {
