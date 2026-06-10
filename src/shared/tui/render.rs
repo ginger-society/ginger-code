@@ -148,7 +148,7 @@ pub fn help_text(
                     .to_string()
             }
             SidebarItem::DbSchema(_) => {
-                "↑/↓ navigate  |  → logs  |  q quit".to_string()
+                "↑/↓ navigate  |  → logs  |  ⇧←/⇧→ container  |  q quit".to_string()
             }
         },
         Focus::Logs => {
@@ -190,6 +190,8 @@ pub fn draw(
     popup:                Option<&Popup>,
     active_container_idx: usize,
     active_container:     Option<&str>,
+    db_containers:        &[String],
+    db_selected_container: Option<&str>,
 ) -> DrawnAreas {
     let area = f.size();
 
@@ -221,6 +223,9 @@ pub fn draw(
         false
     };
 
+    // Multi-container flag for the current DB schema.
+    let db_multi_container = db_containers.len() > 1;
+
     let logs_area = match sidebar_item {
         SidebarItem::Package(pkg_idx) => {
             draw_package_detail(f, chunks[1], packages.get(*pkg_idx), focus);
@@ -230,6 +235,7 @@ pub fn draw(
             draw_db_schema_detail(
                 f, chunks[1], db_schemas.get(*db_idx), db_logs,
                 focus, scroll_offset, auto_scroll,
+                db_containers, db_selected_container,
             );
             right_chunks[1]
         }
@@ -253,7 +259,7 @@ pub fn draw(
                 );
                 draw_container_tabs(
                     f, info_chunks[1],
-                    selected.map(|s| s.containers.as_slice()).unwrap_or(&[]),
+                    selected,
                     active_container_idx,
                     active_container,
                 );
@@ -277,10 +283,14 @@ pub fn draw(
     };
 
     // ── Help bar ──────────────────────────────────────────────────────────────
+    // Derive multi_container for help text — covers both service and DB schema.
+    let help_multi = multi_container
+        || (matches!(sidebar_item, SidebarItem::DbSchema(_)) && db_multi_container);
+
     f.render_widget(
         Paragraph::new(help_text(
             focus, sidebar_item, has_deployment, has_lang,
-            is_ejected_now, multi_container,
+            is_ejected_now, help_multi,
         ))
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::TOP)),
@@ -296,63 +306,130 @@ pub fn draw(
 }
 
 /* ================================================================
-   CONTAINER TAB BAR
+   CONTAINER TAB BAR  (services)
    ================================================================ */
 
-/// Renders a row of container name tabs.  Active tab is highlighted in yellow.
-/// Navigation hint is shown on the right.
+/// Renders a row of container name tabs for a service.
 fn draw_container_tabs(
     f:                 &mut Frame,
     area:              Rect,
-    containers:        &[String],
+    selected_svc:      Option<&K8sService>,
     active_idx:        usize,
     _active_container: Option<&str>,
 ) {
-    if containers.is_empty() { return; }
+    let svc = match selected_svc {
+        Some(s) if !s.containers.is_empty() => s,
+        _ => return,
+    };
+
+    let containers       = &svc.containers;
+    let ejected_name     = svc.ejected_container.as_deref().unwrap_or("");
+    let svc_is_ejected   = svc.ejected;
 
     let tab_w = (area.width as usize / containers.len().max(1)).max(1) as u16;
 
     let mut spans: Vec<Span> = Vec::new();
     for (i, name) in containers.iter().enumerate() {
-        let is_active = i == active_idx;
-        // Pad/truncate label to tab_w - 2 so borders don't crowd.
+        let is_active      = i == active_idx;
+        let is_ejected_tab = svc_is_ejected && name.as_str() == ejected_name;
+
+        let raw_label = if is_ejected_tab {
+            format!("⚡ {}", name)
+        } else {
+            name.clone()
+        };
+
+        let label = if raw_label.len() + 2 > tab_w as usize {
+            format!(" {:.width$} ", raw_label, width = (tab_w as usize).saturating_sub(2))
+        } else {
+            format!(" {:<width$} ", raw_label, width = (tab_w as usize).saturating_sub(2))
+        };
+
+        spans.push(if is_active {
+            let fg = if is_ejected_tab { Color::Magenta } else { Color::Black };
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(fg)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if is_ejected_tab {
+            Span::styled(label, Style::default().fg(Color::Magenta))
+        } else {
+            Span::styled(label, Style::default().fg(Color::DarkGray))
+        });
+
+        if i + 1 < containers.len() {
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    spans.push(Span::styled(
+        "  ⇧←/⇧→",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ));
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+        area,
+    );
+}
+
+/* ================================================================
+   CONTAINER TAB BAR  (DB schemas)
+   ================================================================ */
+
+/// Renders a row of container name tabs for a DB schema.
+/// Only shown when there are 2+ containers.
+fn draw_db_container_tabs(
+    f:         &mut Frame,
+    area:      Rect,
+    containers: &[String],
+    selected:  Option<&str>,
+) {
+    if containers.len() <= 1 {
+        return;
+    }
+
+    let tab_w = (area.width as usize / containers.len().max(1)).max(1) as u16;
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, name) in containers.iter().enumerate() {
+        let is_active = selected == Some(name.as_str());
+
         let label = if name.len() + 2 > tab_w as usize {
             format!(" {:.width$} ", name, width = (tab_w as usize).saturating_sub(2))
         } else {
             format!(" {:<width$} ", name, width = (tab_w as usize).saturating_sub(2))
         };
 
-        if is_active {
-            spans.push(Span::styled(
+        spans.push(if is_active {
+            Span::styled(
                 label,
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            ));
+            )
         } else {
-            spans.push(Span::styled(
-                label,
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        // Divider between tabs.
+            Span::styled(label, Style::default().fg(Color::DarkGray))
+        });
+
         if i + 1 < containers.len() {
-            spans.push(Span::styled(
-                "│",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
         }
     }
 
-    // Hint at right-hand side.
-    let hint = Span::styled(
+    spans.push(Span::styled(
         "  ⇧←/⇧→",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    );
-    spans.push(hint);
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+    ));
 
     f.render_widget(
         Paragraph::new(Line::from(spans))
@@ -438,7 +515,6 @@ fn draw_sidebar(
             Span::raw("")
         };
 
-        // Show container count badge if multi-container.
         let container_badge = if svc.containers.len() > 1 {
             let badge_style = if is_sel {
                 Style::default().bg(Color::Yellow).fg(Color::Cyan)
@@ -766,28 +842,19 @@ fn draw_logs(
     scroll_offset:    usize,
     active_container: Option<&str>,
 ) {
-    // Show the "ejected / dev mode" splash ONLY when:
-    //   - The service is ejected AND
-    //   - We know which container is ejected (ejected_container is Some) AND
-    //   - The currently active container matches the ejected one.
-    //
-    // When container list hasn't loaded yet (active_container is None) OR
-    // when the user has shifted to a sidecar container, show logs normally.
     let viewing_ejected_container = selected.map(|s| {
         if !s.ejected { return false; }
-
         match (active_container, s.ejected_container.as_deref()) {
-            // Both known: only show splash when viewing the ejected container.
             (Some(ac), Some(ec)) => ac == ec,
-            // active_container not known yet (container list still loading):
-            // don't block — show logs pane, it will just show "Fetching…".
-            (None, _) => false,
-            // ejected_container not known yet: same — don't block prematurely.
-            (Some(_), None) => false,
+            _ => false,
         }
     }).unwrap_or(false);
 
     if viewing_ejected_container {
+        let container_label = selected
+            .and_then(|s| s.ejected_container.as_deref())
+            .unwrap_or("container");
+
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -802,8 +869,19 @@ fn draw_logs(
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
-                        "The container is running  sleep infinity  — no application logs.",
+                        format!(
+                            "Container '{}' is running  sleep infinity  — no application logs.",
+                            container_label,
+                        ),
                         Style::default().fg(Color::Gray),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Use ⇧← / ⇧→ to switch to a sidecar container.",
+                        Style::default().fg(Color::DarkGray),
                     ),
                 ]),
                 Line::from(""),
@@ -990,6 +1068,7 @@ fn draw_package_detail(f: &mut Frame, area: Rect, pkg: Option<&Package>, focus: 
    DB SCHEMA DETAIL PANEL
    ================================================================ */
 
+#[allow(clippy::too_many_arguments)]
 fn draw_db_schema_detail(
     f:             &mut Frame,
     area:          Rect,
@@ -998,6 +1077,8 @@ fn draw_db_schema_detail(
     focus:         &Focus,
     scroll_offset: usize,
     auto_scroll:   bool,
+    db_containers:         &[String],
+    db_selected_container: Option<&str>,
 ) {
     let Some(schema) = schema else {
         f.render_widget(
@@ -1008,10 +1089,27 @@ fn draw_db_schema_detail(
         return;
     };
 
+    // Layout: info strip | [optional container tabs] | logs
+    let has_tabs = db_containers.len() > 1;
+    let constraints = if has_tabs {
+        vec![
+            Constraint::Length(7), // info strip
+            Constraint::Length(2), // container tab bar
+            Constraint::Min(0),    // logs
+        ]
+    } else {
+        vec![
+            Constraint::Length(7), // info strip
+            Constraint::Min(0),    // logs
+        ]
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints(constraints)
         .split(area);
+
+    let logs_chunk = if has_tabs { chunks[2] } else { chunks[1] };
 
     // ── Info strip ────────────────────────────────────────────────────────────
     let db_type = schema.db_type.as_deref().unwrap_or("db");
@@ -1089,6 +1187,11 @@ fn draw_db_schema_detail(
         chunks[0],
     );
 
+    // ── Container tab bar (only when 2+ containers) ───────────────────────────
+    if has_tabs {
+        draw_db_container_tabs(f, chunks[1], db_containers, db_selected_container);
+    }
+
     // ── Logs pane ─────────────────────────────────────────────────────────────
     match db_logs {
         None => {
@@ -1106,7 +1209,7 @@ fn draw_db_schema_detail(
                         .title(" Logs ")
                         .border_style(Style::default().fg(Color::DarkGray)),
                 ),
-                chunks[1],
+                logs_chunk,
             );
         }
 
@@ -1130,14 +1233,14 @@ fn draw_db_schema_detail(
                         .title(" Logs — No Deployment ")
                         .border_style(Style::default().fg(Color::DarkGray)),
                 ),
-                chunks[1],
+                logs_chunk,
             );
         }
 
         Some(lines) => {
             let log_text   = lines.join("\n");
             let num_lines  = log_text.lines().count();
-            let height     = chunks[1].height.saturating_sub(2) as usize;
+            let height     = logs_chunk.height.saturating_sub(2) as usize;
             let max_scroll = num_lines.saturating_sub(height);
             let offset     = if auto_scroll {
                 max_scroll
@@ -1145,9 +1248,20 @@ fn draw_db_schema_detail(
                 scroll_offset.min(max_scroll)
             };
 
+            // Show which container we're tailing when there are multiple.
+            let title = if let Some(name) = db_selected_container {
+                if db_containers.len() > 1 {
+                    format!(" Logs [{}] ", name)
+                } else {
+                    " Logs [FOLLOW] ".to_string()
+                }
+            } else {
+                " Logs [FOLLOW] ".to_string()
+            };
+
             let inner_area = Rect {
-                width: chunks[1].width.saturating_sub(1),
-                ..chunks[1]
+                width: logs_chunk.width.saturating_sub(1),
+                ..logs_chunk
             };
 
             f.render_widget(
@@ -1155,7 +1269,7 @@ fn draw_db_schema_detail(
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(" Logs [FOLLOW] ")
+                            .title(title)
                             .border_style(if *focus == Focus::Logs {
                                 Style::default().fg(Color::Yellow)
                             } else {
@@ -1175,10 +1289,10 @@ fn draw_db_schema_detail(
                     .track_symbol(Some("│"))
                     .thumb_symbol("█"),
                 Rect {
-                    x:      chunks[1].x + chunks[1].width.saturating_sub(1),
-                    y:      chunks[1].y + 1,
+                    x:      logs_chunk.x + logs_chunk.width.saturating_sub(1),
+                    y:      logs_chunk.y + 1,
                     width:  1,
-                    height: chunks[1].height.saturating_sub(2),
+                    height: logs_chunk.height.saturating_sub(2),
                 },
                 &mut sb,
             );

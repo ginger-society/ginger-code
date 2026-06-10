@@ -305,6 +305,12 @@ async fn run_tui(
     let mut db_log_generation: u64 = 0;
     let mut db_log_schema: Option<usize> = None;
 
+    // DB schema container state — mirrors gui AppState fields
+    // db_containers: resolved container list for the current DB schema
+    // db_selected_container: the one whose logs are being streamed
+    let mut db_containers:          Vec<String>   = Vec::new();
+    let mut db_selected_container:  Option<String> = None;
+
     // ── Background: k8s status + ejected flags every 5 s ─────────────────────
     {
         let services = services.clone();
@@ -458,6 +464,17 @@ async fn run_tui(
                                 }
                             }
                         }
+                        // If ALL containers are the ejected one (single-container ejected
+                        // service), default selection stays at 0 — the render layer will
+                        // show the dev-mode splash via viewing_ejected_container guard.
+                        else if !container_selection.contains_key(&svc_idx) {
+                            container_selection.insert(svc_idx, 0);
+                            // Clear any stale logs; render will show the splash.
+                            let svcs = services.lock().unwrap();
+                            if let Some(svc) = svcs.get(svc_idx) {
+                                logs.lock().unwrap().remove(&svc.meta_name);
+                            }
+                        }
                     } else {
                         // Non-ejected service: if no container selected yet,
                         // default to the first container and (re)start the stream.
@@ -497,9 +514,12 @@ async fn run_tui(
                 Ok(TuiMsg::DbContainers { schema_idx, containers }) => {
                     // Only act if this is still the schema we're viewing.
                     if db_log_schema == Some(schema_idx) {
+                        db_containers = containers.clone();
+
                         // Pick the first container and restart the log stream
                         // with it so the API receives a concrete container name.
                         if let Some(first_container) = containers.first().cloned() {
+                            db_selected_container = Some(first_container.clone());
                             db_log_generation += 1;
                             *db_logs.lock().unwrap() = None; // clear stale "looking…" state
 
@@ -546,6 +566,10 @@ async fn run_tui(
                 (None, false, false, false)
             };
 
+        // Resolve active container name for the selected service.
+        // For an ejected service where the selected container IS the ejected
+        // one, we intentionally pass Some(ejected_container_name) so the
+        // render layer's `viewing_ejected_container` guard fires correctly.
         let (active_container_idx, active_container_name): (usize, Option<String>) =
             if let SidebarItem::Service(i) = sidebar_item {
                 if let Some(svc) = services_snap.get(i) {
@@ -616,6 +640,8 @@ async fn run_tui(
                 popup.as_ref(),
                 active_container_idx,
                 active_container_name.as_deref(),
+                &db_containers,
+                db_selected_container.as_deref(),
             );
             sidebar_scroll = drawn.sidebar_scroll;
         })?;
@@ -673,6 +699,8 @@ async fn run_tui(
                                         &mut db_log_generation,
                                         &db_logs,
                                         &bg_tx,
+                                        &mut db_containers,
+                                        &mut db_selected_container,
                                     );
                                     auto_scroll   = true;
                                     scroll_offset = 0;
@@ -867,58 +895,114 @@ async fn run_tui(
                     }
 
                     // ── Container tab navigation: Shift + ← / → ──────────
+                    //
+                    // Works for both Service containers AND DB schema containers.
                     KeyCode::Left
                         if key.modifiers == KeyModifiers::SHIFT =>
                     {
-                        if let SidebarItem::Service(svc_i) = sidebar_item {
-                            let svcs = services.lock().unwrap();
-                            if let Some(svc) = svcs.get(svc_i) {
-                                if svc.containers.len() > 1 {
-                                    let cur =
-                                        *container_selection.get(&svc_i).unwrap_or(&0);
-                                    let next = if cur == 0 {
-                                        svc.containers.len() - 1
-                                    } else {
-                                        cur - 1
-                                    };
-                                    let svc_snapshot = svc.clone();
-                                    drop(svcs);
-                                    select_container(
-                                        svc_i,
-                                        next,
-                                        &[svc_snapshot],
-                                        &mut container_selection,
-                                        &mut svc_log_generation,
-                                        &bg_tx,
-                                        &logs,
-                                    );
+                        match sidebar_item {
+                            SidebarItem::Service(svc_i) => {
+                                let svcs = services.lock().unwrap();
+                                if let Some(svc) = svcs.get(svc_i) {
+                                    if svc.containers.len() > 1 {
+                                        let cur =
+                                            *container_selection.get(&svc_i).unwrap_or(&0);
+                                        let next = if cur == 0 {
+                                            svc.containers.len() - 1
+                                        } else {
+                                            cur - 1
+                                        };
+                                        let svc_snapshot = svc.clone();
+                                        drop(svcs);
+                                        select_container(
+                                            svc_i,
+                                            next,
+                                            &[svc_snapshot],
+                                            &mut container_selection,
+                                            &mut svc_log_generation,
+                                            &bg_tx,
+                                            &logs,
+                                        );
+                                    }
                                 }
                             }
+                            SidebarItem::DbSchema(schema_i) => {
+                                if db_containers.len() > 1 {
+                                    let cur_idx = db_containers
+                                        .iter()
+                                        .position(|c| Some(c.as_str()) == db_selected_container.as_deref())
+                                        .unwrap_or(0);
+                                    let next_idx = if cur_idx == 0 {
+                                        db_containers.len() - 1
+                                    } else {
+                                        cur_idx - 1
+                                    };
+                                    select_db_container(
+                                        schema_i,
+                                        next_idx,
+                                        &db_containers,
+                                        &db_schemas.lock().unwrap(),
+                                        &mut db_selected_container,
+                                        &mut db_log_generation,
+                                        &mut db_log_schema,
+                                        &db_logs,
+                                        &bg_tx,
+                                    );
+                                    auto_scroll   = true;
+                                    scroll_offset = 0;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     KeyCode::Right
                         if key.modifiers == KeyModifiers::SHIFT =>
                     {
-                        if let SidebarItem::Service(svc_i) = sidebar_item {
-                            let svcs = services.lock().unwrap();
-                            if let Some(svc) = svcs.get(svc_i) {
-                                if svc.containers.len() > 1 {
-                                    let cur =
-                                        *container_selection.get(&svc_i).unwrap_or(&0);
-                                    let next = (cur + 1) % svc.containers.len();
-                                    let svc_snapshot = svc.clone();
-                                    drop(svcs);
-                                    select_container(
-                                        svc_i,
-                                        next,
-                                        &[svc_snapshot],
-                                        &mut container_selection,
-                                        &mut svc_log_generation,
-                                        &bg_tx,
-                                        &logs,
-                                    );
+                        match sidebar_item {
+                            SidebarItem::Service(svc_i) => {
+                                let svcs = services.lock().unwrap();
+                                if let Some(svc) = svcs.get(svc_i) {
+                                    if svc.containers.len() > 1 {
+                                        let cur =
+                                            *container_selection.get(&svc_i).unwrap_or(&0);
+                                        let next = (cur + 1) % svc.containers.len();
+                                        let svc_snapshot = svc.clone();
+                                        drop(svcs);
+                                        select_container(
+                                            svc_i,
+                                            next,
+                                            &[svc_snapshot],
+                                            &mut container_selection,
+                                            &mut svc_log_generation,
+                                            &bg_tx,
+                                            &logs,
+                                        );
+                                    }
                                 }
                             }
+                            SidebarItem::DbSchema(schema_i) => {
+                                if db_containers.len() > 1 {
+                                    let cur_idx = db_containers
+                                        .iter()
+                                        .position(|c| Some(c.as_str()) == db_selected_container.as_deref())
+                                        .unwrap_or(0);
+                                    let next_idx = (cur_idx + 1) % db_containers.len();
+                                    select_db_container(
+                                        schema_i,
+                                        next_idx,
+                                        &db_containers,
+                                        &db_schemas.lock().unwrap(),
+                                        &mut db_selected_container,
+                                        &mut db_log_generation,
+                                        &mut db_log_schema,
+                                        &db_logs,
+                                        &bg_tx,
+                                    );
+                                    auto_scroll   = true;
+                                    scroll_offset = 0;
+                                }
+                            }
+                            _ => {}
                         }
                     }
 
@@ -957,6 +1041,8 @@ async fn run_tui(
                                     &mut db_log_generation,
                                     &db_logs,
                                     &bg_tx,
+                                    &mut db_containers,
+                                    &mut db_selected_container,
                                 );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
@@ -996,6 +1082,8 @@ async fn run_tui(
                                     &mut db_log_generation,
                                     &db_logs,
                                     &bg_tx,
+                                    &mut db_containers,
+                                    &mut db_selected_container,
                                 );
                                 auto_scroll   = true;
                                 scroll_offset = 0;
@@ -1141,6 +1229,49 @@ async fn run_tui(
 }
 
 /* ================================================================
+   DB CONTAINER SELECTION HELPER
+   ================================================================ */
+
+/// Switch to a different container for the currently-viewed DB schema.
+/// Bumps the log generation and starts a new stream for `container_idx`.
+#[allow(clippy::too_many_arguments)]
+fn select_db_container(
+    schema_idx:            usize,
+    container_idx:         usize,
+    db_containers:         &[String],
+    db_schemas:            &[DbSchema],
+    db_selected_container: &mut Option<String>,
+    db_log_generation:     &mut u64,
+    db_log_schema:         &mut Option<usize>,
+    db_logs:               &Arc<Mutex<Option<Vec<String>>>>,
+    bg_tx:                 &std::sync::mpsc::Sender<TuiMsg>,
+) {
+    let Some(container) = db_containers.get(container_idx).cloned() else { return };
+
+    *db_selected_container = Some(container.clone());
+    *db_log_schema         = Some(schema_idx);
+    *db_log_generation    += 1;
+    *db_logs.lock().unwrap() = None;
+
+    let slug = db_schemas
+        .get(schema_idx)
+        .and_then(|s| s.k8s_name.clone())
+        .unwrap_or_default();
+
+    if slug.is_empty() {
+        *db_logs.lock().unwrap() = Some(vec![]);
+        return;
+    }
+
+    spawn_db_log_stream(
+        bg_tx.clone(),
+        slug,
+        Some(container),
+        *db_log_generation,
+    );
+}
+
+/* ================================================================
    CONTAINER SELECTION HELPER
    ================================================================ */
 
@@ -1243,21 +1374,27 @@ fn switch_service_logs(
    DB SCHEMA LOG STREAM HELPER
    ================================================================ */
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_start_db_stream(
-    idx:               usize,
-    db_schemas:        &[DbSchema],
-    db_log_schema:     &mut Option<usize>,
-    db_log_generation: &mut u64,
-    db_logs:           &Arc<Mutex<Option<Vec<String>>>>,
-    bg_tx:             &std::sync::mpsc::Sender<TuiMsg>,
+    idx:                   usize,
+    db_schemas:            &[DbSchema],
+    db_log_schema:         &mut Option<usize>,
+    db_log_generation:     &mut u64,
+    db_logs:               &Arc<Mutex<Option<Vec<String>>>>,
+    bg_tx:                 &std::sync::mpsc::Sender<TuiMsg>,
+    db_containers:         &mut Vec<String>,
+    db_selected_container: &mut Option<String>,
 ) {
     if *db_log_schema == Some(idx) {
         return;
     }
 
-    *db_log_schema    = Some(idx);
-    *db_log_generation += 1;
+    *db_log_schema         = Some(idx);
+    *db_log_generation    += 1;
     *db_logs.lock().unwrap() = None;
+    // Reset container state for the new schema — will be filled by DbContainers msg.
+    *db_containers         = Vec::new();
+    *db_selected_container = None;
 
     let slug = db_schemas
         .get(idx)
@@ -1271,8 +1408,6 @@ fn maybe_start_db_stream(
 
     // Start a container fetch first — the DbContainers message handler will
     // start the actual log stream once we know a real container name.
-    // This mirrors the GUI's spawn_db_container_fetch → BgMsg::DbContainers
-    // → spawn_db_schema_logs flow.
     spawn_db_container_fetch(bg_tx.clone(), slug.clone(), idx);
 
     // Also kick off an initial log stream without a container name as a
