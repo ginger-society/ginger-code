@@ -275,8 +275,8 @@ pub async fn eject(
 
     api.patch(
         deployment_name,
-        &PatchParams::apply("ginger-code").force(),
-        &Patch::Strategic(patch),   // `patch` is already the serde_json::Value you built
+        &PatchParams::default(),
+        &Patch::Strategic(patch),
     )
     .await
     .map_err(|e| format!("patch failed for {}: {}", deployment_name, e))?;
@@ -423,8 +423,8 @@ pub async fn uneject(deployment_name: &str) -> Result<(), Box<dyn std::error::Er
 
     api.patch(
         deployment_name,
-        &PatchParams::apply("ginger-code").force(),
-        &Patch::Strategic(patch),   // `patch` is already the serde_json::Value you built
+        &PatchParams::default(),
+        &Patch::Strategic(patch),
     )
     .await
     .map_err(|e| format!("patch failed for {}: {}", deployment_name, e))?;

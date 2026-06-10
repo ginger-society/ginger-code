@@ -31,7 +31,7 @@ use MetadataService::apis::configuration::Configuration as MetadataConfiguration
 
 use crate::shared::core::{
     eject::{eject, uneject},
-    k8_info::{get_k8s_deployments, get_pod_logs, is_ejected},
+    k8_info::{get_k8s_deployments, is_ejected},
     mount::{mount, unmount},
     types::{DbSchema, K8sService, Package},
 };
