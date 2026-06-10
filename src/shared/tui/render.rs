@@ -259,7 +259,7 @@ pub fn draw(
                 );
                 draw_logs(
                     f, info_chunks[2], selected, logs, focus,
-                    auto_scroll, scroll_offset,
+                    auto_scroll, scroll_offset, active_container,
                 );
                 info_chunks[2]
             } else {
@@ -269,7 +269,7 @@ pub fn draw(
                 );
                 draw_logs(
                     f, right_chunks[1], selected, logs, focus,
-                    auto_scroll, scroll_offset,
+                    auto_scroll, scroll_offset, active_container,
                 );
                 right_chunks[1]
             }
@@ -299,14 +299,14 @@ pub fn draw(
    CONTAINER TAB BAR
    ================================================================ */
 
-/// Renders a row of container name tabs.  Active tab is underlined in yellow.
+/// Renders a row of container name tabs.  Active tab is highlighted in yellow.
 /// Navigation hint is shown on the right.
 fn draw_container_tabs(
-    f:                    &mut Frame,
-    area:                 Rect,
-    containers:           &[String],
-    active_idx:           usize,
-    _active_container:    Option<&str>,
+    f:                 &mut Frame,
+    area:              Rect,
+    containers:        &[String],
+    active_idx:        usize,
+    _active_container: Option<&str>,
 ) {
     if containers.is_empty() { return; }
 
@@ -601,9 +601,9 @@ fn draw_sidebar(
                 _              => "✗ ",
             };
             let k8s_dot_color = match schema.k8s_status.as_str() {
-                "Running"                => Color::Green,
-                "Degraded" | "Pending"   => Color::Yellow,
-                _                        => Color::DarkGray,
+                "Running"              => Color::Green,
+                "Degraded" | "Pending" => Color::Yellow,
+                _                      => Color::DarkGray,
             };
 
             let dot_style = if is_sel {
@@ -757,15 +757,37 @@ fn draw_service_info(
    ================================================================ */
 
 fn draw_logs(
-    f:             &mut Frame,
-    area:          Rect,
-    selected:      Option<&K8sService>,
-    logs:          &HashMap<String, Vec<String>>,
-    focus:         &Focus,
-    auto_scroll:   bool,
-    scroll_offset: usize,
+    f:                &mut Frame,
+    area:             Rect,
+    selected:         Option<&K8sService>,
+    logs:             &HashMap<String, Vec<String>>,
+    focus:            &Focus,
+    auto_scroll:      bool,
+    scroll_offset:    usize,
+    active_container: Option<&str>,
 ) {
-    if selected.map(|s| s.ejected).unwrap_or(false) {
+    // Show the "ejected / dev mode" splash ONLY when:
+    //   - The service is ejected AND
+    //   - We know which container is ejected (ejected_container is Some) AND
+    //   - The currently active container matches the ejected one.
+    //
+    // When container list hasn't loaded yet (active_container is None) OR
+    // when the user has shifted to a sidecar container, show logs normally.
+    let viewing_ejected_container = selected.map(|s| {
+        if !s.ejected { return false; }
+
+        match (active_container, s.ejected_container.as_deref()) {
+            // Both known: only show splash when viewing the ejected container.
+            (Some(ac), Some(ec)) => ac == ec,
+            // active_container not known yet (container list still loading):
+            // don't block — show logs pane, it will just show "Fetching…".
+            (None, _) => false,
+            // ejected_container not known yet: same — don't block prematurely.
+            (Some(_), None) => false,
+        }
+    }).unwrap_or(false);
+
+    if viewing_ejected_container {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -1028,9 +1050,9 @@ fn draw_db_schema_detail(
             Span::styled(
                 &schema.k8s_status,
                 Style::default().fg(match schema.k8s_status.as_str() {
-                    "Running"                => Color::Green,
-                    "Degraded" | "Pending"   => Color::Yellow,
-                    _                        => Color::DarkGray,
+                    "Running"              => Color::Green,
+                    "Degraded" | "Pending" => Color::Yellow,
+                    _                      => Color::DarkGray,
                 }),
             ),
             Span::raw("   "),

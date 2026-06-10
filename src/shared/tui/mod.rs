@@ -57,12 +57,9 @@ enum TuiMsg {
 }
 
 /* ================================================================
-   LOG STREAMER  (mirrors bg.rs spawn_service_logs)
+   LOG STREAMER
    ================================================================ */
 
-/// Spawn a background thread that streams pod logs and sends
-/// `TuiMsg::ServiceLogs` on every new line.  Retries on stream end.
-/// Stops when `tx` is dropped.
 fn spawn_service_log_stream(
     tx:              std::sync::mpsc::Sender<TuiMsg>,
     deployment_name: String,
@@ -104,7 +101,6 @@ fn spawn_service_log_stream(
                         }
                     }
                 }
-                // Stream ended — check still wanted, then reconnect.
                 if tx
                     .send(TuiMsg::ServiceLogs {
                         lines:      lines.clone(),
@@ -120,7 +116,6 @@ fn spawn_service_log_stream(
     });
 }
 
-/// Same as above but sends `TuiMsg::DbLogs`.
 fn spawn_db_log_stream(
     tx:         std::sync::mpsc::Sender<TuiMsg>,
     slug:       String,
@@ -183,7 +178,6 @@ fn spawn_db_log_stream(
     });
 }
 
-/// Fetch container names once and send `TuiMsg::Containers`.
 fn spawn_container_fetch(
     tx:              std::sync::mpsc::Sender<TuiMsg>,
     deployment_name: String,
@@ -283,9 +277,7 @@ async fn run_tui(
     let (bg_tx, bg_rx) = std::sync::mpsc::channel::<TuiMsg>();
 
     // ── Log state ─────────────────────────────────────────────────────────────
-    // Service logs (keyed by meta_name so switching back is instant).
     let logs: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Generation counter: bump when we want old streamers to stop updating.
     let mut svc_log_generation: u64 = 0;
 
     // DB logs
@@ -313,7 +305,6 @@ async fn run_tui(
                         }
                     }
                 }
-                // Refresh ejected flags.
                 let deps: Vec<(usize, String)> = {
                     let svcs = services.lock().unwrap();
                     svcs.iter()
@@ -356,7 +347,6 @@ async fn run_tui(
                     None,
                     svc_log_generation,
                 );
-                // Also kick off container fetch for service 0.
                 spawn_container_fetch(bg_tx.clone(), dep.clone(), 0);
             }
         }
@@ -368,7 +358,6 @@ async fn run_tui(
             match bg_rx.try_recv() {
                 Ok(TuiMsg::ServiceLogs { lines, generation }) => {
                     if generation == svc_log_generation {
-                        // Store under the current service's meta_name.
                         let key = {
                             let svcs = services.lock().unwrap();
                             if let SidebarItem::Service(i) = sidebar_item {
@@ -388,9 +377,67 @@ async fn run_tui(
                     }
                 }
                 Ok(TuiMsg::Containers { svc_idx, containers }) => {
-                    let mut svcs = services.lock().unwrap();
-                    if let Some(svc) = svcs.get_mut(svc_idx) {
-                        svc.containers = containers;
+                    // Determine the ejected container name before mutating.
+                    let ejected_container = {
+                        let svcs = services.lock().unwrap();
+                        svcs.get(svc_idx).and_then(|s| s.ejected_container.clone())
+                    };
+                    let is_ejected_svc = {
+                        let svcs = services.lock().unwrap();
+                        svcs.get(svc_idx).map(|s| s.ejected).unwrap_or(false)
+                    };
+
+                    // Write the container list into the service.
+                    {
+                        let mut svcs = services.lock().unwrap();
+                        if let Some(svc) = svcs.get_mut(svc_idx) {
+                            svc.containers = containers.clone();
+                        }
+                    }
+
+                    // If this service is ejected, auto-select the first
+                    // non-ejected container so logs start without user
+                    // having to manually shift to a sidecar.
+                    if is_ejected_svc {
+                        let ejected_name = ejected_container.as_deref().unwrap_or("");
+                        if let Some(non_ejected_idx) = containers
+                            .iter()
+                            .position(|c| c.as_str() != ejected_name)
+                        {
+                            // Only switch if no explicit selection has been
+                            // made by the user yet for this service.
+                            if !container_selection.contains_key(&svc_idx) {
+                                container_selection.insert(svc_idx, non_ejected_idx);
+
+                                // Restart log stream for the active service only.
+                                let is_active = matches!(sidebar_item, SidebarItem::Service(i) if i == svc_idx);
+                                if is_active {
+                                    let dep = {
+                                        let svcs = services.lock().unwrap();
+                                        svcs.get(svc_idx)
+                                            .and_then(|s| s.deployment_name.clone())
+                                    };
+                                    let container = containers.get(non_ejected_idx).cloned();
+                                    if let Some(dep) = dep {
+                                        // Clear stale lines so the old ejected-splash
+                                        // doesn't linger while the new stream loads.
+                                        {
+                                            let svcs = services.lock().unwrap();
+                                            if let Some(svc) = svcs.get(svc_idx) {
+                                                logs.lock().unwrap().remove(&svc.meta_name);
+                                            }
+                                        }
+                                        svc_log_generation += 1;
+                                        spawn_service_log_stream(
+                                            bg_tx.clone(),
+                                            dep,
+                                            container,
+                                            svc_log_generation,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Err(_) => break,
@@ -404,7 +451,6 @@ async fn run_tui(
         let logs_snap       = logs.lock().unwrap().clone();
         let db_logs_snap    = db_logs.lock().unwrap().clone();
 
-        // Derive UI flags from current sidebar selection.
         let (selected_svc, has_deployment, has_lang, is_ejected_now) =
             if let SidebarItem::Service(i) = sidebar_item {
                 let svc      = services_snap.get(i);
@@ -418,12 +464,10 @@ async fn run_tui(
                 (None, false, false, false)
             };
 
-        // Compute the active container index for the current service.
         let (active_container_idx, active_container_name): (usize, Option<String>) =
             if let SidebarItem::Service(i) = sidebar_item {
-                let svcs = &services_snap;
-                if let Some(svc) = svcs.get(i) {
-                    let idx = *container_selection.get(&i).unwrap_or(&0);
+                if let Some(svc) = services_snap.get(i) {
+                    let idx  = *container_selection.get(&i).unwrap_or(&0);
                     let name = svc.containers.get(idx).cloned();
                     (idx, name)
                 } else {
@@ -626,6 +670,9 @@ async fn run_tui(
                                                     if let Err(e) = r {
                                                         eprintln!("Error: {e}");
                                                     }
+                                                    // After eject/uneject, clear container
+                                                    // selection so it re-detects on next load.
+                                                    container_selection.remove(&svc_i);
                                                     sleep(Duration::from_secs(2)).await;
                                                     enter_tui(&mut terminal)?;
                                                     continue;
@@ -752,11 +799,12 @@ async fn run_tui(
                                     } else {
                                         cur - 1
                                     };
+                                    let svc_snapshot = svc.clone();
                                     drop(svcs);
                                     select_container(
                                         svc_i,
                                         next,
-                                        &services.lock().unwrap(),
+                                        &[svc_snapshot],
                                         &mut container_selection,
                                         &mut svc_log_generation,
                                         &bg_tx,
@@ -776,11 +824,12 @@ async fn run_tui(
                                     let cur =
                                         *container_selection.get(&svc_i).unwrap_or(&0);
                                     let next = (cur + 1) % svc.containers.len();
+                                    let svc_snapshot = svc.clone();
                                     drop(svcs);
                                     select_container(
                                         svc_i,
                                         next,
-                                        &services.lock().unwrap(),
+                                        &[svc_snapshot],
                                         &mut container_selection,
                                         &mut svc_log_generation,
                                         &bg_tx,
@@ -1015,6 +1064,9 @@ async fn run_tui(
 
 /// Switch the active container for `svc_i`, bump the log generation,
 /// and start a new log stream for the chosen container.
+///
+/// `services` slice must contain exactly one entry at index 0 corresponding
+/// to the service at `svc_i` (pass `&[svc_snapshot]`).
 fn select_container(
     svc_i:                usize,
     container_idx:        usize,
@@ -1024,14 +1076,24 @@ fn select_container(
     bg_tx:                &std::sync::mpsc::Sender<TuiMsg>,
     logs:                 &Arc<Mutex<HashMap<String, Vec<String>>>>,
 ) {
-    let Some(svc) = services.get(svc_i) else { return };
+    // services is a single-element slice containing the snapshot for svc_i.
+    let Some(svc) = services.first() else { return };
     let Some(dep) = svc.deployment_name.clone() else { return };
     let container = svc.containers.get(container_idx).cloned();
 
     container_selection.insert(svc_i, container_idx);
 
-    // Clear the cached log for this service so the pane shows fresh output.
+    // If this container is the ejected one it runs `sleep infinity` —
+    // no log stream to start. Clear stale lines so the render layer
+    // shows the "dev mode" splash immediately.
+    let is_ejected_container = svc.ejected
+        && svc.ejected_container.as_deref() == container.as_deref();
+
     logs.lock().unwrap().remove(&svc.meta_name);
+
+    if is_ejected_container {
+        return;
+    }
 
     *svc_log_generation += 1;
     spawn_service_log_stream(
@@ -1046,8 +1108,6 @@ fn select_container(
    SERVICE LOG SWITCH HELPER
    ================================================================ */
 
-/// Switch to a different service: bump generation, start a new stream
-/// for the service's currently-selected container.
 fn switch_service_logs(
     svc_i:               usize,
     services:            &[K8sService],
@@ -1058,9 +1118,6 @@ fn switch_service_logs(
 ) {
     let Some(svc) = services.get(svc_i) else { return };
     let Some(dep) = svc.deployment_name.clone() else { return };
-
-    // If we already have cached lines for this service don't clear them —
-    // the user will see last known output instantly while new lines arrive.
 
     let container_idx = *container_selection.get(&svc_i).unwrap_or(&0);
     let container     = svc.containers.get(container_idx).cloned();
@@ -1073,7 +1130,6 @@ fn switch_service_logs(
         *svc_log_generation,
     );
 
-    // Kick off a container fetch if we don't have the list yet.
     if svc.containers.is_empty() {
         spawn_container_fetch(bg_tx.clone(), dep, svc_i);
     }
@@ -1084,18 +1140,18 @@ fn switch_service_logs(
    ================================================================ */
 
 fn maybe_start_db_stream(
-    idx:              usize,
-    db_schemas:       &[DbSchema],
-    db_log_schema:    &mut Option<usize>,
+    idx:               usize,
+    db_schemas:        &[DbSchema],
+    db_log_schema:     &mut Option<usize>,
     db_log_generation: &mut u64,
-    db_logs:          &Arc<Mutex<Option<Vec<String>>>>,
-    bg_tx:            &std::sync::mpsc::Sender<TuiMsg>,
+    db_logs:           &Arc<Mutex<Option<Vec<String>>>>,
+    bg_tx:             &std::sync::mpsc::Sender<TuiMsg>,
 ) {
     if *db_log_schema == Some(idx) {
         return;
     }
 
-    *db_log_schema = Some(idx);
+    *db_log_schema    = Some(idx);
     *db_log_generation += 1;
     *db_logs.lock().unwrap() = None;
 
