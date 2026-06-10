@@ -4,7 +4,8 @@
 //! * [`daemon`]     — Unix-socket communication with the ginger-code daemon.
 //! * [`git_ops`]    — Pod-side SSH-key management, git clone, branch checkout.
 //! * [`image`]      — Language → builder-image mapping and slug helpers.
-//! * [`k8s_ops`]    — Low-level kubectl / pod helpers (PVCs, deployments, pods).
+//! * [`k8s_ops`]   — Kubernetes API operations: get / create / patch Deployments, plus JSONPath parsing.
+//! * [`k8s_exec`]   — Attach to a pod with `kubectl attach
 //! * [`port`]       — Free-port discovery in the 2200–2299 range.
 //! * [`ssh_config`] — `~/.ssh/config` block management (add / remove / source).
 

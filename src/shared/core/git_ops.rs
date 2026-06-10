@@ -61,7 +61,6 @@ pub async fn write_pod_ssh_config(
 // ── Temporary key copy / cleanup ──────────────────────────────────────────────
 
 /// Copy `~/.ssh/id_ed25519{,.pub,-cert.pub}` into the pod for the initial clone.
-/// Uses `exec_in_pod` with stdin to stream file bytes directly — no `kubectl cp`.
 pub async fn copy_ssh_keys_to_dev(
     pod_name:  &str,
     container: &str,
