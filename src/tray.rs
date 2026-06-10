@@ -305,6 +305,8 @@ fn build_menu(
 
 // ── Tray state ────────────────────────────────────────────────────────────────
 
+// Drop-in replacement for compute_tray_state in tray.rs
+
 fn compute_tray_state(
     map: &std::collections::HashMap<String, crate::ForwardState>,
     bc:  &[DeploymentEntry],
@@ -319,21 +321,31 @@ fn compute_tray_state(
         return (TrayState::NoBranch, 0, 0);
     }
 
-    let connected = bc.iter()
-        .filter(|e| {
-            map.get(&e.deployment_name)
-                .map_or(false, |fw| fw.status == ForwardStatus::Connected)
-        })
-        .count();
+    let mut n_connected = 0usize;
+    let mut n_offline   = 0usize;
 
-    let all_offline = bc.iter().all(|e| {
-        map.get(&e.deployment_name)
-            .map_or(false, |fw| fw.status == ForwardStatus::Offline)
-    });
+    for e in bc {
+        match map.get(&e.deployment_name).map(|fw| &fw.status) {
+            Some(ForwardStatus::Connected)       => n_connected += 1,
+            Some(ForwardStatus::Offline)         => n_offline   += 1,
+            Some(ForwardStatus::Retrying { .. }) => {}   // re-resolving — neither
+            None                                 => {}   // not yet in map
+        }
+    }
 
-    if all_offline        { (TrayState::Offline,      0,         total) }
-    else if connected == total { (TrayState::AllConnected, connected, total) }
-    else                  { (TrayState::Partial,       connected, total) }
+    if n_connected == total {
+        // All forwards confirmed connected
+        (TrayState::AllConnected, n_connected, total)
+    } else if n_offline == total {
+        // Every forward explicitly offline (no network)
+        (TrayState::Offline, 0, total)
+    } else if n_offline > 0 && n_connected == 0 {
+        // Mix of offline + retrying, nothing connected — still show red
+        (TrayState::Offline, 0, total)
+    } else {
+        // Some connected, rest retrying/offline — amber
+        (TrayState::Partial, n_connected, total)
+    }
 }
 
 fn tooltip(cfg: &Config, connected: usize, total: usize) -> String {

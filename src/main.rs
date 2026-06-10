@@ -171,7 +171,6 @@ async fn run_forward(
     let name = entry.deployment_name.clone();
     let pods: Api<Pod> = Api::default_namespaced(client.clone());
 
-    // Bind the TCP listener once — it survives pod restarts.
     let listener = loop {
         match TcpListener::bind(("127.0.0.1", entry.forwarding_port)).await {
             Ok(l) => break l,
@@ -196,13 +195,11 @@ async fn run_forward(
     let mut attempt: u32 = 0;
 
     loop {
-        // ── Stop requested ────────────────────────────────────────────────────
         if token.is_cancelled() {
             println!("[ginger-code] stopping forward for '{}'", name);
             return;
         }
 
-        // ── Network offline ───────────────────────────────────────────────────
         if offline.load(Ordering::Relaxed) {
             update_status(&state_map, &name, ForwardStatus::Offline);
             tokio::select! {
@@ -212,7 +209,6 @@ async fn run_forward(
             continue;
         }
 
-        // ── Resolve current pod ───────────────────────────────────────────────
         let pod_name = match resolve_pod(&pods, &name).await {
             Ok(p) => {
                 attempt = 0;
@@ -233,12 +229,23 @@ async fn run_forward(
         println!("[ginger-code] '{}' resolved to pod '{}'", name, pod_name);
         update_status(&state_map, &name, ForwardStatus::Connected);
 
-        // ── Accept connections and proxy each one ─────────────────────────────
         'accept: loop {
             tokio::select! {
                 _ = token.cancelled() => {
                     println!("[ginger-code] stopping forward for '{}'", name);
                     return;
+                }
+
+                // Heartbeat: while we're sitting in the accept loop the local
+                // TCP listener is working fine. Re-assert Connected every second
+                // so that a post-reconnect Retrying/Offline status that was set
+                // by run_net_monitor gets corrected without requiring a full
+                // pod re-resolve cycle.
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if !offline.load(Ordering::Relaxed) {
+                        update_status(&state_map, &name, ForwardStatus::Connected);
+                    }
+                    // Stay in 'accept — do not break.
                 }
 
                 accept_result = listener.accept() => {
@@ -276,10 +283,7 @@ async fn run_forward(
                         }
                     };
 
-                    println!(
-                        "[ginger-code] '{}' ← new connection from {}",
-                        name, peer
-                    );
+                    println!("[ginger-code] '{}' ← new connection from {}", name, peer);
 
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) {
@@ -448,6 +452,11 @@ async fn run_net_monitor(
         if !was_online && online {
             println!("[ginger-code] network restored");
             offline.store(false, Ordering::Relaxed);
+            // NOTE: We intentionally do NOT reset statuses to Retrying here.
+            // Forward tasks sitting in the 'accept loop will self-correct back
+            // to Connected within ~1 second via the heartbeat tick arm, because
+            // the local TCP listener never dropped. Resetting to Retrying here
+            // was the root cause of the tray staying amber after reconnect.
         } else if was_online && !online {
             println!("[ginger-code] network lost");
             offline.store(true, Ordering::Relaxed);
@@ -472,14 +481,18 @@ fn has_network() -> bool {
 // ── Config watcher ────────────────────────────────────────────────────────────
 
 async fn run_watcher(
-    state_map: StateMap,
-    cfg_path:  PathBuf,
-    client:    Client,
-    offline:   Arc<AtomicBool>,
-    token:     CancellationToken,
+    state_map:      StateMap,
+    cfg_path:       PathBuf,
+    client:         Client,
+    offline:        Arc<AtomicBool>,
+    token:          CancellationToken,
+    initial_branch: Option<String>,
 ) {
-    let mut last_branch:   Option<String>                = None;
-    let mut last_modified: Option<std::time::SystemTime> = None;
+    let mut last_branch: Option<String> = initial_branch;
+
+    let mut last_modified: Option<std::time::SystemTime> = fs::metadata(&cfg_path)
+        .and_then(|m| m.modified())
+        .ok();
 
     loop {
         tokio::select! {
@@ -775,12 +788,6 @@ fn socket_path() -> PathBuf {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-//
-// KEY CHANGE from original:
-//   We do NOT use #[tokio::main] — instead we build the runtime manually and
-//   keep the main thread free so that tray::run_tray() (winit / NSApplication)
-//   can run on it. On macOS the OS requires the UI event loop to live on the
-//   thread that called main(). spawn_blocking does NOT satisfy this requirement.
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -812,39 +819,30 @@ fn main() {
     let sock_path = socket_path();
     let cfg_path  = config_path();
 
-    // ── Build tokio runtime manually ──────────────────────────────────────────
-    // This lets us control which thread is "main" — the tokio runtime runs on
-    // its own thread pool while main() stays free for the tray event loop.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
-    // ── Shared state ──────────────────────────────────────────────────────────
-    let state_map:      StateMap           = Arc::new(Mutex::new(HashMap::new()));
-    let shutdown_token: CancellationToken  = CancellationToken::new();
-    let offline:        Arc<AtomicBool>    = Arc::new(AtomicBool::new(!has_network()));
+    let state_map:      StateMap          = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown_token: CancellationToken = CancellationToken::new();
+    let offline:        Arc<AtomicBool>   = Arc::new(AtomicBool::new(!has_network()));
 
-    // ── Async setup: kube client + seeding + background tasks ─────────────────
-    // block_on runs the future on the runtime but still returns to main().
     let kube_client: Client = rt.block_on(async {
         let cfg_path  = cfg_path.clone();
         let state_map = Arc::clone(&state_map);
         let offline   = Arc::clone(&offline);
         let tok       = shutdown_token.clone();
 
-        // Build kube client
         let client = match Client::try_default().await {
             Ok(c)  => c,
             Err(e) => {
                 eprintln!("[ginger-code] failed to build kube client: {e}");
-                eprintln!("[ginger-code] check your kubeconfig — continuing without k8s");
                 panic!("cannot build kube client — is KUBECONFIG set?");
             }
         };
 
-        // Seed state from active branch
-        {
+        let initial_branch = {
             let cfg = Config::load(&cfg_path);
             if let Some(ref branch) = cfg.active_branch {
                 println!("[ginger-code] active branch: '{}'", branch);
@@ -854,28 +852,28 @@ fn main() {
             } else {
                 println!("[ginger-code] no active branch — run `ginger-code -b <branch>`");
             }
-        }
+            cfg.active_branch.clone()
+        };
 
-        // Network monitor
         tokio::spawn(run_net_monitor(
             Arc::clone(&offline),
             Arc::clone(&state_map),
             tok.clone(),
         ));
 
-        // Config watcher
         tokio::spawn(run_watcher(
             Arc::clone(&state_map),
             cfg_path.clone(),
             client.clone(),
             Arc::clone(&offline),
             tok.clone(),
+            initial_branch,
         ));
 
         client
     });
 
-    // ── Socket listener — blocking thread ─────────────────────────────────────
+    // ── Socket listener ───────────────────────────────────────────────────────
     {
         let sp      = sock_path.clone();
         let cp      = cfg_path.clone();
@@ -923,9 +921,8 @@ fn main() {
 
     println!("{:?}", daemon_mode);
 
-    // ── Tray or daemon — both run on the main thread ──────────────────────────
+    // ── Tray or daemon ────────────────────────────────────────────────────────
     if daemon_mode {
-        // Daemon mode: block main thread on Ctrl-C signal.
         println!("[ginger-code] running in daemon mode (no tray)");
         rt.block_on(async {
             tokio::signal::ctrl_c().await.expect("set signal handler");
@@ -933,11 +930,8 @@ fn main() {
         println!("[ginger-code] signal received, shutting down...");
         shutdown_token.cancel();
     } else {
-        // Tray mode: run_tray MUST be called on the main thread (macOS/winit requirement).
-        // We bridge the CancellationToken → AtomicBool so tray.rs keeps its existing API.
         let tray_shutdown = Arc::new(AtomicBool::new(false));
 
-        // If the token is cancelled externally (e.g. from watcher), also set the bool.
         {
             let tray_sd = Arc::clone(&tray_shutdown);
             let tok     = shutdown_token.clone();
@@ -947,8 +941,6 @@ fn main() {
             });
         }
 
-        // ✅ This call blocks the main thread — correct on macOS.
-        //    winit / NSApplication EventLoop will now be on the right thread.
         tray::run_tray(
             Arc::clone(&state_map),
             Arc::clone(&tray_shutdown),
@@ -957,7 +949,6 @@ fn main() {
             cfg_path.clone(),
         );
 
-        // Tray event loop exited (user chose Quit) — cancel everything.
         shutdown_token.cancel();
     }
 
