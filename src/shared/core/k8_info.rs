@@ -1,19 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
+use k8s_openapi::api::core::v1::Pod;
+use kube::{Api, Client};
+use kube::api::ListParams;
 
-pub async fn is_mounted(deployment_slug: &str) -> bool {
-    let out = tokio::process::Command::new("kubectl")
-        .args([
-            "get",
-            "deployment",
-            deployment_slug,
-            "-o",
-            "jsonpath={.metadata.annotations.ginger-mounted}",
-        ])
-        .output()
-        .await;
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "true")
+// ── Client helper ─────────────────────────────────────────────────────────────
+
+async fn client() -> Client {
+    Client::try_default().await.expect("kube client")
 }
+
+// ── meta_to_deployment_name ───────────────────────────────────────────────────
 
 /// "@ginger-society/dev-portal"  → "dev-portal"
 /// "@ginger-society/IAMService"  → "iamservice"
@@ -25,133 +23,174 @@ pub fn meta_to_deployment_name(meta_name: &str) -> String {
         .to_lowercase()
 }
 
+// ── is_mounted ────────────────────────────────────────────────────────────────
+
+pub async fn is_mounted(deployment_slug: &str) -> bool {
+    let api: Api<Deployment> = Api::default_namespaced(client().await);
+    api.get(deployment_slug)
+        .await
+        .ok()
+        .and_then(|d| d.metadata.annotations)
+        .and_then(|a| a.get("ginger-mounted").cloned())
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+// ── is_ejected ────────────────────────────────────────────────────────────────
+
+pub async fn is_ejected(deployment_name: &str) -> bool {
+    let api: Api<Deployment> = Api::default_namespaced(client().await);
+    api.get(deployment_name)
+        .await
+        .ok()
+        .and_then(|d| d.metadata.annotations)
+        .and_then(|a| a.get("ginger-ejected").cloned())
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+// ── get_k8s_deployments ───────────────────────────────────────────────────────
+
 /// Returns map: deployment_name → (status, ready_string)
 pub async fn get_k8s_deployments() -> HashMap<String, (String, String)> {
-    let output = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get",
-            "deployments",
-            "-o",
-            "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas",
-            "--no-headers",
-        ])
-        .output()
-        .await;
+    let api: Api<Deployment> = Api::default_namespaced(client().await);
+    let Ok(list) = api.list(&ListParams::default()).await else {
+        return HashMap::new();
+    };
 
-    let mut map = HashMap::new();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().filter(|l| !l.is_empty()) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let name        = parts[0].to_string();
-                let ready_count = parts[1];
-                let desired     = parts[2];
-                let ready_str   = format!("{}/{}", ready_count, desired);
-                let status = if ready_count == desired {
-                    "Running".to_string()
-                } else if ready_count == "<none>" || ready_count == "0" {
-                    "Pending".to_string()
-                } else {
-                    "Degraded".to_string()
-                };
-                map.insert(name, (status, ready_str));
+    list.items
+        .into_iter()
+        .filter_map(|d| {
+            let name    = d.metadata.name?;
+            let status  = d.status.as_ref()?;
+            let desired = d.spec.as_ref()?.replicas.unwrap_or(0);
+            let ready   = status.ready_replicas.unwrap_or(0);
+
+            let ready_str  = format!("{}/{}", ready, desired);
+            let status_str = if ready == desired && desired > 0 {
+                "Running".to_string()
+            } else if ready == 0 {
+                "Pending".to_string()
+            } else {
+                "Degraded".to_string()
+            };
+
+            Some((name, (status_str, ready_str)))
+        })
+        .collect()
+}
+
+// ── get_k8s_statefulsets ──────────────────────────────────────────────────────
+
+pub async fn get_k8s_statefulsets() -> HashMap<String, (String, String)> {
+    let api: Api<StatefulSet> = Api::default_namespaced(client().await);
+    let Ok(list) = api.list(&ListParams::default()).await else {
+        return HashMap::new();
+    };
+
+    list.items
+        .into_iter()
+        .filter_map(|ss| {
+            let name    = ss.metadata.name?;
+            let status  = ss.status.as_ref()?;
+            let desired = ss.spec.as_ref()?.replicas.unwrap_or(0) as i32;
+            let ready   = status.ready_replicas.unwrap_or(0);
+
+            let ready_str  = format!("{}/{}", ready, desired);
+            let status_str = if ready == desired && desired > 0 {
+                "Running".to_string()
+            } else if ready == 0 {
+                "Pending".to_string()
+            } else {
+                "Degraded".to_string()
+            };
+
+            Some((name, (status_str, ready_str)))
+        })
+        .collect()
+}
+
+// ── resolve_pod_name ──────────────────────────────────────────────────────────
+//
+// Shared by get_pod_containers and get_pod_logs.
+// Tries label selectors first, falls back to pod-name prefix matching.
+// This is necessary for Helm-managed StatefulSets (e.g. my-db-postgresql-0)
+// which don't carry an `app=` label.
+
+async fn resolve_pod_name(deployment_name: &str) -> Option<String> {
+    let api: Api<Pod> = Api::default_namespaced(client().await);
+
+    let label_strategies = [
+        format!("app={}", deployment_name),
+        format!("app.kubernetes.io/instance={}", deployment_name),
+        format!("app.kubernetes.io/name={}", deployment_name),
+    ];
+
+    for label in &label_strategies {
+        let lp = ListParams::default().labels(label);
+        if let Ok(list) = api.list(&lp).await {
+            if let Some(name) = list.items.into_iter()
+                .find(|p| {
+                    p.status.as_ref()
+                        .and_then(|s| s.phase.as_deref())
+                        == Some("Running")
+                    && p.metadata.deletion_timestamp.is_none()
+                })
+                .and_then(|p| p.metadata.name)
+            {
+                return Some(name);
             }
         }
     }
-    map
+
+    // Pod-name prefix fallback — covers StatefulSets like my-db-postgresql-0
+    if let Ok(all) = api.list(&ListParams::default()).await {
+        return all.items.into_iter()
+            .find(|p| {
+                let matches = p.metadata.name.as_deref()
+                    .map(|n| n == deployment_name
+                        || n.starts_with(&format!("{}-", deployment_name)))
+                    .unwrap_or(false);
+                let running = p.status.as_ref()
+                    .and_then(|s| s.phase.as_deref())
+                    == Some("Running");
+                let not_terminating = p.metadata.deletion_timestamp.is_none();
+                matches && running && not_terminating
+            })
+            .and_then(|p| p.metadata.name);
+    }
+
+    None
 }
 
-pub async fn is_ejected(deployment_name: &str) -> bool {
-    let out = tokio::process::Command::new("kubectl")
-        .args([
-            "get",
-            "deployment",
-            deployment_name,
-            "-o",
-            "jsonpath={.metadata.annotations.ginger-ejected}",
-        ])
-        .output()
-        .await;
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "true")
-}
+// ── get_pod_containers ────────────────────────────────────────────────────────
 
-/// Returns (pod_name, vec_of_container_names) for the running pod of a deployment.
-/// Returns None if no running pod is found.
 pub async fn get_pod_containers(deployment_name: &str) -> Option<(String, Vec<String>)> {
-    let pod_output = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get", "pods",
-            "--field-selector=status.phase=Running",
-            "--no-headers",
-            "-o", "custom-columns=NAME:.metadata.name",
-        ])
-        .output()
-        .await
-        .ok()?;
+    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let pod_name = resolve_pod_name(deployment_name).await?;
 
-    let pod_name = String::from_utf8_lossy(&pod_output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .find(|l| l.trim().starts_with(deployment_name))
-        .map(|l| l.trim().to_string())?;
-
-    let container_output = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get", "pod", &pod_name,
-            "-o", "jsonpath={.spec.containers[*].name}",
-        ])
-        .output()
-        .await
-        .ok()?;
-
-    let containers = String::from_utf8_lossy(&container_output.stdout)
-        .split_whitespace()
-        .map(|s| s.to_string())
+    let pod = api.get(&pod_name).await.ok()?;
+    let containers = pod.spec?
+        .containers
+        .into_iter()
+        .map(|c| c.name)
         .collect::<Vec<_>>();
 
     if containers.is_empty() { None } else { Some((pod_name, containers)) }
 }
 
-/// Fetch container list for a service once — fires once per service selection.
+// ── get_pod_logs — kubectl shell-out using resolved pod name ──────────────────
 
-
-// In k8_info.rs — replace get_pod_logs with this version that uses
-// -l selector instead of name prefix matching, which is more reliable
 pub async fn get_pod_logs(deployment_name: &str, container: Option<String>) -> Vec<String> {
-    // Use label selector — more reliable than pod name prefix matching
-    let label = format!("app={}", deployment_name);
-    
-    let pod_output = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get", "pods",
-            "-l", &label,
-            "--field-selector=status.phase=Running",
-            "--no-headers",
-            "-o", "custom-columns=NAME:.metadata.name",
-        ])
-        .output()
-        .await;
-
-    let pod_name = match pod_output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.lines()
-                .filter(|l| !l.trim().is_empty())
-                .next()
-                .map(|l| l.trim().to_string())
-        }
-        Err(_) => None,
-    };
-
-    let Some(pod) = pod_name else {
-        return vec![format!("No pods found for deployment '{}'.", deployment_name)];
+    let pod_name = match resolve_pod_name(deployment_name).await {
+        Some(p) => p,
+        None    => return vec![format!("No pods found for deployment '{}'.", deployment_name)],
     };
 
     let mut args: Vec<String> = vec![
         "logs".into(),
         "--tail=500".into(),
-        pod.clone(),
+        pod_name,
     ];
     if let Some(ref c) = container {
         args.push("--container".into());
@@ -165,7 +204,6 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<String>) -> V
     {
         Ok(out) => {
             if !out.stderr.is_empty() {
-                // If kubectl errors (e.g. wrong container name), surface it
                 let err = String::from_utf8_lossy(&out.stderr);
                 return vec![format!("kubectl logs error: {}", err.trim())];
             }
@@ -177,6 +215,34 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<String>) -> V
         Err(e) => vec![format!("Failed to fetch logs: {}", e)],
     }
 }
+
+// ── get_transitioning_deployments ─────────────────────────────────────────────
+
+pub async fn get_transitioning_deployments() -> HashSet<String> {
+    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let Ok(list) = api.list(&ListParams::default()).await else {
+        return HashSet::new();
+    };
+
+    list.items
+        .into_iter()
+        .filter(|p| {
+            let terminating = p.metadata.deletion_timestamp.is_some();
+            let pending     = p.status.as_ref()
+                .and_then(|s| s.phase.as_deref())
+                == Some("Pending");
+            terminating || pending
+        })
+        .filter_map(|p| {
+            p.metadata
+                .labels?
+                .get("app")
+                .cloned()
+        })
+        .collect()
+}
+
+// ── db helpers ────────────────────────────────────────────────────────────────
 
 pub fn db_to_k8s_name(name: &str, db_type: &str) -> String {
     let slug = name.to_lowercase().replace(' ', "-");
@@ -190,74 +256,4 @@ pub fn db_to_k8s_name(name: &str, db_type: &str) -> String {
 
 pub fn db_is_statefulset(db_type: &str) -> bool {
     db_type == "rdbms"
-}
-
-pub async fn get_k8s_statefulsets() -> HashMap<String, (String, String)> {
-    let output = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get", "statefulsets",
-            "-o", "custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas",
-            "--no-headers",
-        ])
-        .output()
-        .await;
-
-    let mut map = HashMap::new();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().filter(|l| !l.is_empty()) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let name        = parts[0].to_string();
-                let ready_count = parts[1];
-                let desired     = parts[2];
-                let ready_str   = format!("{}/{}", ready_count, desired);
-                let status = if ready_count == desired {
-                    "Running".to_string()
-                } else if ready_count == "<none>" || ready_count == "0" {
-                    "Pending".to_string()
-                } else {
-                    "Degraded".to_string()
-                };
-                map.insert(name, (status, ready_str));
-            }
-        }
-    }
-    map
-}
-
-
-/// Returns the set of deployment names (via `app=` label) that have at least
-/// one pod in a transient state: Terminating, ContainerCreating, Pending.
-pub async fn get_transitioning_deployments() -> std::collections::HashSet<String> {
-    let out = tokio::process::Command::new("kubectl")
-        .args(&[
-            "get", "pods",
-            "--no-headers",
-            "-o", "custom-columns=\
-                APP:.metadata.labels.app,\
-                PHASE:.status.phase,\
-                DELETED:.metadata.deletionTimestamp",
-        ])
-        .output()
-        .await;
-
-    let mut set = std::collections::HashSet::new();
-    let Ok(out) = out else { return set };
-
-    for line in String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-    {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 { continue; }
-        let app     = parts[0];
-        let phase   = parts[1]; // "Running", "Pending", "Succeeded", "Failed"
-        let deleted = parts[2]; // "<none>" or a timestamp
-
-        if deleted != "<none>" || phase == "Pending" {
-            set.insert(app.to_string());
-        }
-    }
-    set
 }
