@@ -24,7 +24,6 @@ use super::terminal::{spawn_kubectl, TermPerformer};
 use super::types::{AppState, RightPane, TermState};
 use crate::shared::core::eject::{eject, uneject};
 use crate::shared::core::image::pkg_to_slug;
-use crate::shared::gui::panels::draw_container_chips;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -376,6 +375,25 @@ impl App {
             svc.selected_container = container.clone();
         }
 
+        // Don't poll logs for the ejected container — it's a dev container
+        // running sleep/entrypoint, not the application.
+        if let Some(svc) = self.state.services.get(idx) {
+            let selected_is_ejected = svc.ejected
+                && svc.ejected_container.is_some()
+                && svc.selected_container == svc.ejected_container;
+
+            if selected_is_ejected {
+                self.state.logs = vec![
+                    format!(
+                        "⚡ {} is ejected — running in dev mode.",
+                        svc.meta_name
+                    ),
+                    "No application logs available.".into(),
+                ];
+                return;
+            }
+        }
+
         let dep = match self.state.services.get(idx)
             .and_then(|s| s.deployment_name.clone())
         {
@@ -406,44 +424,30 @@ impl App {
                 // ── Containers arrived ────────────────────────────────────────
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {
-                        let ejected_container = svc.ejected_container.clone();
-
-                        // If ejected, default to the first non-ejected container;
-                        // otherwise just pick the first one.
-                        let default = if svc.ejected {
-                            ejected_container.as_ref()
-                                .and_then(|ej| containers.iter().find(|c| *c != ej).cloned())
-                                .or_else(|| containers.first().cloned())
-                        } else {
-                            containers.first().cloned()
-                        };
-
-                        svc.selected_container = default;
+                        svc.selected_container = containers.first().cloned();
                         svc.containers         = containers;
                     }
 
-                    // Restart log poller for the active service with the
-                    // now-known (and correctly chosen) container.
                     if svc_idx == self.state.selected_idx {
                         if let Some(svc) = self.state.services.get(svc_idx) {
-                            // Don't start log poller for ejected single-container services
-                            let ejected_container  = svc.ejected_container.clone();
-                            let has_other_containers = ejected_container.as_ref()
-                                .map(|ej| svc.containers.iter().any(|c| c != ej))
-                                .unwrap_or(false);
+                            // Skip log polling if the selected container is the ejected one —
+                            // the dev container has no application logs to tail.
+                            let selected_is_ejected = svc.ejected
+                                && svc.ejected_container.is_some()
+                                && svc.selected_container == svc.ejected_container;
 
-                            if svc.ejected && !has_other_containers {
-                                // already showing dev-mode message — leave logs alone
-                            } else if let (Some(dep), Some(container)) = (
-                                svc.deployment_name.clone(),
-                                svc.selected_container.clone(),
-                            ) {
-                                self.state.log_generation += 1;
-                                let gen = self.state.log_generation;
-                                spawn_logs_for_container(
-                                    self.tx.clone(), self.ctx.clone(),
-                                    dep, Some(container), gen,
-                                );
+                            if !selected_is_ejected {
+                                if let (Some(dep), Some(container)) = (
+                                    svc.deployment_name.clone(),
+                                    svc.selected_container.clone(),
+                                ) {
+                                    self.state.log_generation += 1;
+                                    let gen = self.state.log_generation;
+                                    spawn_logs_for_container(
+                                        self.tx.clone(), self.ctx.clone(),
+                                        dep, Some(container), gen,
+                                    );
+                                }
                             }
                         }
                     }
@@ -735,18 +739,23 @@ impl eframe::App for App {
                     if strip_action.uneject_clicked     { self.run_uneject(ctx); }
                     if strip_action.open_editor_clicked { self.open_editor(); }
 
-                    // Container chip bar — above tabs so both logs and terminal inherit it
-                    if let Some(container) = draw_container_chips(&self.state, ui) {
-                        self.select_container(Some(container));
-                    }
-
                     match draw_tab_bar(&self.state, ui) {
-                        Some(TabBarAction::SwitchToLogs)    => self.state.right_pane = RightPane::Logs,
+                        Some(TabBarAction::SelectContainer(name)) => {
+                            let container = if name.is_empty() { None } else { Some(name) };
+                            self.select_container(container);
+                            self.state.right_pane = RightPane::Logs;
+                        }
+                        Some(TabBarAction::OpenTermForContainer(name)) => {
+                            // Set the container first so open_and_connect_term picks it up
+                            if let Some(svc) = self.state.services.get_mut(self.state.selected_idx) {
+                                svc.selected_container = Some(name);
+                            }
+                            self.open_and_connect_term(ctx);
+                        }
                         Some(TabBarAction::SwitchToTerm(i)) => {
                             self.state.right_pane  = RightPane::TerminalTab(i);
                             self.state.active_term = i;
                         }
-                        Some(TabBarAction::NewTerm)      => self.open_and_connect_term(ctx),
                         Some(TabBarAction::CloseTerm(i)) => self.state.close_term_tab(i),
                         None => {}
                     }

@@ -41,48 +41,7 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
 
 /// Returns Some(Some(name)) to switch container, Some(None) to reset to default, None if no click.
 /// Only renders anything when the service has more than one container.
-pub fn draw_container_chips(state: &AppState, ui: &mut egui::Ui) -> Option<String> {
-    let svc = state.services.get(state.selected_idx)?;
-    if svc.containers.len() <= 1 { return None; }
 
-    let mut clicked: Option<String> = None;
-
-    let (bar_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 28.0),
-        egui::Sense::hover(),
-    );
-    ui.painter().rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(22, 22, 22));
-    ui.painter().line_segment(
-        [bar_rect.left_bottom(), bar_rect.right_bottom()],
-        egui::Stroke::new(0.5, COLOR_BORDER),
-    );
-
-    let mut child_ui = ui.child_ui(bar_rect, egui::Layout::left_to_right(egui::Align::Center));
-    child_ui.add_space(8.0);
-    child_ui.label(
-        egui::RichText::new("container:")
-            .font(egui::FontId::new(10.5, egui::FontFamily::Monospace))
-            .color(COLOR_MUTED),
-    );
-    child_ui.add_space(6.0);
-
-    // Just the real container names — no "default" chip
-    for name in &svc.containers {
-        let is_active  = svc.selected_container.as_deref() == Some(name.as_str());
-        let is_ejected = svc.ejected
-            && svc.ejected_container.as_deref() == Some(name.as_str());
-
-        if is_ejected {
-            draw_ejected_chip(&mut child_ui, name, is_active);
-        } else {
-            if chip(&mut child_ui, name, is_active).clicked() && !is_active {
-                clicked = Some(name.clone());
-            }
-        }
-        child_ui.add_space(4.0);
-    }
-    clicked
-}
 
 fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
     let badge_text  = "⚡ Ejected";

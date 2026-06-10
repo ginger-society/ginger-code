@@ -14,11 +14,12 @@ pub mod dbschemadetail;
 mod log_highlight;
 
 pub use infostrip::{draw_info_strip, InfoStripAction};
-pub use logspane::{draw_logs_pane, draw_container_chips};
+pub use logspane::draw_logs_pane;
 pub use packagedetail::{draw_package_detail, PackageDetailAction};
 pub use sidebar::draw_service_list;
 pub use statusbar::draw_statusbar;
-pub use tabbar::{draw_tab_bar, TabBarAction};
 pub use terminalpane::draw_terminal_pane;
 pub use titlebar::draw_titlebar;
 pub use dbschemadetail::draw_db_schema_detail;
+pub use tabbar::{draw_tab_bar, TabBarAction};
+
