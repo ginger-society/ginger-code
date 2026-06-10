@@ -130,8 +130,6 @@ pub fn spawn_service_refresh(
 
         rt.block_on(async move {
             let ejected = is_ejected(&deployment_name).await;
-
-            // Read which container was ejected from the deployment annotation
             let ejected_container = if ejected {
                 get_deployment_annotation(
                     &deployment_name,
@@ -140,22 +138,10 @@ pub fn spawn_service_refresh(
             } else {
                 None
             };
-
             let _ = tx.send(BgMsg::EjectedFlag { idx, ejected, ejected_container });
             ctx.request_repaint();
-
-            if ejected { return; }
-
-            let lines = get_pod_logs(&deployment_name, None).await;
-            let _ = tx.send(BgMsg::Logs { lines, generation });
-            ctx.request_repaint();
-
-            loop {
-                sleep(Duration::from_secs(2)).await;
-                let lines = get_pod_logs(&deployment_name, None).await;
-                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
-                ctx.request_repaint();
-            }
+            // No log polling here at all — EjectedFlag handler starts
+            // container fetch, Containers handler starts the log poller
         });
     });
 }
@@ -254,7 +240,7 @@ pub fn spawn_db_schema_logs(
 
         rt.block_on(async move {
             loop {
-                let lines = get_pod_logs(&slug, container.as_deref()).await;
+                let lines = get_pod_logs(&slug, container.clone()).await;
                 let normalised = if lines.len() == 1
                     && (lines[0].starts_with("No pods found")
                         || lines[0].starts_with("No pods found for deployment"))
@@ -329,7 +315,29 @@ pub fn spawn_logs_for_container(
 
         rt.block_on(async move {
             loop {
-                let lines = get_pod_logs(&deployment_name, container.as_deref()).await;
+                let lines = get_pod_logs(&deployment_name, container.clone()).await;
+                if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
+                ctx.request_repaint();
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+pub fn spawn_service_logs(
+    tx:              mpsc::Sender<BgMsg>,
+    ctx:             egui::Context,
+    deployment_name: String,
+    container:       Option<String>,
+    generation:      u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            loop {
+                let lines = get_pod_logs(&deployment_name, container.clone()).await;
                 if tx.send(BgMsg::Logs { lines, generation }).is_err() { break; }
                 ctx.request_repaint();
                 sleep(Duration::from_secs(2)).await;

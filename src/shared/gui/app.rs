@@ -11,7 +11,7 @@ use super::bg::{
     spawn_mount,
     spawn_service_refresh,
     spawn_unmount,
-    spawn_logs_for_container,
+    spawn_service_logs,
     spawn_container_fetch,
     spawn_db_container_fetch
 };
@@ -80,19 +80,12 @@ impl App {
     fn select_service(&mut self, new_idx: usize) {
         let generation = self.state.switch_service(new_idx);
 
-        let svc               = &self.state.services[new_idx];
-        let meta_name         = svc.meta_name.clone();
-        let deployment_name   = svc.deployment_name.clone();
-        let ejected           = svc.ejected;
-        let ejected_container = svc.ejected_container.clone();
-        let containers        = svc.containers.clone();
+        let svc             = &self.state.services[new_idx];
+        let meta_name       = svc.meta_name.clone();
+        let deployment_name = svc.deployment_name.clone();
+        let ejected         = svc.ejected;
 
-        let has_other_containers = ejected_container.as_ref()
-            .map(|ej| containers.iter().any(|c| c != ej))
-            .unwrap_or(false);
-
-        if ejected && !has_other_containers {
-            // Single-container ejected: show dev mode message immediately
+        if ejected {
             self.state.logs = vec![
                 format!("⚡ {} is ejected — running in dev mode.", meta_name),
                 "No application logs available.".into(),
@@ -101,9 +94,8 @@ impl App {
             self.state.logs = vec![format!("Fetching logs for {}…", meta_name)];
         }
 
-        if let Some(dep) = deployment_name.clone() {
-            spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep.clone(), generation);
-            spawn_container_fetch(self.tx.clone(), self.ctx.clone(), new_idx, dep);
+        if let Some(dep) = deployment_name {
+            spawn_service_refresh(self.tx.clone(), self.ctx.clone(), new_idx, dep, generation);
         }
     }
 
@@ -389,43 +381,36 @@ impl App {
 
     // ── Container selection ───────────────────────────────────────────────────
 
+    // In select_container, replace the spawn_service_logs call:
     fn select_container(&mut self, container: Option<String>) {
         let idx = self.state.selected_idx;
         if let Some(svc) = self.state.services.get_mut(idx) {
             svc.selected_container = container.clone();
         }
 
-        // Don't poll logs for the ejected container — it's a dev container
-        // running sleep/entrypoint, not the application.
         if let Some(svc) = self.state.services.get(idx) {
             let selected_is_ejected = svc.ejected
-                && svc.ejected_container.is_some()
-                && svc.selected_container == svc.ejected_container;
+                && container.as_deref() == svc.ejected_container.as_deref();
 
             if selected_is_ejected {
+                // ── Bump generation to kill any running log poller ────────────
+                self.state.log_generation += 1;
                 self.state.logs = vec![
-                    format!(
-                        "⚡ {} is ejected — running in dev mode.",
-                        svc.meta_name
-                    ),
+                    format!("⚡ {} is ejected — running in dev mode.", svc.meta_name),
                     "No application logs available.".into(),
                 ];
                 return;
             }
-        }
 
-        let dep = match self.state.services.get(idx)
-            .and_then(|s| s.deployment_name.clone())
-        {
-            Some(d) => d,
-            None    => return,
-        };
-        self.state.log_generation += 1;
-        let gen = self.state.log_generation;
-        spawn_logs_for_container(
-            self.tx.clone(), self.ctx.clone(),
-            dep, container, gen,
-        );
+            if let Some(dep) = svc.deployment_name.clone() {
+                self.state.log_generation += 1;
+                let gen = self.state.log_generation;
+                spawn_service_logs(
+                    self.tx.clone(), self.ctx.clone(),
+                    dep, container, gen,
+                );
+            }
+        }
     }
 
     // ── Drain background channel ──────────────────────────────────────────────
@@ -463,31 +448,30 @@ impl App {
                 // ── Containers arrived ────────────────────────────────────────
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
                     if let Some(svc) = self.state.services.get_mut(svc_idx) {
-                        svc.selected_container = containers.first().cloned();
-                        svc.containers         = containers;
+                        // Only override if ejected_container is known; otherwise wait
+                        // for EjectedFlag before selecting a default.
+                        let default = if svc.ejected && svc.ejected_container.is_none() {
+                            // EjectedFlag not yet received — don't start log polling yet
+                            // (EjectedFlag handler will call spawn_container_fetch again
+                            //  which re-triggers this path once ejected_container is known)
+                            None
+                        } else {
+                            containers.iter()
+                                .find(|c| Some(c.as_str()) != svc.ejected_container.as_deref())
+                                .or_else(|| containers.first())
+                                .cloned()
+                        };
+                        svc.selected_container = default;
+                        svc.containers = containers;
                     }
 
                     if svc_idx == self.state.selected_idx {
-                        if let Some(svc) = self.state.services.get(svc_idx) {
-                            // Skip log polling if the selected container is the ejected one —
-                            // the dev container has no application logs to tail.
-                            let selected_is_ejected = svc.ejected
-                                && svc.ejected_container.is_some()
-                                && svc.selected_container == svc.ejected_container;
-
-                            if !selected_is_ejected {
-                                if let (Some(dep), Some(container)) = (
-                                    svc.deployment_name.clone(),
-                                    svc.selected_container.clone(),
-                                ) {
-                                    self.state.log_generation += 1;
-                                    let gen = self.state.log_generation;
-                                    spawn_logs_for_container(
-                                        self.tx.clone(), self.ctx.clone(),
-                                        dep, Some(container), gen,
-                                    );
-                                }
-                            }
+                        let container = self.state.services
+                            .get(svc_idx)
+                            .and_then(|s| s.selected_container.clone());
+                        // Only call select_container if we have a resolved container
+                        if container.is_some() {
+                            self.select_container(container);
                         }
                     }
                 }
@@ -540,52 +524,44 @@ impl App {
                 Ok(BgMsg::EjectedFlag { idx, ejected, ejected_container }) => {
                     if let Some(svc) = self.state.services.get_mut(idx) {
                         svc.ejected           = ejected;
-                        svc.ejected_container = ejected_container.clone();
-
-                        // If ejected and multi-container, steer selected_container
-                        // away from the ejected container to the first available one.
-                        if ejected {
-                            if let Some(ref ej) = ejected_container {
-                                if let Some(alt) = svc.containers.iter().find(|c| *c != ej).cloned() {
-                                    svc.selected_container = Some(alt);
-                                }
-                            }
-                        }
+                        svc.ejected_container = ejected_container;
                     }
+                    if idx == self.state.selected_idx && ejected {
+                        let name = self.state.services.get(idx)
+                            .map(|s| s.meta_name.as_str())
+                            .unwrap_or("this service");
+                        self.state.logs = vec![
+                            format!("⚡ {} is ejected — running in dev mode.", name),
+                            "No application logs available.".into(),
+                        ];
+                    }
+                    
+                    // NEW: if containers are already loaded, re-resolve the default now that
+                    // ejected_container is known — this handles the race where Containers
+                    // arrived before EjectedFlag.
+                    let containers_already_loaded = self.state.services
+                        .get(idx)
+                        .map(|s| !s.containers.is_empty())
+                        .unwrap_or(false);
 
-                    // Update logs for the active service
-                    if idx == self.state.selected_idx {
-                        let svc                  = self.state.services.get(idx);
-                        let is_ejected           = svc.map(|s| s.ejected).unwrap_or(false);
-                        let containers           = svc.map(|s| s.containers.clone()).unwrap_or_default();
-                        let ej_container         = svc.and_then(|s| s.ejected_container.clone());
-                        let selected_container   = svc.and_then(|s| s.selected_container.clone());
-                        let dep                  = svc.and_then(|s| s.deployment_name.clone());
-                        let name                 = svc.map(|s| s.meta_name.clone()).unwrap_or_default();
-
-                        let has_other_containers = ej_container.as_ref()
-                            .map(|ej| containers.iter().any(|c| c != ej))
-                            .unwrap_or(false);
-
-                        if is_ejected && !has_other_containers {
-                            // Single-container ejected: show dev mode message
-                            self.state.logs = vec![
-                                format!("⚡ {} is ejected — running in dev mode.", name),
-                                "No application logs available.".into(),
-                            ];
-                        } else if is_ejected && has_other_containers {
-                            // Multi-container ejected: stream logs for the
-                            // selected non-ejected container
-                            if let (Some(d), Some(container)) = (dep, selected_container) {
-                                self.state.log_generation += 1;
-                                let gen = self.state.log_generation;
-                                spawn_logs_for_container(
-                                    self.tx.clone(), self.ctx.clone(),
-                                    d, Some(container), gen,
-                                );
-                            }
+                    if containers_already_loaded && idx == self.state.selected_idx {
+                        let container = self.state.services.get(idx).and_then(|svc| {
+                            svc.containers.iter()
+                                .find(|c| Some(c.as_str()) != svc.ejected_container.as_deref())
+                                .or_else(|| svc.containers.first())
+                                .cloned()
+                        });
+                        if let Some(svc) = self.state.services.get_mut(idx) {
+                            svc.selected_container = container.clone();
                         }
-                        // If not ejected, spawn_service_refresh already handles logs
+                        self.select_container(container);
+                    } else {
+                        // Containers not yet loaded — trigger the fetch as before
+                        if let Some(dep) = self.state.services.get(idx)
+                            .and_then(|s| s.deployment_name.clone())
+                        {
+                            spawn_container_fetch(self.tx.clone(), self.ctx.clone(), idx, dep);
+                        }
                     }
                 }
 

@@ -116,10 +116,16 @@ pub async fn get_pod_containers(deployment_name: &str) -> Option<(String, Vec<St
 /// Fetch container list for a service once — fires once per service selection.
 
 
-pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec<String> {
+// In k8_info.rs — replace get_pod_logs with this version that uses
+// -l selector instead of name prefix matching, which is more reliable
+pub async fn get_pod_logs(deployment_name: &str, container: Option<String>) -> Vec<String> {
+    // Use label selector — more reliable than pod name prefix matching
+    let label = format!("app={}", deployment_name);
+    
     let pod_output = tokio::process::Command::new("kubectl")
         .args(&[
             "get", "pods",
+            "-l", &label,
             "--field-selector=status.phase=Running",
             "--no-headers",
             "-o", "custom-columns=NAME:.metadata.name",
@@ -128,11 +134,13 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec
         .await;
 
     let pod_name = match pod_output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .find(|l| l.trim().starts_with(deployment_name))
-            .map(|l| l.trim().to_string()),
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.lines()
+                .filter(|l| !l.trim().is_empty())
+                .next()
+                .map(|l| l.trim().to_string())
+        }
         Err(_) => None,
     };
 
@@ -140,10 +148,14 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec
         return vec![format!("No pods found for deployment '{}'.", deployment_name)];
     };
 
-    let mut args = vec!["logs", "--tail=500", &pod];
-    if let Some(c) = container {
-        args.push("--container");
-        args.push(c);
+    let mut args: Vec<String> = vec![
+        "logs".into(),
+        "--tail=500".into(),
+        pod.clone(),
+    ];
+    if let Some(ref c) = container {
+        args.push("--container".into());
+        args.push(c.clone());
     }
 
     match tokio::process::Command::new("kubectl")
@@ -151,10 +163,17 @@ pub async fn get_pod_logs(deployment_name: &str, container: Option<&str>) -> Vec
         .output()
         .await
     {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|s| s.to_string())
-            .collect(),  // stdout only — stderr dropped entirely
+        Ok(out) => {
+            if !out.stderr.is_empty() {
+                // If kubectl errors (e.g. wrong container name), surface it
+                let err = String::from_utf8_lossy(&out.stderr);
+                return vec![format!("kubectl logs error: {}", err.trim())];
+            }
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        }
         Err(e) => vec![format!("Failed to fetch logs: {}", e)],
     }
 }
