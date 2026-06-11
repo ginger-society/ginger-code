@@ -53,7 +53,6 @@ pub fn point_in_rect(col: u16, row: u16, area: Rect) -> bool {
         && row < area.y + area.height
 }
 
-/// Translate a mouse click in the sidebar to a `SidebarItem`.
 pub fn click_sidebar_item(
     col:           u16,
     row:           u16,
@@ -64,7 +63,7 @@ pub fn click_sidebar_item(
     db_count:      usize,
 ) -> Option<SidebarItem> {
     let x0 = sidebar_area.x + 1;
-    let y0 = sidebar_area.y + 2; // border + "Services" header row
+    let y0 = sidebar_area.y + 2;
     let x1 = sidebar_area.x + sidebar_area.width - 1;
     let y1 = sidebar_area.y + sidebar_area.height - 1;
 
@@ -129,13 +128,13 @@ pub fn help_text(
     has_lang:        bool,
     ejected:         bool,
     multi_container: bool,
+    can_shell:       bool,   // only true when focus=Logs + non-ejected container
 ) -> String {
     match focus {
         Focus::Sidebar => match sidebar_item {
             SidebarItem::Service(_) => {
                 let mut parts = vec!["↑/↓ navigate", "→ logs"];
                 if multi_container { parts.push("⇧←/⇧→ container"); }
-                if has_deployment  { parts.push("s shell"); }
                 if has_deployment && has_lang {
                     parts.push(if ejected { "e uneject" } else { "e eject" });
                 }
@@ -152,8 +151,19 @@ pub fn help_text(
             }
         },
         Focus::Logs => {
-            "PgUp top  |  PgDn follow  |  ↑/↓ scroll  |  g/G jump  |  ← sidebar  |  q quit"
-                .to_string()
+            let mut parts = vec![
+                "PgUp top",
+                "PgDn follow",
+                "↑/↓ scroll",
+                "g/G jump",
+                "⇧←/⇧→ container",
+                "← sidebar",
+            ];
+            if can_shell {
+                parts.push("s shell");
+            }
+            parts.push("q quit");
+            parts.join("  |  ")
         }
     }
 }
@@ -174,24 +184,25 @@ pub struct DrawnAreas {
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
-    f:                    &mut Frame,
-    services:             &[K8sService],
-    packages:             &[Package],
-    db_schemas:           &[DbSchema],
-    sidebar_item:         &SidebarItem,
-    logs:                 &HashMap<String, Vec<String>>,
-    db_logs:              Option<&[String]>,
-    focus:                &Focus,
-    auto_scroll:          bool,
-    scroll_offset:        usize,
-    has_deployment:       bool,
-    has_lang:             bool,
-    is_ejected_now:       bool,
-    popup:                Option<&Popup>,
-    active_container_idx: usize,
-    active_container:     Option<&str>,
-    db_containers:        &[String],
+    f:                     &mut Frame,
+    services:              &[K8sService],
+    packages:              &[Package],
+    db_schemas:            &[DbSchema],
+    sidebar_item:          &SidebarItem,
+    logs:                  &HashMap<String, Vec<String>>,
+    db_logs:               Option<&[String]>,
+    focus:                 &Focus,
+    auto_scroll:           bool,
+    scroll_offset:         usize,
+    has_deployment:        bool,
+    has_lang:              bool,
+    is_ejected_now:        bool,
+    popup:                 Option<&Popup>,
+    active_container_idx:  usize,
+    active_container:      Option<&str>,
+    db_containers:         &[String],
     db_selected_container: Option<&str>,
+    can_shell:             bool,
 ) -> DrawnAreas {
     let area = f.size();
 
@@ -205,25 +216,21 @@ pub fn draw(
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(root[0]);
 
-    // ── Sidebar ───────────────────────────────────────────────────────────────
     let sidebar_scroll = draw_sidebar(
         f, chunks[0], services, packages, db_schemas, sidebar_item, focus,
     );
 
-    // ── Right pane ────────────────────────────────────────────────────────────
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(6), Constraint::Min(0)])
         .split(chunks[1]);
 
-    // Multi-container flag for the current service.
     let multi_container = if let SidebarItem::Service(i) = sidebar_item {
         services.get(*i).map(|s| s.containers.len() > 1).unwrap_or(false)
     } else {
         false
     };
 
-    // Multi-container flag for the current DB schema.
     let db_multi_container = db_containers.len() > 1;
 
     let logs_area = match sidebar_item {
@@ -242,62 +249,42 @@ pub fn draw(
         SidebarItem::Service(svc_idx) => {
             let selected = services.get(*svc_idx);
 
-            // Info strip: split into info (top) + container tabs row (if multi).
             if multi_container {
                 let info_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(4), // service info
-                        Constraint::Length(2), // container tab bar
-                        Constraint::Min(0),    // logs
+                        Constraint::Length(4),
+                        Constraint::Length(2),
+                        Constraint::Min(0),
                     ])
                     .split(chunks[1]);
 
-                draw_service_info(
-                    f, info_chunks[0], selected,
-                    has_deployment, has_lang, is_ejected_now,
-                );
-                draw_container_tabs(
-                    f, info_chunks[1],
-                    selected,
-                    active_container_idx,
-                    active_container,
-                );
-                draw_logs(
-                    f, info_chunks[2], selected, logs, focus,
-                    auto_scroll, scroll_offset, active_container,
-                );
+                draw_service_info(f, info_chunks[0], selected, has_deployment, has_lang, is_ejected_now);
+                draw_container_tabs(f, info_chunks[1], selected, active_container_idx, active_container);
+                draw_logs(f, info_chunks[2], selected, logs, focus, auto_scroll, scroll_offset, active_container);
                 info_chunks[2]
             } else {
-                draw_service_info(
-                    f, right_chunks[0], selected,
-                    has_deployment, has_lang, is_ejected_now,
-                );
-                draw_logs(
-                    f, right_chunks[1], selected, logs, focus,
-                    auto_scroll, scroll_offset, active_container,
-                );
+                draw_service_info(f, right_chunks[0], selected, has_deployment, has_lang, is_ejected_now);
+                draw_logs(f, right_chunks[1], selected, logs, focus, auto_scroll, scroll_offset, active_container);
                 right_chunks[1]
             }
         }
     };
 
-    // ── Help bar ──────────────────────────────────────────────────────────────
-    // Derive multi_container for help text — covers both service and DB schema.
+    // Help bar — ⇧←/⇧→ shown only when there are multiple containers to switch.
     let help_multi = multi_container
         || (matches!(sidebar_item, SidebarItem::DbSchema(_)) && db_multi_container);
 
     f.render_widget(
         Paragraph::new(help_text(
             focus, sidebar_item, has_deployment, has_lang,
-            is_ejected_now, help_multi,
+            is_ejected_now, help_multi, can_shell,
         ))
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::TOP)),
         root[1],
     );
 
-    // ── Popup overlay ─────────────────────────────────────────────────────────
     if let Some(p) = popup {
         render_popup(f, p, area);
     }
@@ -309,7 +296,6 @@ pub fn draw(
    CONTAINER TAB BAR  (services)
    ================================================================ */
 
-/// Renders a row of container name tabs for a service.
 fn draw_container_tabs(
     f:                 &mut Frame,
     area:              Rect,
@@ -322,9 +308,9 @@ fn draw_container_tabs(
         _ => return,
     };
 
-    let containers       = &svc.containers;
-    let ejected_name     = svc.ejected_container.as_deref().unwrap_or("");
-    let svc_is_ejected   = svc.ejected;
+    let containers     = &svc.containers;
+    let ejected_name   = svc.ejected_container.as_deref().unwrap_or("");
+    let svc_is_ejected = svc.ejected;
 
     let tab_w = (area.width as usize / containers.len().max(1)).max(1) as u16;
 
@@ -333,11 +319,7 @@ fn draw_container_tabs(
         let is_active      = i == active_idx;
         let is_ejected_tab = svc_is_ejected && name.as_str() == ejected_name;
 
-        let raw_label = if is_ejected_tab {
-            format!("⚡ {}", name)
-        } else {
-            name.clone()
-        };
+        let raw_label = if is_ejected_tab { format!("⚡ {}", name) } else { name.clone() };
 
         let label = if raw_label.len() + 2 > tab_w as usize {
             format!(" {:.width$} ", raw_label, width = (tab_w as usize).saturating_sub(2))
@@ -347,13 +329,7 @@ fn draw_container_tabs(
 
         spans.push(if is_active {
             let fg = if is_ejected_tab { Color::Magenta } else { Color::Black };
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(fg)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+            Span::styled(label, Style::default().fg(fg).bg(Color::Yellow).add_modifier(Modifier::BOLD))
         } else if is_ejected_tab {
             Span::styled(label, Style::default().fg(Color::Magenta))
         } else {
@@ -365,18 +341,11 @@ fn draw_container_tabs(
         }
     }
 
-    spans.push(Span::styled(
-        "  ⇧←/⇧→",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-    ));
+    spans.push(Span::styled("  ⇧←/⇧→", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
 
     f.render_widget(
         Paragraph::new(Line::from(spans))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
+            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray))),
         area,
     );
 }
@@ -385,17 +354,13 @@ fn draw_container_tabs(
    CONTAINER TAB BAR  (DB schemas)
    ================================================================ */
 
-/// Renders a row of container name tabs for a DB schema.
-/// Only shown when there are 2+ containers.
 fn draw_db_container_tabs(
-    f:         &mut Frame,
-    area:      Rect,
+    f:          &mut Frame,
+    area:       Rect,
     containers: &[String],
-    selected:  Option<&str>,
+    selected:   Option<&str>,
 ) {
-    if containers.len() <= 1 {
-        return;
-    }
+    if containers.len() <= 1 { return; }
 
     let tab_w = (area.width as usize / containers.len().max(1)).max(1) as u16;
 
@@ -410,13 +375,7 @@ fn draw_db_container_tabs(
         };
 
         spans.push(if is_active {
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            Span::styled(label, Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
         } else {
             Span::styled(label, Style::default().fg(Color::DarkGray))
         });
@@ -426,18 +385,11 @@ fn draw_db_container_tabs(
         }
     }
 
-    spans.push(Span::styled(
-        "  ⇧←/⇧→",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-    ));
+    spans.push(Span::styled("  ⇧←/⇧→", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
 
     f.render_widget(
         Paragraph::new(Line::from(spans))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
+            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray))),
         area,
     );
 }
@@ -459,11 +411,7 @@ fn draw_sidebar(
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(" Services ")
-        .border_style(if sidebar_focus {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default()
-        });
+        .border_style(if sidebar_focus { Style::default().fg(Color::Yellow) } else { Style::default() });
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -474,15 +422,11 @@ fn draw_sidebar(
     };
 
     let fill = |is_sel: bool, is_cur: bool| -> Span<'static> {
-        Span::styled(
-            " ".repeat(inner.width as usize),
-            row_bg(is_sel, is_cur),
-        )
+        Span::styled(" ".repeat(inner.width as usize), row_bg(is_sel, is_cur))
     };
 
     let mut items: Vec<ListItem> = Vec::new();
 
-    // ── Service items ─────────────────────────────────────────────────────────
     for (i, svc) in services.iter().enumerate() {
         let is_sel = *sidebar_item == SidebarItem::Service(i) && sidebar_focus;
         let is_cur = *sidebar_item == SidebarItem::Service(i);
@@ -509,11 +453,7 @@ fn draw_sidebar(
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
         };
 
-        let eject = if svc.ejected {
-            Span::styled(" [EJECTED]", eject_style)
-        } else {
-            Span::raw("")
-        };
+        let eject = if svc.ejected { Span::styled(" [EJECTED]", eject_style) } else { Span::raw("") };
 
         let container_badge = if svc.containers.len() > 1 {
             let badge_style = if is_sel {
@@ -521,10 +461,7 @@ fn draw_sidebar(
             } else {
                 Style::default().fg(Color::Cyan)
             };
-            Span::styled(
-                format!(" [{}c]", svc.containers.len()),
-                badge_style,
-            )
+            Span::styled(format!(" [{}c]", svc.containers.len()), badge_style)
         } else {
             Span::raw("")
         };
@@ -546,22 +483,15 @@ fn draw_sidebar(
                 fill(is_sel, is_cur),
             ]),
             Line::from(vec![
-                Span::styled(
-                    format!("  ready: {}  {}", svc.ready, svc.status),
-                    sub_style,
-                ),
+                Span::styled(format!("  ready: {}  {}", svc.ready, svc.status), sub_style),
                 fill(is_sel, is_cur),
             ]),
         ]));
     }
 
-    // ── Packages section header ───────────────────────────────────────────────
     if !packages.is_empty() {
         items.push(ListItem::new(vec![
-            Line::from(vec![Span::styled(
-                "── Packages & Executables ──",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-            )]),
+            Line::from(vec![Span::styled("── Packages & Executables ──", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))]),
             Line::from(""),
         ]));
 
@@ -578,13 +508,9 @@ fn draw_sidebar(
             };
 
             let dot_style = if is_sel {
-                Style::default()
-                    .bg(Color::Yellow)
-                    .fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
+                Style::default().bg(Color::Yellow).fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
             } else if is_cur {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
+                Style::default().bg(Color::DarkGray).fg(if pkg.mounted { Color::Green } else { Color::DarkGray })
             } else if pkg.mounted {
                 Style::default().fg(Color::Green)
             } else {
@@ -613,11 +539,7 @@ fn draw_sidebar(
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             };
 
-            let mounted = if pkg.mounted {
-                Span::styled(" [MOUNTED]", mounted_style)
-            } else {
-                Span::raw("")
-            };
+            let mounted = if pkg.mounted { Span::styled(" [MOUNTED]", mounted_style) } else { Span::raw("") };
 
             items.push(ListItem::new(vec![
                 Line::from(vec![
@@ -627,23 +549,16 @@ fn draw_sidebar(
                     fill(is_sel, is_cur),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {}  ·  {}", pkg.package_type, pkg.lang),
-                        sub_style,
-                    ),
+                    Span::styled(format!("  {}  ·  {}", pkg.package_type, pkg.lang), sub_style),
                     fill(is_sel, is_cur),
                 ]),
             ]));
         }
     }
 
-    // ── DB Schemas section header ─────────────────────────────────────────────
     if !db_schemas.is_empty() {
         items.push(ListItem::new(vec![
-            Line::from(vec![Span::styled(
-                "── DB Schemas ──────────────",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-            )]),
+            Line::from(vec![Span::styled("── DB Schemas ──────────────", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))]),
             Line::from(""),
         ]));
 
@@ -697,47 +612,35 @@ fn draw_sidebar(
                     fill(is_sel, is_cur),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {}  ·  {} tables", db_type, schema.tables.len()),
-                        sub_style,
-                    ),
+                    Span::styled(format!("  {}  ·  {} tables", db_type, schema.tables.len()), sub_style),
                     fill(is_sel, is_cur),
                 ]),
             ]));
         }
     }
 
-    // ── Compute selected flat index ───────────────────────────────────────────
     let pkg_header = if packages.is_empty()   { 0 } else { 1 };
     let db_header  = if db_schemas.is_empty() { 0 } else { 1 };
 
     let selected_flat = match sidebar_item {
         SidebarItem::Service(i)  => *i,
         SidebarItem::Package(i)  => services.len() + pkg_header + i,
-        SidebarItem::DbSchema(i) => {
-            services.len() + pkg_header + packages.len() + db_header + i
-        }
+        SidebarItem::DbSchema(i) => services.len() + pkg_header + packages.len() + db_header + i,
     };
 
     let mut state = ListState::default();
     state.select(Some(selected_flat));
 
-    let list_area = Rect {
-        width: inner.width.saturating_sub(1),
-        ..inner
-    };
+    let list_area = Rect { width: inner.width.saturating_sub(1), ..inner };
     let list = List::new(items).highlight_style(Style::default());
     f.render_stateful_widget(list, list_area, &mut state);
 
-    // ── Sidebar scrollbar ─────────────────────────────────────────────────────
     let pkg_header_slots = if packages.is_empty()   { 0usize } else { 1 };
     let db_header_slots  = if db_schemas.is_empty() { 0usize } else { 1 };
-    let total_slots      = services.len()
-        + pkg_header_slots + packages.len()
-        + db_header_slots  + db_schemas.len();
-    let visible_slots = (inner.height as usize / 2).max(1);
-    let max_scroll    = total_slots.saturating_sub(visible_slots);
-    let scroll_pos    = state.offset();
+    let total_slots      = services.len() + pkg_header_slots + packages.len() + db_header_slots + db_schemas.len();
+    let visible_slots    = (inner.height as usize / 2).max(1);
+    let max_scroll       = total_slots.saturating_sub(visible_slots);
+    let scroll_pos       = state.offset();
 
     if max_scroll > 0 {
         let mut sb_state = ScrollbarState::new(max_scroll).position(scroll_pos);
@@ -747,12 +650,7 @@ fn draw_sidebar(
                 .end_symbol(Some("▼"))
                 .track_symbol(Some("│"))
                 .thumb_symbol("█"),
-            Rect {
-                x:      inner.x + inner.width.saturating_sub(1),
-                y:      inner.y,
-                width:  1,
-                height: inner.height,
-            },
+            Rect { x: inner.x + inner.width.saturating_sub(1), y: inner.y, width: 1, height: inner.height },
             &mut sb_state,
         );
     }
@@ -784,10 +682,7 @@ fn draw_service_info(
             ]),
             Line::from(vec![
                 Span::styled("Status:  ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    svc.status.clone(),
-                    Style::default().fg(status_color(&svc.status)),
-                ),
+                Span::styled(svc.status.clone(), Style::default().fg(status_color(&svc.status))),
             ]),
             Line::from(vec![
                 Span::styled("Ejected: ", Style::default().fg(Color::Cyan)),
@@ -798,12 +693,12 @@ fn draw_service_info(
             ]),
         ];
         let mut hints = vec![];
-        if has_deployment             { hints.push("[s] shell"); }
         if has_deployment && has_lang {
             hints.push(if svc.ejected { "[e] uneject" } else { "[e] eject" });
         }
         if has_deployment && svc.ejected { hints.push("[c] VS Code"); }
-        if svc.containers.len() > 1    { hints.push("⇧←/⇧→ container"); }
+        if svc.containers.len() > 1     { hints.push("⇧←/⇧→ container  |  → logs panel for [s] shell"); }
+        else if has_deployment           { hints.push("→ logs panel for [s] shell"); }
         if !hints.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("  {}", hints.join("   ")),
@@ -817,12 +712,7 @@ fn draw_service_info(
 
     f.render_widget(
         Paragraph::new(info_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Service Info ")
-                    .border_style(Style::default().fg(Color::Blue)),
-            )
+            .block(Block::default().borders(Borders::ALL).title(" Service Info ").border_style(Style::default().fg(Color::Blue)))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -842,11 +732,13 @@ fn draw_logs(
     scroll_offset:    usize,
     active_container: Option<&str>,
 ) {
+    // Detect ejected-container view: show splash instead of logs.
     let viewing_ejected_container = selected.map(|s| {
         if !s.ejected { return false; }
         match (active_container, s.ejected_container.as_deref()) {
             (Some(ac), Some(ec)) => ac == ec,
-            _ => false,
+            // Single-container ejected service — always show splash.
+            _ => s.containers.len() <= 1,
         }
     }).unwrap_or(false);
 
@@ -880,7 +772,7 @@ fn draw_logs(
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
-                        "Use ⇧← / ⇧→ to switch to a sidecar container.",
+                        "Use ⇧← / ⇧→ to switch to a sidecar container to view its logs.",
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]),
@@ -890,6 +782,14 @@ fn draw_logs(
                     Span::styled(
                         "Press  c  to open the workspace in VS Code / Codium.",
                         Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "To shell into a sidecar: switch container tab, then press  s  in the logs panel.",
+                        Style::default().fg(Color::DarkGray),
                     ),
                 ]),
             ])
@@ -916,11 +816,7 @@ fn draw_logs(
     let num_lines        = log_text.lines().count();
     let height           = area.height.saturating_sub(2) as usize;
     let max_scroll       = num_lines.saturating_sub(height);
-    let effective_offset = if auto_scroll {
-        max_scroll
-    } else {
-        scroll_offset.min(max_scroll)
-    };
+    let effective_offset = if auto_scroll { max_scroll } else { scroll_offset.min(max_scroll) };
 
     let inner_area = Rect { width: area.width.saturating_sub(1), ..area };
 
@@ -981,15 +877,9 @@ fn draw_package_detail(f: &mut Frame, area: Rect, pkg: Option<&Package>, focus: 
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                &pkg.identifier,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(&pkg.identifier, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(
-                format!("[{}]", pkg.package_type),
-                Style::default().fg(type_color),
-            ),
+            Span::styled(format!("[{}]", pkg.package_type), Style::default().fg(type_color)),
             if pkg.mounted {
                 Span::styled("  ● mounted", Style::default().fg(Color::Green))
             } else {
@@ -1005,60 +895,34 @@ fn draw_package_detail(f: &mut Frame, area: Rect, pkg: Option<&Package>, focus: 
 
     if !pkg.description.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            &pkg.description,
-            Style::default().fg(Color::Gray),
-        )]));
+        lines.push(Line::from(vec![Span::styled(&pkg.description, Style::default().fg(Color::Gray))]));
     }
 
     if !pkg.dependencies.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "dependencies:",
-            Style::default().fg(Color::DarkGray),
-        )]));
+        lines.push(Line::from(vec![Span::styled("dependencies:", Style::default().fg(Color::DarkGray))]));
         for dep in &pkg.dependencies {
-            lines.push(Line::from(vec![
-                Span::raw("  · "),
-                Span::styled(dep, Style::default().fg(Color::Gray)),
-            ]));
+            lines.push(Line::from(vec![Span::raw("  · "), Span::styled(dep, Style::default().fg(Color::Gray))]));
         }
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "─────────────────────────────",
-        Style::default().fg(Color::DarkGray),
-    )]));
+    lines.push(Line::from(vec![Span::styled("─────────────────────────────", Style::default().fg(Color::DarkGray))]));
     lines.push(Line::from(""));
 
     if pkg.mounted {
         lines.push(Line::from(vec![
-            Span::styled(
-                "  [m] Unmount",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("  [m] Unmount", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("   "),
-            Span::styled(
-                "[c] Open VS Code",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("[c] Open VS Code", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]));
     } else {
-        lines.push(Line::from(vec![Span::styled(
-            "  [m] Mount Dev Container",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )]));
+        lines.push(Line::from(vec![Span::styled("  [m] Mount Dev Container", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]));
     }
 
     f.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Package Detail ")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
+            .block(Block::default().borders(Borders::ALL).title(" Package Detail ").border_style(Style::default().fg(Color::Yellow)))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -1070,13 +934,13 @@ fn draw_package_detail(f: &mut Frame, area: Rect, pkg: Option<&Package>, focus: 
 
 #[allow(clippy::too_many_arguments)]
 fn draw_db_schema_detail(
-    f:             &mut Frame,
-    area:          Rect,
-    schema:        Option<&DbSchema>,
-    db_logs:       Option<&[String]>,
-    focus:         &Focus,
-    scroll_offset: usize,
-    auto_scroll:   bool,
+    f:                     &mut Frame,
+    area:                  Rect,
+    schema:                Option<&DbSchema>,
+    db_logs:               Option<&[String]>,
+    focus:                 &Focus,
+    scroll_offset:         usize,
+    auto_scroll:           bool,
     db_containers:         &[String],
     db_selected_container: Option<&str>,
 ) {
@@ -1089,19 +953,11 @@ fn draw_db_schema_detail(
         return;
     };
 
-    // Layout: info strip | [optional container tabs] | logs
     let has_tabs = db_containers.len() > 1;
     let constraints = if has_tabs {
-        vec![
-            Constraint::Length(7), // info strip
-            Constraint::Length(2), // container tab bar
-            Constraint::Min(0),    // logs
-        ]
+        vec![Constraint::Length(7), Constraint::Length(2), Constraint::Min(0)]
     } else {
-        vec![
-            Constraint::Length(7), // info strip
-            Constraint::Min(0),    // logs
-        ]
+        vec![Constraint::Length(7), Constraint::Min(0)]
     };
 
     let chunks = Layout::default()
@@ -1111,48 +967,32 @@ fn draw_db_schema_detail(
 
     let logs_chunk = if has_tabs { chunks[2] } else { chunks[1] };
 
-    // ── Info strip ────────────────────────────────────────────────────────────
     let db_type = schema.db_type.as_deref().unwrap_or("db");
 
     let mut info_lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                &schema.name,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(&schema.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(
-                format!("[{}]", db_type),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(format!("[{}]", db_type), Style::default().fg(Color::Cyan)),
         ]),
         Line::from(vec![
             Span::styled("identifier: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                schema.identifier.as_deref().unwrap_or("—"),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(schema.identifier.as_deref().unwrap_or("—"), Style::default().fg(Color::Gray)),
             Span::raw("   "),
             Span::styled("tables: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                schema.tables.len().to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(schema.tables.len().to_string(), Style::default().fg(Color::Cyan)),
             Span::raw("   "),
             Span::styled("org: ", Style::default().fg(Color::DarkGray)),
             Span::styled(&schema.organization_id, Style::default().fg(Color::Gray)),
         ]),
         Line::from(vec![
             Span::styled("k8s: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                &schema.k8s_status,
-                Style::default().fg(match schema.k8s_status.as_str() {
-                    "Running"              => Color::Green,
-                    "Degraded" | "Pending" => Color::Yellow,
-                    _                      => Color::DarkGray,
-                }),
-            ),
+            Span::styled(&schema.k8s_status, Style::default().fg(match schema.k8s_status.as_str() {
+                "Running"              => Color::Green,
+                "Degraded" | "Pending" => Color::Yellow,
+                _                      => Color::DarkGray,
+            })),
             Span::raw("   "),
             Span::styled("ready: ", Style::default().fg(Color::DarkGray)),
             Span::styled(&schema.k8s_ready, Style::default().fg(Color::Gray)),
@@ -1161,10 +1001,7 @@ fn draw_db_schema_detail(
 
     if let Some(ref desc) = schema.description {
         if !desc.is_empty() {
-            info_lines.push(Line::from(vec![Span::styled(
-                desc.as_str(),
-                Style::default().fg(Color::DarkGray),
-            )]));
+            info_lines.push(Line::from(vec![Span::styled(desc.as_str(), Style::default().fg(Color::DarkGray))]));
         }
     }
 
@@ -1177,38 +1014,23 @@ fn draw_db_schema_detail(
 
     f.render_widget(
         Paragraph::new(info_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" DB Schema Info ")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
+            .block(Block::default().borders(Borders::ALL).title(" DB Schema Info ").border_style(Style::default().fg(Color::Cyan)))
             .wrap(Wrap { trim: true }),
         chunks[0],
     );
 
-    // ── Container tab bar (only when 2+ containers) ───────────────────────────
     if has_tabs {
         draw_db_container_tabs(f, chunks[1], db_containers, db_selected_container);
     }
 
-    // ── Logs pane ─────────────────────────────────────────────────────────────
     match db_logs {
         None => {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "  Looking for deployment…",
-                        Style::default().fg(Color::Cyan),
-                    )]),
+                    Line::from(vec![Span::styled("  Looking for deployment…", Style::default().fg(Color::Cyan))]),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Logs ")
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                ),
+                .block(Block::default().borders(Borders::ALL).title(" Logs ").border_style(Style::default().fg(Color::DarkGray))),
                 logs_chunk,
             );
         }
@@ -1227,12 +1049,7 @@ fn draw_db_schema_detail(
                         Style::default().fg(Color::DarkGray),
                     )]),
                 ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Logs — No Deployment ")
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                ),
+                .block(Block::default().borders(Borders::ALL).title(" Logs — No Deployment ").border_style(Style::default().fg(Color::DarkGray))),
                 logs_chunk,
             );
         }
@@ -1242,40 +1059,23 @@ fn draw_db_schema_detail(
             let num_lines  = log_text.lines().count();
             let height     = logs_chunk.height.saturating_sub(2) as usize;
             let max_scroll = num_lines.saturating_sub(height);
-            let offset     = if auto_scroll {
-                max_scroll
-            } else {
-                scroll_offset.min(max_scroll)
-            };
+            let offset     = if auto_scroll { max_scroll } else { scroll_offset.min(max_scroll) };
 
-            // Show which container we're tailing when there are multiple.
             let title = if let Some(name) = db_selected_container {
-                if db_containers.len() > 1 {
-                    format!(" Logs [{}] ", name)
-                } else {
-                    " Logs [FOLLOW] ".to_string()
-                }
+                if db_containers.len() > 1 { format!(" Logs [{}] ", name) }
+                else { " Logs [FOLLOW] ".to_string() }
             } else {
                 " Logs [FOLLOW] ".to_string()
             };
 
-            let inner_area = Rect {
-                width: logs_chunk.width.saturating_sub(1),
-                ..logs_chunk
-            };
+            let inner_area = Rect { width: logs_chunk.width.saturating_sub(1), ..logs_chunk };
 
             f.render_widget(
                 Paragraph::new(log_text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(if *focus == Focus::Logs {
-                                Style::default().fg(Color::Yellow)
-                            } else {
-                                Style::default().fg(Color::Cyan)
-                            }),
-                    )
+                    .block(Block::default().borders(Borders::ALL).title(title).border_style(
+                        if *focus == Focus::Logs { Style::default().fg(Color::Yellow) }
+                        else { Style::default().fg(Color::Cyan) },
+                    ))
                     .wrap(Wrap { trim: false })
                     .scroll((offset as u16, 0)),
                 inner_area,

@@ -48,13 +48,9 @@ use self::{
    ================================================================ */
 
 enum TuiMsg {
-    /// A new batch of log lines for a service (generation-gated).
     ServiceLogs { lines: Vec<String>, generation: u64 },
-    /// A new batch of log lines for a DB schema (generation-gated).
     DbLogs { lines: Vec<String>, generation: u64 },
-    /// Container list resolved for `svc_idx`.
     Containers { svc_idx: usize, containers: Vec<String> },
-    /// Container list resolved for a DB schema.
     DbContainers { schema_idx: usize, containers: Vec<String> },
 }
 
@@ -288,30 +284,22 @@ async fn run_tui(
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // ── Shared state ──────────────────────────────────────────────────────────
     let services:   Arc<Mutex<Vec<K8sService>>> = Arc::new(Mutex::new(initial_services));
     let packages:   Arc<Mutex<Vec<Package>>>    = Arc::new(Mutex::new(initial_packages));
     let db_schemas: Arc<Mutex<Vec<DbSchema>>>   = Arc::new(Mutex::new(initial_db_schemas));
 
-    // ── Internal channel for background → UI messages ─────────────────────────
     let (bg_tx, bg_rx) = std::sync::mpsc::channel::<TuiMsg>();
 
-    // ── Log state ─────────────────────────────────────────────────────────────
     let logs: Arc<Mutex<HashMap<String, Vec<String>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut svc_log_generation: u64 = 0;
 
-    // DB logs
     let db_logs:       Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
     let mut db_log_generation: u64 = 0;
     let mut db_log_schema: Option<usize> = None;
 
-    // DB schema container state — mirrors gui AppState fields
-    // db_containers: resolved container list for the current DB schema
-    // db_selected_container: the one whose logs are being streamed
-    let mut db_containers:          Vec<String>   = Vec::new();
-    let mut db_selected_container:  Option<String> = None;
+    let mut db_containers:         Vec<String>    = Vec::new();
+    let mut db_selected_container: Option<String> = None;
 
-    // ── Background: k8s status + ejected flags every 5 s ─────────────────────
     {
         let services = services.clone();
         tokio::spawn(async move {
@@ -349,7 +337,6 @@ async fn run_tui(
         });
     }
 
-    // ── UI state ──────────────────────────────────────────────────────────────
     let mut focus:           Focus       = Focus::Sidebar;
     let mut sidebar_item:    SidebarItem = SidebarItem::Service(0);
     let mut auto_scroll:     bool        = true;
@@ -358,10 +345,8 @@ async fn run_tui(
     let mut sidebar_scroll:  usize       = 0;
     let mut db_last_max_scroll: usize    = 0;
 
-    // Container selection per service: svc_idx → selected container index.
     let mut container_selection: HashMap<usize, usize> = HashMap::new();
 
-    // Kick off the initial service log stream (index 0).
     {
         let svcs = services.lock().unwrap();
         if let Some(svc) = svcs.first() {
@@ -403,7 +388,6 @@ async fn run_tui(
                     }
                 }
                 Ok(TuiMsg::Containers { svc_idx, containers }) => {
-                    // Determine the ejected container name before mutating.
                     let ejected_container = {
                         let svcs = services.lock().unwrap();
                         svcs.get(svc_idx).and_then(|s| s.ejected_container.clone())
@@ -413,7 +397,6 @@ async fn run_tui(
                         svcs.get(svc_idx).map(|s| s.ejected).unwrap_or(false)
                     };
 
-                    // Write the container list into the service.
                     {
                         let mut svcs = services.lock().unwrap();
                         if let Some(svc) = svcs.get_mut(svc_idx) {
@@ -421,21 +404,15 @@ async fn run_tui(
                         }
                     }
 
-                    // If this service is ejected, auto-select the first
-                    // non-ejected container so logs start without user
-                    // having to manually shift to a sidecar.
                     if is_ejected_svc {
                         let ejected_name = ejected_container.as_deref().unwrap_or("");
                         if let Some(non_ejected_idx) = containers
                             .iter()
                             .position(|c| c.as_str() != ejected_name)
                         {
-                            // Only switch if no explicit selection has been
-                            // made by the user yet for this service.
                             if !container_selection.contains_key(&svc_idx) {
                                 container_selection.insert(svc_idx, non_ejected_idx);
 
-                                // Restart log stream for the active service only.
                                 let is_active = matches!(sidebar_item, SidebarItem::Service(i) if i == svc_idx);
                                 if is_active {
                                     let dep = {
@@ -445,8 +422,6 @@ async fn run_tui(
                                     };
                                     let container = containers.get(non_ejected_idx).cloned();
                                     if let Some(dep) = dep {
-                                        // Clear stale lines so the old ejected-splash
-                                        // doesn't linger while the new stream loads.
                                         {
                                             let svcs = services.lock().unwrap();
                                             if let Some(svc) = svcs.get(svc_idx) {
@@ -463,21 +438,15 @@ async fn run_tui(
                                     }
                                 }
                             }
-                        }
-                        // If ALL containers are the ejected one (single-container ejected
-                        // service), default selection stays at 0 — the render layer will
-                        // show the dev-mode splash via viewing_ejected_container guard.
-                        else if !container_selection.contains_key(&svc_idx) {
+                        } else if !container_selection.contains_key(&svc_idx) {
+                            // All containers are the ejected one — show splash, no stream.
                             container_selection.insert(svc_idx, 0);
-                            // Clear any stale logs; render will show the splash.
                             let svcs = services.lock().unwrap();
                             if let Some(svc) = svcs.get(svc_idx) {
                                 logs.lock().unwrap().remove(&svc.meta_name);
                             }
                         }
                     } else {
-                        // Non-ejected service: if no container selected yet,
-                        // default to the first container and (re)start the stream.
                         if !container_selection.contains_key(&svc_idx) {
                             if let Some(first) = containers.first() {
                                 container_selection.insert(svc_idx, 0);
@@ -510,18 +479,13 @@ async fn run_tui(
                     }
                 }
 
-                // ── DB container list resolved ────────────────────────────────
                 Ok(TuiMsg::DbContainers { schema_idx, containers }) => {
-                    // Only act if this is still the schema we're viewing.
                     if db_log_schema == Some(schema_idx) {
                         db_containers = containers.clone();
-
-                        // Pick the first container and restart the log stream
-                        // with it so the API receives a concrete container name.
                         if let Some(first_container) = containers.first().cloned() {
                             db_selected_container = Some(first_container.clone());
                             db_log_generation += 1;
-                            *db_logs.lock().unwrap() = None; // clear stale "looking…" state
+                            *db_logs.lock().unwrap() = None;
 
                             let slug = db_schemas
                                 .lock()
@@ -566,10 +530,6 @@ async fn run_tui(
                 (None, false, false, false)
             };
 
-        // Resolve active container name for the selected service.
-        // For an ejected service where the selected container IS the ejected
-        // one, we intentionally pass Some(ejected_container_name) so the
-        // render layer's `viewing_ejected_container` guard fires correctly.
         let (active_container_idx, active_container_name): (usize, Option<String>) =
             if let SidebarItem::Service(i) = sidebar_item {
                 if let Some(svc) = services_snap.get(i) {
@@ -582,6 +542,32 @@ async fn run_tui(
             } else {
                 (0, None)
             };
+
+        // True when the currently visible container IS the ejected one.
+        let viewing_ejected_container = if let SidebarItem::Service(i) = sidebar_item {
+            if let Some(svc) = services_snap.get(i) {
+                if svc.ejected {
+                    match (active_container_name.as_deref(), svc.ejected_container.as_deref()) {
+                        (Some(ac), Some(ec)) => ac == ec,
+                        // Single-container ejected service — always ejected view.
+                        _ => svc.containers.len() <= 1,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Shell is allowed only when: focus is Logs, a service is selected,
+        // it is deployed, and the active container is NOT the ejected one.
+        let can_shell = focus == Focus::Logs
+            && matches!(sidebar_item, SidebarItem::Service(_))
+            && has_deployment
+            && !viewing_ejected_container;
 
         let db_logs_opt: Option<&[String]> = match sidebar_item {
             SidebarItem::DbSchema(i) if db_log_schema == Some(i) => {
@@ -642,6 +628,7 @@ async fn run_tui(
                 active_container_name.as_deref(),
                 &db_containers,
                 db_selected_container.as_deref(),
+                can_shell,
             );
             sidebar_scroll = drawn.sidebar_scroll;
         })?;
@@ -780,8 +767,6 @@ async fn run_tui(
                                                     if let Err(e) = r {
                                                         eprintln!("Error: {e}");
                                                     }
-                                                    // After eject/uneject, clear container
-                                                    // selection so it re-detects on next load.
                                                     container_selection.remove(&svc_i);
                                                     sleep(Duration::from_secs(2)).await;
                                                     enter_tui(&mut terminal)?;
@@ -868,7 +853,6 @@ async fn run_tui(
 
                 // ── Normal key handling ───────────────────────────────────
                 match key.code {
-                    // ── Quit ─────────────────────────────────────────────
                     KeyCode::Char('q') | KeyCode::Esc => {
                         popup = Some(Popup {
                             service_name: String::new(),
@@ -877,7 +861,6 @@ async fn run_tui(
                         });
                     }
 
-                    // ── Panel focus ───────────────────────────────────────
                     KeyCode::Left
                         if key.modifiers != KeyModifiers::SHIFT =>
                     {
@@ -894,34 +877,22 @@ async fn run_tui(
                         }
                     }
 
-                    // ── Container tab navigation: Shift + ← / → ──────────
-                    //
-                    // Works for both Service containers AND DB schema containers.
-                    KeyCode::Left
-                        if key.modifiers == KeyModifiers::SHIFT =>
-                    {
+                    // ── Container tab: Shift+←/→ ──────────────────────────
+                    KeyCode::Left if key.modifiers == KeyModifiers::SHIFT => {
                         match sidebar_item {
                             SidebarItem::Service(svc_i) => {
                                 let svcs = services.lock().unwrap();
                                 if let Some(svc) = svcs.get(svc_i) {
                                     if svc.containers.len() > 1 {
-                                        let cur =
-                                            *container_selection.get(&svc_i).unwrap_or(&0);
-                                        let next = if cur == 0 {
-                                            svc.containers.len() - 1
-                                        } else {
-                                            cur - 1
-                                        };
+                                        let cur  = *container_selection.get(&svc_i).unwrap_or(&0);
+                                        let next = if cur == 0 { svc.containers.len() - 1 } else { cur - 1 };
                                         let svc_snapshot = svc.clone();
                                         drop(svcs);
                                         select_container(
-                                            svc_i,
-                                            next,
-                                            &[svc_snapshot],
+                                            svc_i, next, &[svc_snapshot],
                                             &mut container_selection,
                                             &mut svc_log_generation,
-                                            &bg_tx,
-                                            &logs,
+                                            &bg_tx, &logs,
                                         );
                                     }
                                 }
@@ -932,21 +903,14 @@ async fn run_tui(
                                         .iter()
                                         .position(|c| Some(c.as_str()) == db_selected_container.as_deref())
                                         .unwrap_or(0);
-                                    let next_idx = if cur_idx == 0 {
-                                        db_containers.len() - 1
-                                    } else {
-                                        cur_idx - 1
-                                    };
+                                    let next_idx = if cur_idx == 0 { db_containers.len() - 1 } else { cur_idx - 1 };
                                     select_db_container(
-                                        schema_i,
-                                        next_idx,
-                                        &db_containers,
+                                        schema_i, next_idx, &db_containers,
                                         &db_schemas.lock().unwrap(),
                                         &mut db_selected_container,
                                         &mut db_log_generation,
                                         &mut db_log_schema,
-                                        &db_logs,
-                                        &bg_tx,
+                                        &db_logs, &bg_tx,
                                     );
                                     auto_scroll   = true;
                                     scroll_offset = 0;
@@ -955,27 +919,21 @@ async fn run_tui(
                             _ => {}
                         }
                     }
-                    KeyCode::Right
-                        if key.modifiers == KeyModifiers::SHIFT =>
-                    {
+                    KeyCode::Right if key.modifiers == KeyModifiers::SHIFT => {
                         match sidebar_item {
                             SidebarItem::Service(svc_i) => {
                                 let svcs = services.lock().unwrap();
                                 if let Some(svc) = svcs.get(svc_i) {
                                     if svc.containers.len() > 1 {
-                                        let cur =
-                                            *container_selection.get(&svc_i).unwrap_or(&0);
+                                        let cur  = *container_selection.get(&svc_i).unwrap_or(&0);
                                         let next = (cur + 1) % svc.containers.len();
                                         let svc_snapshot = svc.clone();
                                         drop(svcs);
                                         select_container(
-                                            svc_i,
-                                            next,
-                                            &[svc_snapshot],
+                                            svc_i, next, &[svc_snapshot],
                                             &mut container_selection,
                                             &mut svc_log_generation,
-                                            &bg_tx,
-                                            &logs,
+                                            &bg_tx, &logs,
                                         );
                                     }
                                 }
@@ -988,15 +946,12 @@ async fn run_tui(
                                         .unwrap_or(0);
                                     let next_idx = (cur_idx + 1) % db_containers.len();
                                     select_db_container(
-                                        schema_i,
-                                        next_idx,
-                                        &db_containers,
+                                        schema_i, next_idx, &db_containers,
                                         &db_schemas.lock().unwrap(),
                                         &mut db_selected_container,
                                         &mut db_log_generation,
                                         &mut db_log_schema,
-                                        &db_logs,
-                                        &bg_tx,
+                                        &db_logs, &bg_tx,
                                     );
                                     auto_scroll   = true;
                                     scroll_offset = 0;
@@ -1009,43 +964,18 @@ async fn run_tui(
                     // ── Sidebar navigation ────────────────────────────────
                     KeyCode::Up | KeyCode::Char('k') => {
                         if focus == Focus::Logs {
-                            if auto_scroll {
-                                scroll_offset = db_last_max_scroll;
-                            }
+                            if auto_scroll { scroll_offset = db_last_max_scroll; }
                             auto_scroll   = false;
                             scroll_offset = scroll_offset.saturating_sub(1);
                         } else {
-                            let prev = sidebar_prev(
-                                &sidebar_item,
-                                &services_snap,
-                                &packages_snap,
-                                &db_schemas_snap,
-                            );
+                            let prev = sidebar_prev(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
                             if let SidebarItem::Service(i) = prev {
-                                switch_service_logs(
-                                    i,
-                                    &services_snap,
-                                    &mut svc_log_generation,
-                                    &container_selection,
-                                    &bg_tx,
-                                    &logs,
-                                );
-                                auto_scroll   = true;
-                                scroll_offset = 0;
+                                switch_service_logs(i, &services_snap, &mut svc_log_generation, &container_selection, &bg_tx, &logs);
+                                auto_scroll = true; scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = prev {
-                                maybe_start_db_stream(
-                                    i,
-                                    &db_schemas_snap,
-                                    &mut db_log_schema,
-                                    &mut db_log_generation,
-                                    &db_logs,
-                                    &bg_tx,
-                                    &mut db_containers,
-                                    &mut db_selected_container,
-                                );
-                                auto_scroll   = true;
-                                scroll_offset = 0;
+                                maybe_start_db_stream(i, &db_schemas_snap, &mut db_log_schema, &mut db_log_generation, &db_logs, &bg_tx, &mut db_containers, &mut db_selected_container);
+                                auto_scroll = true; scroll_offset = 0;
                             }
                             sidebar_item = prev;
                         }
@@ -1056,66 +986,30 @@ async fn run_tui(
                             auto_scroll   = false;
                             scroll_offset += 1;
                         } else {
-                            let next = sidebar_next(
-                                &sidebar_item,
-                                &services_snap,
-                                &packages_snap,
-                                &db_schemas_snap,
-                            );
+                            let next = sidebar_next(&sidebar_item, &services_snap, &packages_snap, &db_schemas_snap);
                             if let SidebarItem::Service(i) = next {
-                                switch_service_logs(
-                                    i,
-                                    &services_snap,
-                                    &mut svc_log_generation,
-                                    &container_selection,
-                                    &bg_tx,
-                                    &logs,
-                                );
-                                auto_scroll   = true;
-                                scroll_offset = 0;
+                                switch_service_logs(i, &services_snap, &mut svc_log_generation, &container_selection, &bg_tx, &logs);
+                                auto_scroll = true; scroll_offset = 0;
                             }
                             if let SidebarItem::DbSchema(i) = next {
-                                maybe_start_db_stream(
-                                    i,
-                                    &db_schemas_snap,
-                                    &mut db_log_schema,
-                                    &mut db_log_generation,
-                                    &db_logs,
-                                    &bg_tx,
-                                    &mut db_containers,
-                                    &mut db_selected_container,
-                                );
-                                auto_scroll   = true;
-                                scroll_offset = 0;
+                                maybe_start_db_stream(i, &db_schemas_snap, &mut db_log_schema, &mut db_log_generation, &db_logs, &bg_tx, &mut db_containers, &mut db_selected_container);
+                                auto_scroll = true; scroll_offset = 0;
                             }
                             sidebar_item = next;
                         }
                     }
 
-                    // ── Scroll jump ───────────────────────────────────────
                     KeyCode::PageDown => {
-                        if focus == Focus::Logs {
-                            auto_scroll   = true;
-                            scroll_offset = db_last_max_scroll;
-                        }
+                        if focus == Focus::Logs { auto_scroll = true; scroll_offset = db_last_max_scroll; }
                     }
                     KeyCode::PageUp => {
-                        if focus == Focus::Logs {
-                            auto_scroll   = false;
-                            scroll_offset = 0;
-                        }
+                        if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; }
                     }
                     KeyCode::Char('g') => {
-                        if focus == Focus::Logs {
-                            auto_scroll   = false;
-                            scroll_offset = 0;
-                        }
+                        if focus == Focus::Logs { auto_scroll = false; scroll_offset = 0; }
                     }
                     KeyCode::Char('G') => {
-                        if focus == Focus::Logs {
-                            auto_scroll   = true;
-                            scroll_offset = db_last_max_scroll;
-                        }
+                        if focus == Focus::Logs { auto_scroll = true; scroll_offset = db_last_max_scroll; }
                     }
 
                     // ── Mount / unmount ───────────────────────────────────
@@ -1124,11 +1018,7 @@ async fn run_tui(
                             if let Some(pkg) = packages_snap.get(pkg_i) {
                                 popup = Some(Popup {
                                     service_name: pkg.identifier.clone(),
-                                    action:       if pkg.mounted {
-                                        PopupAction::Unmount
-                                    } else {
-                                        PopupAction::Mount
-                                    },
+                                    action: if pkg.mounted { PopupAction::Unmount } else { PopupAction::Mount },
                                     selected: 0,
                                 });
                             }
@@ -1144,9 +1034,7 @@ async fn run_tui(
                                         let alias = format!("{}-local", pkg.identifier);
                                         let uri   = format!(
                                             "vscode-remote://ssh-remote+{}/workspace/{}-{}",
-                                            alias,
-                                            pkg.organization_id,
-                                            pkg.identifier,
+                                            alias, pkg.organization_id, pkg.identifier,
                                         );
                                         open_vscode(&mut terminal, &uri).await?;
                                     }
@@ -1169,18 +1057,12 @@ async fn run_tui(
                         }
                     }
 
-                    // ── Shell ─────────────────────────────────────────────
+                    // ── Shell — only from Logs pane, only non-ejected container ──
                     KeyCode::Char('s') => {
-                        if let SidebarItem::Service(svc_i) = sidebar_item {
-                            if let Some(svc) = services_snap.get(svc_i) {
-                                if svc.status != "Not deployed" && svc.status != "Unknown" {
-                                    if svc.ejected {
-                                        popup = Some(Popup {
-                                            service_name: String::new(),
-                                            action:       PopupAction::ShellBlocked,
-                                            selected:     0,
-                                        });
-                                    } else if let Some(ref dep) = svc.deployment_name {
+                        if can_shell {
+                            if let SidebarItem::Service(svc_i) = sidebar_item {
+                                if let Some(svc) = services_snap.get(svc_i) {
+                                    if let Some(ref dep) = svc.deployment_name {
                                         let dep = dep.clone();
                                         leave_tui(&mut terminal)?;
                                         let _ = shell_into_pod(&dep).await;
@@ -1198,11 +1080,7 @@ async fn run_tui(
                                 if let Some(svc) = services_snap.get(svc_i) {
                                     popup = Some(Popup {
                                         service_name: svc.meta_name.clone(),
-                                        action:       if svc.ejected {
-                                            PopupAction::Uneject
-                                        } else {
-                                            PopupAction::Eject
-                                        },
+                                        action: if svc.ejected { PopupAction::Uneject } else { PopupAction::Eject },
                                         selected: 0,
                                     });
                                 }
@@ -1232,8 +1110,6 @@ async fn run_tui(
    DB CONTAINER SELECTION HELPER
    ================================================================ */
 
-/// Switch to a different container for the currently-viewed DB schema.
-/// Bumps the log generation and starts a new stream for `container_idx`.
 #[allow(clippy::too_many_arguments)]
 fn select_db_container(
     schema_idx:            usize,
@@ -1263,23 +1139,13 @@ fn select_db_container(
         return;
     }
 
-    spawn_db_log_stream(
-        bg_tx.clone(),
-        slug,
-        Some(container),
-        *db_log_generation,
-    );
+    spawn_db_log_stream(bg_tx.clone(), slug, Some(container), *db_log_generation);
 }
 
 /* ================================================================
    CONTAINER SELECTION HELPER
    ================================================================ */
 
-/// Switch the active container for `svc_i`, bump the log generation,
-/// and start a new log stream for the chosen container.
-///
-/// `services` slice must contain exactly one entry at index 0 corresponding
-/// to the service at `svc_i` (pass `&[svc_snapshot]`).
 fn select_container(
     svc_i:                usize,
     container_idx:        usize,
@@ -1289,32 +1155,24 @@ fn select_container(
     bg_tx:                &std::sync::mpsc::Sender<TuiMsg>,
     logs:                 &Arc<Mutex<HashMap<String, Vec<String>>>>,
 ) {
-    // services is a single-element slice containing the snapshot for svc_i.
     let Some(svc) = services.first() else { return };
     let Some(dep) = svc.deployment_name.clone() else { return };
     let container = svc.containers.get(container_idx).cloned();
 
     container_selection.insert(svc_i, container_idx);
 
-    // If this container is the ejected one it runs `sleep infinity` —
-    // no log stream to start. Clear stale lines so the render layer
-    // shows the "dev mode" splash immediately.
     let is_ejected_container = svc.ejected
         && svc.ejected_container.as_deref() == container.as_deref();
 
     logs.lock().unwrap().remove(&svc.meta_name);
 
     if is_ejected_container {
+        // Show the dev-mode splash — no log stream needed.
         return;
     }
 
     *svc_log_generation += 1;
-    spawn_service_log_stream(
-        bg_tx.clone(),
-        dep,
-        container,
-        *svc_log_generation,
-    );
+    spawn_service_log_stream(bg_tx.clone(), dep, container, *svc_log_generation);
 }
 
 /* ================================================================
@@ -1334,22 +1192,16 @@ fn switch_service_logs(
 
     let container_idx = *container_selection.get(&svc_i).unwrap_or(&0);
 
-    // If the service is ejected and we haven't resolved a non-ejected container
-    // yet (containers list is empty), don't start a log stream — just fetch
-    // the container list. The Containers message handler will start the stream.
     if svc.ejected && svc.containers.is_empty() {
         spawn_container_fetch(bg_tx.clone(), dep, svc_i);
         return;
     }
 
-    // For an ejected service, only stream if the selected container is NOT
-    // the ejected one.
     let container = svc.containers.get(container_idx).cloned();
     let is_ejected_container = svc.ejected
         && svc.ejected_container.as_deref() == container.as_deref();
 
     if is_ejected_container {
-        // Clear any stale logs so the render layer shows the dev-mode splash.
         logs.lock().unwrap().remove(&svc.meta_name);
         if svc.containers.is_empty() {
             spawn_container_fetch(bg_tx.clone(), dep, svc_i);
@@ -1358,12 +1210,7 @@ fn switch_service_logs(
     }
 
     *svc_log_generation += 1;
-    spawn_service_log_stream(
-        bg_tx.clone(),
-        dep.clone(),
-        container,
-        *svc_log_generation,
-    );
+    spawn_service_log_stream(bg_tx.clone(), dep.clone(), container, *svc_log_generation);
 
     if svc.containers.is_empty() {
         spawn_container_fetch(bg_tx.clone(), dep, svc_i);
@@ -1385,14 +1232,11 @@ fn maybe_start_db_stream(
     db_containers:         &mut Vec<String>,
     db_selected_container: &mut Option<String>,
 ) {
-    if *db_log_schema == Some(idx) {
-        return;
-    }
+    if *db_log_schema == Some(idx) { return; }
 
     *db_log_schema         = Some(idx);
     *db_log_generation    += 1;
     *db_logs.lock().unwrap() = None;
-    // Reset container state for the new schema — will be filled by DbContainers msg.
     *db_containers         = Vec::new();
     *db_selected_container = None;
 
@@ -1406,26 +1250,15 @@ fn maybe_start_db_stream(
         return;
     }
 
-    // Start a container fetch first — the DbContainers message handler will
-    // start the actual log stream once we know a real container name.
     spawn_db_container_fetch(bg_tx.clone(), slug.clone(), idx);
-
-    // Also kick off an initial log stream without a container name as a
-    // fallback, in case the pod has only one (unnamed) container.  The
-    // DbContainers handler will bump db_log_generation and restart it with
-    // the real name moments later, so this fallback stream will be discarded.
     spawn_db_log_stream(bg_tx.clone(), slug, None, *db_log_generation);
 }
 
 /* ================================================================
-   SIDEBAR NAVIGATION HELPERS
+   SIDEBAR NAVIGATION
    ================================================================ */
 
-fn sidebar_total(
-    services:   &[K8sService],
-    packages:   &[Package],
-    db_schemas: &[DbSchema],
-) -> usize {
+fn sidebar_total(services: &[K8sService], packages: &[Package], db_schemas: &[DbSchema]) -> usize {
     services.len() + packages.len() + db_schemas.len()
 }
 
@@ -1438,43 +1271,22 @@ fn sidebar_flat(item: &SidebarItem, svc_count: usize, pkg_count: usize) -> usize
 }
 
 fn sidebar_from_flat(flat: usize, svc_count: usize, pkg_count: usize) -> SidebarItem {
-    if flat < svc_count {
-        SidebarItem::Service(flat)
-    } else if flat < svc_count + pkg_count {
-        SidebarItem::Package(flat - svc_count)
-    } else {
-        SidebarItem::DbSchema(flat - svc_count - pkg_count)
-    }
+    if flat < svc_count { SidebarItem::Service(flat) }
+    else if flat < svc_count + pkg_count { SidebarItem::Package(flat - svc_count) }
+    else { SidebarItem::DbSchema(flat - svc_count - pkg_count) }
 }
 
-fn sidebar_next(
-    current:    &SidebarItem,
-    services:   &[K8sService],
-    packages:   &[Package],
-    db_schemas: &[DbSchema],
-) -> SidebarItem {
+fn sidebar_next(current: &SidebarItem, services: &[K8sService], packages: &[Package], db_schemas: &[DbSchema]) -> SidebarItem {
     let total = sidebar_total(services, packages, db_schemas);
     if total == 0 { return current.clone(); }
     let flat = sidebar_flat(current, services.len(), packages.len());
-    let next = (flat + 1).min(total - 1);
-    sidebar_from_flat(next, services.len(), packages.len())
+    sidebar_from_flat((flat + 1).min(total - 1), services.len(), packages.len())
 }
 
-fn sidebar_prev(
-    current:    &SidebarItem,
-    services:   &[K8sService],
-    packages:   &[Package],
-    db_schemas: &[DbSchema],
-) -> SidebarItem {
-    if sidebar_total(services, packages, db_schemas) == 0 {
-        return current.clone();
-    }
+fn sidebar_prev(current: &SidebarItem, services: &[K8sService], packages: &[Package], db_schemas: &[DbSchema]) -> SidebarItem {
+    if sidebar_total(services, packages, db_schemas) == 0 { return current.clone(); }
     let flat = sidebar_flat(current, services.len(), packages.len());
-    sidebar_from_flat(
-        flat.saturating_sub(1),
-        services.len(),
-        packages.len(),
-    )
+    sidebar_from_flat(flat.saturating_sub(1), services.len(), packages.len())
 }
 
 /* ================================================================
@@ -1501,11 +1313,7 @@ fn enter_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.hide_cursor()?;
     terminal.clear()?;
     Ok(())
