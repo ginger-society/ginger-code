@@ -2,6 +2,7 @@ use eframe::egui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::colors::{COLOR_DIM, COLOR_RED, COLOR_YELLOW};
 use super::terminal::{Cell, ScrollbackSink, SshSession, TermPerformer};
@@ -113,6 +114,13 @@ pub struct AppState {
     pub blink:           bool,
     pub blink_timer:     f64,
     pub raised_on_open:  bool,
+
+    /// Cancels the currently running service-log stream.
+    /// Replaced (and the old one cancelled) every time a new stream starts.
+    pub log_cancel:      CancellationToken,
+
+    /// Cancels the currently running DB-schema-log stream.
+    pub db_log_cancel:   CancellationToken,
 }
 
 impl AppState {
@@ -137,11 +145,32 @@ impl AppState {
             raised_on_open:  false,
             db_containers:         Vec::new(),    
             db_selected_container: None,   
-            db_log_generation: 0,
+            db_log_generation:     0,
+            log_cancel:            CancellationToken::new(),
+            db_log_cancel:         CancellationToken::new(),
         }
     }
 
-    // Replace open_term_tab with open_term_tab_with_label:
+    // ── Cancel helpers ────────────────────────────────────────────────────────
+
+    /// Cancel any running service-log stream and return a fresh token for the
+    /// next one.
+    pub fn new_log_cancel(&mut self) -> CancellationToken {
+        self.log_cancel.cancel();
+        self.log_cancel = CancellationToken::new();
+        self.log_cancel.clone()
+    }
+
+    /// Cancel any running DB-schema-log stream and return a fresh token for
+    /// the next one.
+    pub fn new_db_log_cancel(&mut self) -> CancellationToken {
+        self.db_log_cancel.cancel();
+        self.db_log_cancel = CancellationToken::new();
+        self.db_log_cancel.clone()
+    }
+
+    // ── Terminal tab helpers ───────────────────────────────────────────────────
+
     pub fn open_term_tab_with_label(
         &mut self,
         rows:  usize,

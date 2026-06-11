@@ -26,7 +26,7 @@ MetadataService = { path = "./MetadataService_client" }
 ginger-shared-rs = {version = "0.51.0-nightly.0", organization = "ginger-society"}
 IAMService = { path = "./IAMService_client" }
 tokio = {version = "1", features = ["full"]}
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "time"] }
 ratatui = "0.26"
 crossterm = "0.27"
 dirs = "6.0.0"

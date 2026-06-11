@@ -105,12 +105,18 @@ impl App {
     // ── Package selection ─────────────────────────────────────────────────────
 
     fn select_package(&mut self, pkg_idx: usize) {
+        // Cancel any running service-log stream — the log pane is hidden while
+        // a package detail is shown, and we don't want stale threads running.
+        self.state.new_log_cancel();
         self.state.right_pane = RightPane::PackageDetail(pkg_idx);
     }
 
     // ── DB schema selection ───────────────────────────────────────────────────
 
     fn select_db_schema(&mut self, schema_idx: usize) {
+        // Cancel the previous DB-schema-log stream before starting a new one.
+        let cancel = self.state.new_db_log_cancel();
+
         self.state.right_pane            = RightPane::DbSchemaDetail(schema_idx);
         self.state.db_logs               = vec![];
         self.state.db_containers         = vec![];
@@ -126,7 +132,7 @@ impl App {
 
         spawn_db_schema_logs(
             self.tx.clone(), self.ctx.clone(),
-            schema_idx, slug.clone(), None, gen,
+            schema_idx, slug.clone(), None, gen, cancel,
         );
 
         if !slug.is_empty() {
@@ -138,6 +144,9 @@ impl App {
     }
 
     fn select_db_container(&mut self, schema_idx: usize, container: String) {
+        // Cancel the previous DB-schema-log stream.
+        let cancel = self.state.new_db_log_cancel();
+
         self.state.db_selected_container = Some(container.clone());
         self.state.db_logs               = vec![];
         self.state.db_log_generation    += 1;
@@ -150,7 +159,7 @@ impl App {
 
         spawn_db_schema_logs(
             self.tx.clone(), self.ctx.clone(),
-            schema_idx, slug, Some(container), gen,
+            schema_idx, slug, Some(container), gen, cancel,
         );
     }
 
@@ -357,14 +366,11 @@ impl App {
 
         self.state.term_tabs[tab_idx].performer      = Arc::clone(&performer);
         self.state.term_tabs[tab_idx].scrollback_arc = Some(Arc::clone(&sink));
-        // Mark as connecting so the UI can show a spinner
         self.state.term_tabs[tab_idx].state = TermState::Connecting;
 
         let tx  = self.tx.clone();
         let ctx = ctx.clone();
 
-        // attach_to_pod is async — drive it on the tokio runtime that's already
-        // running for the rest of the kube-rs work.
         self.rt.spawn(async move {
             match attach_to_pod(&dep_name, rows, cols, performer, ctx.clone(), container).await {
                 Ok(session) => {
@@ -389,33 +395,44 @@ impl App {
             svc.selected_container = container.clone();
         }
 
-        if let Some(svc) = self.state.services.get(idx) {
-            let selected_is_ejected = svc.ejected
-                && container.as_deref() == svc.ejected_container.as_deref();
-
-            if selected_is_ejected {
-                self.state.log_generation += 1;
-                self.state.logs = vec![
-                    format!("⚡ {} is ejected — running in dev mode.", svc.meta_name),
-                    "No application logs available.".into(),
-                ];
+        // Extract everything we need before any mutable borrow of self.state.
+        let (selected_is_ejected, meta_name, deployment_name) =
+            if let Some(svc) = self.state.services.get(idx) {
+                let ejected = svc.ejected
+                    && container.as_deref() == svc.ejected_container.as_deref();
+                (ejected, svc.meta_name.clone(), svc.deployment_name.clone())
+            } else {
                 return;
-            }
+            };
 
-            if let Some(dep) = svc.deployment_name.clone() {
-                self.state.log_generation += 1;
-                let gen = self.state.log_generation;
-                spawn_service_logs(
-                    self.tx.clone(), self.ctx.clone(),
-                    dep, container, gen,
-                );
-            }
+        if selected_is_ejected {
+            self.state.new_log_cancel();
+            self.state.log_generation += 1;
+            self.state.logs = vec![
+                format!("⚡ {} is ejected — running in dev mode.", meta_name),
+                "No application logs available.".into(),
+            ];
+            return;
+        }
+
+        if let Some(dep) = deployment_name {
+            let cancel = self.state.new_log_cancel();
+            self.state.log_generation += 1;
+            let gen = self.state.log_generation;
+            spawn_service_logs(
+                self.tx.clone(), self.ctx.clone(),
+                dep, container, gen, cancel,
+            );
         }
     }
 
     // ── Drain background channel ──────────────────────────────────────────────
+    //
+    // Returns true if any message was processed (caller should repaint).
 
-    fn drain_bg_channel(&mut self) {
+    fn drain_bg_channel(&mut self) -> bool {
+        let mut did_work = false;
+
         loop {
             match self.rx.try_recv() {
                 // ── Terminal session ready ────────────────────────────────────
@@ -423,12 +440,14 @@ impl App {
                     if let Some(tab) = self.state.term_tabs.get_mut(tab_idx) {
                         tab.state = TermState::Connected(session);
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::TermError { tab_idx, message }) => {
                     if let Some(tab) = self.state.term_tabs.get_mut(tab_idx) {
                         tab.state = TermState::Error(message);
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::DbContainers { schema_idx, containers }) => {
@@ -437,6 +456,9 @@ impl App {
                         self.state.db_containers         = containers;
 
                         if let Some(container) = self.state.db_selected_container.clone() {
+                            // Cancel the initial (no-container) stream and start
+                            // a specific-container stream now that we know the name.
+                            let cancel = self.state.new_db_log_cancel();
                             self.state.db_log_generation += 1;
                             let gen  = self.state.db_log_generation;
                             let slug = self.state.db_schemas
@@ -446,10 +468,11 @@ impl App {
 
                             spawn_db_schema_logs(
                                 self.tx.clone(), self.ctx.clone(),
-                                schema_idx, slug, Some(container), gen,
+                                schema_idx, slug, Some(container), gen, cancel,
                             );
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::TransitioningSet(set)) => {
@@ -458,6 +481,7 @@ impl App {
                             svc.transitioning = set.contains(dep);
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::Containers { svc_idx, containers }) => {
@@ -482,6 +506,7 @@ impl App {
                             self.select_container(container);
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::Services(svcs)) => {
@@ -503,14 +528,17 @@ impl App {
                     if !rest.is_empty() {
                         spawn_bulk_ejected_check(self.tx.clone(), self.ctx.clone(), rest);
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::Packages(pkgs)) => {
                     self.state.packages = pkgs;
+                    did_work = true;
                 }
 
                 Ok(BgMsg::DbSchemas(schemas)) => {
                     self.state.db_schemas = schemas;
+                    did_work = true;
                 }
 
                 Ok(BgMsg::K8sStatuses(deployments)) => {
@@ -525,6 +553,7 @@ impl App {
                             }
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::EjectedFlag { idx, ejected, ejected_container }) => {
@@ -565,23 +594,28 @@ impl App {
                             spawn_container_fetch(self.tx.clone(), self.ctx.clone(), idx, dep);
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::Logs { lines, generation }) => {
                     if generation == self.state.log_generation {
                         self.state.logs = lines;
+                        did_work = true;
                     }
+                    // Drop stale generations silently — no repaint needed.
                 }
 
                 Ok(BgMsg::DbSchemaLogs { lines, schema_idx, generation }) => {
                     if generation == self.state.db_log_generation {
                         self.state.db_logs = lines;
+                        did_work = true;
                     }
                 }
 
                 Ok(BgMsg::Error(e)) => {
                     self.loading    = false;
                     self.state.logs = vec![format!("Failed to load services: {e}")];
+                    did_work = true;
                 }
 
                 Ok(BgMsg::EjectResult { success, message, idx }) => {
@@ -603,6 +637,7 @@ impl App {
                             spawn_service_refresh(self.tx.clone(), self.ctx.clone(), idx, dep, gen);
                         }
                     }
+                    did_work = true;
                 }
 
                 Ok(BgMsg::MountResult { success, message, pkg_idx, mounted }) => {
@@ -615,11 +650,14 @@ impl App {
                         }
                     }
                     self.state.logs.push(message);
+                    did_work = true;
                 }
 
                 Err(_) => break,
             }
         }
+
+        did_work
     }
 }
 
@@ -627,10 +665,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        // ── Drain the background channel first ────────────────────────────────
+        let _had_messages = self.drain_bg_channel();
 
-        self.drain_bg_channel();
-
+        // ── One-shot: raise the window on first frame only ────────────────────
         if !self.state.raised_on_open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -643,30 +681,46 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         }
 
-        let t = ctx.input(|i| i.time);
-        if t - self.state.blink_timer > 0.5 {
-            self.state.blink       = !self.state.blink;
-            self.state.blink_timer = t;
+        // ── Cursor blink — only schedule when a terminal tab is visible ───────
+        let terminal_visible = matches!(self.state.right_pane, RightPane::TerminalTab(_));
+        if terminal_visible {
+            let t = ctx.input(|i| i.time);
+            if t - self.state.blink_timer > 0.5 {
+                self.state.blink       = !self.state.blink;
+                self.state.blink_timer = t;
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         }
-        if matches!(self.state.right_pane, RightPane::TerminalTab(_)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
-        }
+
+        // ── In-flight mount spinner ───────────────────────────────────────────
         if self.mounting.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
-        for tab in &mut self.state.term_tabs {
-            if let Some(ref sink) = tab.scrollback_arc {
-                let mut s = sink.lock();
-                tab.scrollback.append(&mut *s);
+        // ── Ejecting spinner ──────────────────────────────────────────────────
+        if self.ejecting.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+
+        // ── Drain scrollback into per-tab Vec (only for visible tab) ──────────
+        if let RightPane::TerminalTab(i) = self.state.right_pane {
+            if let Some(tab) = self.state.term_tabs.get_mut(i) {
+                if let Some(ref sink) = tab.scrollback_arc {
+                    let mut s = sink.lock();
+                    if !s.is_empty() {
+                        tab.scrollback.append(&mut *s);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                }
             }
         }
+
+        // ── UI ────────────────────────────────────────────────────────────────
 
         egui::TopBottomPanel::top("titlebar")
             .exact_height(28.0)
             .frame(egui::Frame::none())
             .show(ctx, |ui| draw_titlebar(&self.state, ui, ctx));
-
 
         egui::SidePanel::left("sidebar")
             .exact_width(220.0)

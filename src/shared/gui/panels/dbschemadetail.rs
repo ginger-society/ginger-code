@@ -52,7 +52,6 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     let pad  = 12.0;
     let mut y = rect.min.y + 10.0;
 
-    // Row 1: name + db_type badge
     let name = &schema.name;
     painter.text(
         egui::pos2(rect.min.x + pad, y),
@@ -73,7 +72,6 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     }
     y += 20.0;
 
-    // Row 2: identifier · org · tables count
     let id_part  = schema.identifier.as_deref().unwrap_or("—");
     let meta_row = format!(
         "id: {}   org: {}   tables: {}",
@@ -88,7 +86,6 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     );
     y += 18.0;
 
-    // Row 3: description
     if let Some(ref desc) = schema.description {
         if !desc.is_empty() {
             let max_chars = ((rect.width() - pad * 2.0) / 6.5) as usize;
@@ -108,7 +105,6 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
     }
     y += 18.0;
 
-    // Row 4: k8s status
     let status_color = match schema.k8s_status.as_str() {
         "Running"                => egui::Color32::from_rgb(39, 201, 63),
         "Degraded" | "Pending"   => super::super::colors::COLOR_YELLOW,
@@ -134,14 +130,11 @@ fn draw_info_strip(schema: &DbSchema, ui: &mut egui::Ui) {
 
 // ── Container tab bar ─────────────────────────────────────────────────────────
 
-/// Draws a tab bar for container selection. Returns the name of a newly
-/// selected container if the user clicked a different tab, else `None`.
 fn draw_container_tab_bar(
     containers: &[String],
     selected:   Option<&str>,
     ui:         &mut egui::Ui,
 ) -> Option<String> {
-    // Nothing to show until containers are known or if there's only one
     if containers.len() <= 1 {
         return None;
     }
@@ -154,7 +147,6 @@ fn draw_container_tab_bar(
         egui::Sense::hover(),
     );
 
-    // ── Allocate all interaction zones first ──────────────────────────────────
     struct TabResult {
         rect:    egui::Rect,
         active:  bool,
@@ -189,12 +181,10 @@ fn draw_container_tab_bar(
         x += tab_w;
     }
 
-    // ── Paint ─────────────────────────────────────────────────────────────────
     let painter = ui.painter();
     painter.rect_filled(bar_rect, 0.0, COLOR_TAB_BAR);
 
     for tr in &tab_results {
-        // Tab background
         painter.rect_filled(
             tr.rect,
             0.0,
@@ -204,14 +194,12 @@ fn draw_container_tab_bar(
                 COLOR_TAB_BAR
             },
         );
-        // Active underline
         if tr.active {
             painter.line_segment(
                 [tr.rect.left_bottom(), tr.rect.right_bottom()],
                 egui::Stroke::new(2.0, COLOR_TAB_ACTIVE),
             );
         }
-        // Label
         painter.text(
             egui::pos2(tr.rect.min.x + PAD, tr.rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -221,7 +209,6 @@ fn draw_container_tab_bar(
         );
     }
 
-    // Fill remainder + bottom border
     let remaining = egui::Rect::from_min_max(egui::pos2(x, bar_rect.min.y), bar_rect.max);
     if remaining.width() > 0.0 {
         painter.rect_filled(remaining, 0.0, COLOR_TAB_BAR);
@@ -239,6 +226,9 @@ fn draw_container_tab_bar(
 fn draw_logs_pane(logs: Option<&[String]>, ui: &mut egui::Ui) {
     match logs {
         None => {
+            // "Looking for deployment…" spinner.
+            // We need this to animate, so we schedule a repaint here — but only
+            // in this specific state (not while logs are streaming).
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
@@ -249,7 +239,8 @@ fn draw_logs_pane(logs: Option<&[String]>, ui: &mut egui::Ui) {
                         .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
                         .color(COLOR_CYAN),
                 );
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+                // Only animate while genuinely waiting — this state is transient.
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             });
         }
 
@@ -276,9 +267,12 @@ fn draw_logs_pane(logs: Option<&[String]>, ui: &mut egui::Ui) {
                     .color(COLOR_DIM),
                 );
             });
+            // Static — no repaint needed.
         }
 
         Some(lines) => {
+            // Log lines present — render them. No repaint scheduled here;
+            // bg.rs drives repaints when new lines arrive.
             let palette = LogPalette::from_monokai();
             egui::ScrollArea::vertical()
                 .id_source("db_logs_scroll")

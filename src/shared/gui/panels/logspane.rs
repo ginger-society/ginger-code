@@ -6,9 +6,9 @@ use super::super::colors::{COLOR_BORDER, COLOR_MUTED, COLOR_YELLOW};
 use super::super::types::AppState;
 use super::log_highlight::{highlight_line, LogPalette};
 
-/// Returns Some(Some(name)) to switch to a container, Some(None) to reset to default.
-/// Returns None if no chip was clicked.
-// logspane.rs — draw_logs_pane no longer handles chips, just logs
+// logspane.rs — draw_logs_pane handles only logs, no container chips.
+// Repaints are driven entirely by BgMsg::Logs arriving in app.rs;
+// this function never calls request_repaint() itself.
 pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
     let Some(_svc) = state.services.get(state.selected_idx) else { return; };
 
@@ -39,17 +39,13 @@ pub fn draw_logs_pane(state: &AppState, ui: &mut egui::Ui) {
         });
 }
 
-/// Returns Some(Some(name)) to switch container, Some(None) to reset to default, None if no click.
-/// Only renders anything when the service has more than one container.
-
-
 fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
     let badge_text  = "⚡ Ejected";
     let font        = egui::FontId::new(10.5, egui::FontFamily::Monospace);
     let badge_w     = badge_text.len() as f32 * 6.2 + 10.0;
     let name_w      = name.len()       as f32 * 6.2 + 10.0;
     let chip_h      = 18.0;
-    let total_w     = badge_w + 1.0 + name_w; // 1px divider
+    let total_w     = badge_w + 1.0 + name_w;
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(total_w, chip_h),
@@ -58,7 +54,6 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
 
     let painter = ui.painter();
 
-    // ── Left half: "⚡ Ejected" in magenta ───────────────────────────────────
     let left = egui::Rect::from_min_size(rect.min, egui::vec2(badge_w, chip_h));
     painter.rect_filled(left, egui::Rounding { nw: 3.0, sw: 3.0, ne: 0.0, se: 0.0 }, COLOR_MAGENTA);
     painter.text(
@@ -69,7 +64,6 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
         egui::Color32::WHITE,
     );
 
-    // ── Divider ───────────────────────────────────────────────────────────────
     let divider_x = rect.min.x + badge_w;
     painter.line_segment(
         [
@@ -79,7 +73,6 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 60)),
     );
 
-    // ── Right half: container name, same style as a normal active chip ────────
     let right = egui::Rect::from_min_size(
         egui::pos2(divider_x + 1.0, rect.min.y),
         egui::vec2(name_w, chip_h),
@@ -89,7 +82,6 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
         egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
         if is_active { COLOR_YELLOW } else { egui::Color32::TRANSPARENT },
     );
-    // Right half border (top, right, bottom only — left is the divider)
     painter.rect_stroke(
         right,
         egui::Rounding { nw: 0.0, sw: 0.0, ne: 3.0, se: 3.0 },
@@ -102,17 +94,7 @@ fn draw_ejected_chip(ui: &mut egui::Ui, name: &str, is_active: bool) {
         font,
         if is_active { egui::Color32::BLACK } else { COLOR_MUTED },
     );
-
-    // The whole pill is clickable — selects this container
-    if response.clicked() && !is_active {
-        // Caller checks return — but since we're inside the loop we need
-        // to signal the click. Use the same approach: set clicked in outer scope.
-        // We handle this by making draw_ejected_chip return bool:
-    }
 }
-
-// ── Container chip bar ────────────────────────────────────────────────────────
-
 
 fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let text = egui::RichText::new(label)
