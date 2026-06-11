@@ -86,10 +86,6 @@ async fn run_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture is intentionally NOT enabled. Mouse events were ignored
-    // anyway (see the catch-all below), and leaving it off lets the user's
-    // terminal emulator handle click-drag text selection and copy in the
-    // logs panel normally.
     execute!(stdout, EnterAlternateScreen)?;
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -147,7 +143,7 @@ async fn run_tui(
 
         // ── Draw ──────────────────────────────────────────────────────────────
         let mut scroll_offset_tmp      = state.scroll_offset;
-        let mut db_last_max_scroll_tmp = 0usize; // retained only for panels::draw signature compat
+        let mut db_last_max_scroll_tmp = 0usize;
         let mut sidebar_scroll_tmp     = 0usize;
         let mut log_max_scroll_tmp     = state.log_max_scroll;
 
@@ -172,7 +168,6 @@ async fn run_tui(
 
         state.scroll_offset  = scroll_offset_tmp;
         state.log_max_scroll = log_max_scroll_tmp;
-        // sidebar_scroll_tmp is not stored on state — ratatui owns the list offset
 
         // ── Poll for events (keyboard only) ───────────────────────────────────
         if !event::poll(Duration::from_millis(100))? { continue; }
@@ -187,9 +182,9 @@ async fn run_tui(
                     Action::Continue => {}
                     Action::Quit     => break 'main,
 
-                    Action::Shell(dep) => {
+                    Action::Shell(deployment, container) => {
                         leave_tui(&mut terminal)?;
-                        let _ = shell_into_pod(&dep).await;
+                        let _ = shell_into_pod(&deployment, container.as_deref()).await;
                         enter_tui(&mut terminal)?;
                     }
 
@@ -202,7 +197,6 @@ async fn run_tui(
                         if let Err(e) = eject(&deployment, &lang, &meta, &org).await {
                             eprintln!("Error: {e}");
                         }
-                        // Reset container selection so tabs refresh
                         if let SidebarItem::Service(i) = state.sidebar_item {
                             state.container_selection.remove(&i);
                         }
@@ -274,7 +268,6 @@ fn drain_background_messages(
     state: &mut TuiState,
     bg_tx: &std::sync::mpsc::Sender<TuiMsg>,
 ) {
-    use background::{spawn_service_log_stream as sls, spawn_db_log_stream as dls};
     use input::select_container;
 
     loop {

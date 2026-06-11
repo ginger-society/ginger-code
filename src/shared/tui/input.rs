@@ -21,7 +21,7 @@ use super::{
 
 pub enum Action {
     Continue,
-    Shell(String),
+    Shell(String, Option<String>),   // (deployment_name, container_name)
     OpenVsCode(String),
     Eject  { deployment: String, lang: String, meta: String, org: String },
     Uneject { deployment: String },
@@ -83,9 +83,6 @@ pub fn handle_key(
         // ── Sidebar navigation / log scrolling ────────────────────────────────
         KeyCode::Up | KeyCode::Char('k') => {
             if state.focus == Focus::Logs {
-                // If we were following the tail, snap scroll_offset to the
-                // real bottom (updated every draw frame) so the user sees a
-                // clean one-line step rather than jumping back to 0.
                 if state.auto_scroll {
                     state.scroll_offset = state.log_max_scroll;
                 }
@@ -103,7 +100,6 @@ pub fn handle_key(
             if state.focus == Focus::Logs {
                 state.auto_scroll   = false;
                 state.scroll_offset = state.scroll_offset.saturating_add(1);
-                // Re-engage follow if we scrolled back to the bottom.
                 if state.scroll_offset >= state.log_max_scroll {
                     state.auto_scroll   = true;
                     state.scroll_offset = state.log_max_scroll;
@@ -174,7 +170,9 @@ pub fn handle_key(
                 if let SidebarItem::Service(i) = state.sidebar_item {
                     if let Some(svc) = services_snap.get(i) {
                         if let Some(ref dep) = svc.deployment_name {
-                            return Action::Shell(dep.clone());
+                            let container_idx = *state.container_selection.get(&i).unwrap_or(&0);
+                            let container     = svc.containers.get(container_idx).cloned();
+                            return Action::Shell(dep.clone(), container);
                         }
                     }
                 }
@@ -416,9 +414,6 @@ fn is_deployed_non_ejected(state: &TuiState, services_snap: &[K8sService]) -> bo
     let idx       = *state.container_selection.get(&i).unwrap_or(&0);
     let container = svc.containers.get(idx).map(|s| s.as_str());
 
-    // `ejected_container_name()` falls back to `deployment_name` when
-    // `ejected_container` hasn't been populated, so this correctly disables
-    // shelling into the ejected container even for multi-container services.
     let is_ejected_container = svc.ejected && (
         matches!((container, svc.ejected_container_name()), (Some(ac), Some(ec)) if ac == ec)
         || svc.containers.len() <= 1
@@ -481,8 +476,6 @@ pub fn switch_service_logs(
     }
 
     let container            = svc.containers.get(container_idx).cloned();
-    // Falls back to `deployment_name` when `ejected_container` hasn't been
-    // populated (see `K8sService::ejected_container_name`).
     let is_ejected_container = svc.ejected
         && svc.ejected_container_name() == container.as_deref();
 
@@ -513,8 +506,6 @@ pub fn select_container(
 
     container_selection.insert(svc_i, container_idx);
 
-    // Falls back to `deployment_name` when `ejected_container` hasn't been
-    // populated (see `K8sService::ejected_container_name`).
     let is_ejected_container = svc.ejected
         && svc.ejected_container_name() == container.as_deref();
 

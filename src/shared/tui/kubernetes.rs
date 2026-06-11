@@ -7,7 +7,14 @@ use kube::api::AttachParams;
 
 use crate::shared::core::k8s_exec::resolve_running_pod;
 
-pub async fn shell_into_pod(deployment_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Shell into a specific container of the pod backing `deployment_name`.
+///
+/// `container` should be `Some(name)` for multi-container pods; pass `None`
+/// only for single-container deployments (falls back to containers[0]).
+pub async fn shell_into_pod(
+    deployment_name: &str,
+    container:       Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pod_name = match resolve_running_pod(deployment_name).await {
         Some(p) => p,
         None => {
@@ -19,23 +26,21 @@ pub async fn shell_into_pod(deployment_name: &str) -> Result<(), Box<dyn std::er
     let client = Client::try_default().await?;
     let api: Api<Pod> = Api::default_namespaced(client);
 
-    // Always explicit — multi-container pods 400 on container: None.
-    let container_name: Option<String> = api
-        .get(&pod_name)
-        .await
-        .ok()
-        .and_then(|p| p.spec)
-        .and_then(|s| s.containers.into_iter().next())
-        .map(|c| c.name);
+    // Use the caller-supplied container name when provided; fall back to the
+    // first container in the pod spec only when no override is given.
+    let container_name: Option<String> = if let Some(c) = container {
+        Some(c.to_string())
+    } else {
+        api.get(&pod_name)
+            .await
+            .ok()
+            .and_then(|p| p.spec)
+            .and_then(|s| s.containers.into_iter().next())
+            .map(|c| c.name)
+    };
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    // tty:true merges stderr into stdout at the pty level — that is correct
-    // kernel behaviour. stderr:false is required when tty:true.
-    // We exec the shell directly (no sh -c wrapper) so it is PID 1 and
-    // receives signals (Ctrl+C etc.) directly.
-    // The COLUMNS/LINES/stty args are passed via the shell's own -c flag
-    // then we exec the interactive shell so that becomes PID 1.
     let init = format!(
         "stty rows {rows} cols {cols}; \
          export TERM=xterm-256color COLUMNS={cols} LINES={rows}; \
@@ -52,8 +57,6 @@ pub async fn shell_into_pod(deployment_name: &str) -> Result<(), Box<dyn std::er
             ..Default::default()
         };
 
-        // shell -c "stty ...; exec shell -i"
-        // "$0" expands to the shell binary itself so we don't hardcode it twice.
         let mut attached = match api
             .exec(&pod_name, vec![*shell, "-c", &init], &ap)
             .await
@@ -78,7 +81,6 @@ pub async fn shell_into_pod(deployment_name: &str) -> Result<(), Box<dyn std::er
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // stdin: local terminal → pod
         let stdin_task = tokio::spawn(async move {
             let mut stdin = tokio::io::stdin();
             let mut buf   = [0u8; 256];
@@ -99,7 +101,6 @@ pub async fn shell_into_pod(deployment_name: &str) -> Result<(), Box<dyn std::er
             }
         });
 
-        // stdout (+ pty-merged stderr): pod → local terminal
         let mut out = tokio::io::stdout();
         let mut buf = [0u8; 4096];
         loop {
