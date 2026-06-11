@@ -1,0 +1,188 @@
+//! Background worker threads / tasks and the channel message type.
+//!
+//! The TUI loop owns the receiving end; all background helpers send into it.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::mpsc as async_mpsc;
+use tokio::time::sleep;
+
+use crate::shared::core::{
+    k8_info::{get_k8s_deployments, get_pod_containers, is_ejected, stream_pod_logs},
+    types::K8sService,
+};
+
+// ── Channel messages ──────────────────────────────────────────────────────────
+
+pub enum TuiMsg {
+    ServiceLogs { lines: Vec<String>, generation: u64 },
+    DbLogs      { lines: Vec<String>, generation: u64 },
+    Containers  { svc_idx: usize,    containers: Vec<String> },
+    DbContainers { schema_idx: usize, containers: Vec<String> },
+}
+
+// ── Service log stream ────────────────────────────────────────────────────────
+
+pub fn spawn_service_log_stream(
+    tx:              std::sync::mpsc::Sender<TuiMsg>,
+    deployment_name: String,
+    container:       Option<String>,
+    generation:      u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+                let dep  = deployment_name.clone();
+                let cont = container.clone();
+                tokio::spawn(async move { stream_pod_logs(&dep, cont, line_tx).await });
+                loop {
+                    match line_rx.recv().await {
+                        None => break,
+                        Some(line) => {
+                            lines.push(line);
+                            if lines.len() > 2000 { lines.drain(0..500); }
+                            if tx.send(TuiMsg::ServiceLogs { lines: lines.clone(), generation }).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if tx.send(TuiMsg::ServiceLogs { lines: lines.clone(), generation }).is_err() {
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+// ── DB log stream ─────────────────────────────────────────────────────────────
+
+pub fn spawn_db_log_stream(
+    tx:         std::sync::mpsc::Sender<TuiMsg>,
+    slug:       String,
+    container:  Option<String>,
+    generation: u64,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+
+        rt.block_on(async move {
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+                let dep  = slug.clone();
+                let cont = container.clone();
+                tokio::spawn(async move { stream_pod_logs(&dep, cont, line_tx).await });
+                loop {
+                    match line_rx.recv().await {
+                        None => break,
+                        Some(line) => {
+                            lines.push(line);
+                            if lines.len() > 2000 { lines.drain(0..500); }
+                            let normalised = if lines.len() == 1 && lines[0].starts_with("No pods found") {
+                                vec![]
+                            } else {
+                                lines.clone()
+                            };
+                            if tx.send(TuiMsg::DbLogs { lines: normalised, generation }).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if tx.send(TuiMsg::DbLogs { lines: lines.clone(), generation }).is_err() {
+                    return;
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+        });
+    });
+}
+
+// ── Container fetch ───────────────────────────────────────────────────────────
+
+pub fn spawn_container_fetch(
+    tx:              std::sync::mpsc::Sender<TuiMsg>,
+    deployment_name: String,
+    svc_idx:         usize,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
+                let _ = tx.send(TuiMsg::Containers { svc_idx, containers });
+            }
+        });
+    });
+}
+
+pub fn spawn_db_container_fetch(
+    tx:         std::sync::mpsc::Sender<TuiMsg>,
+    slug:       String,
+    schema_idx: usize,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            if let Some((_pod, containers)) = get_pod_containers(&slug).await {
+                let _ = tx.send(TuiMsg::DbContainers { schema_idx, containers });
+            }
+        });
+    });
+}
+
+// ── Deployment status watcher ─────────────────────────────────────────────────
+
+pub fn spawn_deployment_watcher(services: Arc<Mutex<Vec<K8sService>>>) {
+    tokio::spawn(async move {
+        loop {
+            let deployments = get_k8s_deployments().await;
+            {
+                let mut svcs = services.lock().unwrap();
+                for svc in svcs.iter_mut() {
+                    if let Some(ref dep) = svc.deployment_name {
+                        if let Some((status, ready)) = deployments.get(dep) {
+                            svc.status = status.clone();
+                            svc.ready  = ready.clone();
+                        } else {
+                            svc.status = "Not deployed".to_string();
+                            svc.ready  = "-".to_string();
+                        }
+                    }
+                }
+            }
+            let deps: Vec<(usize, String)> = {
+                let svcs = services.lock().unwrap();
+                svcs.iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.deployment_name.clone().map(|d| (i, d)))
+                    .collect()
+            };
+            for (i, dep) in deps {
+                let ejected = is_ejected(&dep).await;
+                if let Some(svc) = services.lock().unwrap().get_mut(i) {
+                    svc.ejected = ejected;
+                }
+            }
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
