@@ -1,6 +1,4 @@
 //! All mutable state for the TUI loop lives here.
-//! `mod.rs` creates a `TuiState`, then passes `&mut TuiState` to
-//! `input::handle_key` and `panels::draw`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,15 +17,12 @@ pub struct TuiState {
     pub db_logs: Arc<Mutex<Option<Vec<String>>>>,
 
     // ── Log-stream generation counters ───────────────────────────────────────
-    /// Incremented each time we switch to a new service/container stream.
-    /// Background messages from an older generation are silently ignored.
     pub svc_log_generation: u64,
     pub db_log_generation:  u64,
     pub db_log_schema:      Option<usize>,
 
     // ── Container state ───────────────────────────────────────────────────────
-    /// Map from service-index → chosen container index.
-    pub container_selection: HashMap<usize, usize>,
+    pub container_selection:     HashMap<usize, usize>,
     pub db_containers:           Vec<String>,
     pub db_selected_container:   Option<String>,
 
@@ -36,10 +31,14 @@ pub struct TuiState {
     pub sidebar_item: SidebarItem,
 
     // ── Scroll ────────────────────────────────────────────────────────────────
-    pub auto_scroll:        bool,
-    pub scroll_offset:      usize,
-    pub db_last_max_scroll: usize,
-    pub sidebar_scroll:     usize,
+    pub auto_scroll:   bool,
+    pub scroll_offset: usize,
+
+    /// The true maximum scroll offset for whatever log panel is currently
+    /// visible (service *or* db schema). Written every draw frame by
+    /// `panels::draw` so that pressing Up while auto-scrolling snaps to the
+    /// real bottom instead of jumping to 0.
+    pub log_max_scroll: usize,
 
     // ── Popup ─────────────────────────────────────────────────────────────────
     pub popup: Option<Popup>,
@@ -60,15 +59,14 @@ impl TuiState {
             svc_log_generation: 0,
             db_log_generation:  0,
             db_log_schema:      None,
-            container_selection: HashMap::new(),
+            container_selection:     HashMap::new(),
             db_containers:           Vec::new(),
             db_selected_container:   None,
             focus:        Focus::Sidebar,
             sidebar_item: SidebarItem::Service(0),
-            auto_scroll:        true,
-            scroll_offset:      0,
-            db_last_max_scroll: 0,
-            sidebar_scroll:     0,
+            auto_scroll:    true,
+            scroll_offset:  0,
+            log_max_scroll: 0,
             popup: None,
         }
     }

@@ -180,19 +180,26 @@ pub fn draw(
         SidebarItem::DbSchema(i) => services.len() + pkg_header + packages.len() + db_header + i,
     };
 
-    let mut state = ListState::default();
-    state.select(Some(selected_flat));
+    // Each item occupies 2 rows in the list.
+    let visible_rows  = (inner.height as usize / 2).max(1);
+    let total_slots   = services.len() + pkg_header + packages.len() + db_header + db_schemas.len();
+    let max_offset    = total_slots.saturating_sub(visible_rows);
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_flat));
+
+    // Override ratatui's default "stick selected to bottom" behaviour:
+    // keep the selected item one row from the top of the viewport so
+    // scrolling up doesn't leave it anchored at the bottom.
+    let desired_offset = selected_flat.saturating_sub(1);
+    *list_state.offset_mut() = desired_offset.min(max_offset);
 
     let list_area = Rect { width: inner.width.saturating_sub(1), ..inner };
-    f.render_stateful_widget(List::new(items).highlight_style(Style::default()), list_area, &mut state);
+    f.render_stateful_widget(List::new(items).highlight_style(Style::default()), list_area, &mut list_state);
 
-    let total_slots  = services.len() + pkg_header + packages.len() + db_header + db_schemas.len();
-    let visible_slots = (inner.height as usize / 2).max(1);
-    let max_scroll   = total_slots.saturating_sub(visible_slots);
-    let scroll_pos   = state.offset();
-
-    if max_scroll > 0 {
-        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll_pos);
+    if max_offset > 0 {
+        let scroll_pos   = list_state.offset();
+        let mut sb_state = ScrollbarState::new(max_offset).position(scroll_pos);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲")).end_symbol(Some("▼"))
@@ -202,7 +209,7 @@ pub fn draw(
         );
     }
 
-    state.offset()
+    list_state.offset()
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────

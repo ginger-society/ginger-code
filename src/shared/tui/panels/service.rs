@@ -136,6 +136,8 @@ fn tab_spans<'a>(
 
 // ── Logs panel ────────────────────────────────────────────────────────────────
 
+/// Returns the maximum scroll offset for this log panel so the caller can
+/// keep `state.log_max_scroll` up to date.
 pub fn draw_logs(
     f:                &mut Frame,
     area:             Rect,
@@ -145,7 +147,7 @@ pub fn draw_logs(
     auto_scroll:      bool,
     scroll_offset:    usize,
     active_container: Option<&str>,
-) {
+) -> usize {
     // Ejected-container splash
     let viewing_ejected = selected.map(|s| {
         if !s.ejected { return false; }
@@ -167,7 +169,7 @@ pub fn draw_logs(
                 .wrap(Wrap { trim: false }),
             area,
         );
-        return;
+        return 0;
     }
 
     let log_text = if let Some(svc) = selected {
@@ -182,8 +184,10 @@ pub fn draw_logs(
     let height           = area.height.saturating_sub(2) as usize;
     let max_scroll       = num_lines.saturating_sub(height);
     let effective_offset = if auto_scroll { max_scroll } else { scroll_offset.min(max_scroll) };
-    let inner_area       = Rect { width: area.width.saturating_sub(1), ..area };
 
+    // Render the block at full width so every cell in `area` is painted each
+    // frame — this prevents ghost characters from a previous service showing
+    // through on the right edge.
     f.render_widget(
         Paragraph::new(log_text)
             .block(Block::default().borders(Borders::ALL)
@@ -195,13 +199,14 @@ pub fn draw_logs(
                 }))
             .wrap(Wrap { trim: false })
             .scroll((effective_offset as u16, 0)),
-        inner_area,
+        area,
     );
 
+    // Scrollbar sits on the right border column, between the corner chars.
     let mut sb = ScrollbarState::new(max_scroll.max(1)).position(effective_offset);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲")).end_symbol(Some("▼"))
+            .begin_symbol(None).end_symbol(None)
             .track_symbol(Some("│")).thumb_symbol("█"),
         Rect {
             x:      area.x + area.width.saturating_sub(1),
@@ -211,6 +216,8 @@ pub fn draw_logs(
         },
         &mut sb,
     );
+
+    max_scroll
 }
 
 // ── Ejected splash ────────────────────────────────────────────────────────────

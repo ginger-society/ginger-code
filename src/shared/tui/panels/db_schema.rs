@@ -205,8 +205,8 @@ fn draw_logs(
                 " Logs [FOLLOW] ".to_string()
             };
 
-            let inner_area = Rect { width: area.width.saturating_sub(1), ..area };
-
+            // Render at full area width so every cell is painted and no ghost
+            // characters from a previous service survive on the right edge.
             f.render_widget(
                 Paragraph::new(log_text)
                     .block(Block::default().borders(Borders::ALL).title(title)
@@ -217,13 +217,14 @@ fn draw_logs(
                         }))
                     .wrap(Wrap { trim: false })
                     .scroll((offset as u16, 0)),
-                inner_area,
+                area,
             );
 
+            // Scrollbar overlays the right border column between the corners.
             let mut sb = ScrollbarState::new(max_scroll.max(1)).position(offset);
             f.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("▲")).end_symbol(Some("▼"))
+                    .begin_symbol(None).end_symbol(None)
                     .track_symbol(Some("│")).thumb_symbol("█"),
                 Rect {
                     x:      area.x + area.width.saturating_sub(1),

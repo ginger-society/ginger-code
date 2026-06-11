@@ -71,6 +71,7 @@ pub fn draw(
     db_last_max_scroll:    &mut usize,
     scroll_offset_out:     &mut usize,
     sidebar_scroll_out:    &mut usize,
+    log_max_scroll_out:    &mut usize,  // ← always written; covers both service and db panels
 ) {
     let area = f.size();
 
@@ -98,6 +99,11 @@ pub fn draw(
         services.get(*i).map(|s| s.containers.len() > 1).unwrap_or(false)
     } else { false };
 
+    // Clear the entire right panel before rendering so no characters from a
+    // previously selected service bleed through (e.g. after switching items
+    // while scrolled, or when the new content is shorter than the old).
+    f.render_widget(ratatui::widgets::Clear, chunks[1]);
+
     match sidebar_item {
         SidebarItem::Package(i) => {
             package::draw(f, chunks[1], packages.get(*i), focus);
@@ -109,7 +115,8 @@ pub fn draw(
                 focus, scroll_offset, auto_scroll,
                 db_containers, db_selected_container,
             );
-            *db_last_max_scroll = max_scroll;
+            *db_last_max_scroll  = max_scroll;
+            *log_max_scroll_out  = max_scroll;
             if auto_scroll { *scroll_offset_out = max_scroll; }
         }
 
@@ -129,7 +136,7 @@ pub fn draw(
                 }
             }
 
-            if multi_container {
+            let svc_max = if multi_container {
                 let info_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(4), Constraint::Length(2), Constraint::Min(0)])
@@ -137,11 +144,13 @@ pub fn draw(
 
                 service::draw_info(f, info_chunks[0], selected, has_deployment, has_lang, is_ejected_now);
                 service::draw_container_tabs(f, info_chunks[1], selected, active_container_idx, active_container);
-                service::draw_logs(f, info_chunks[2], selected, logs, focus, auto_scroll, *scroll_offset_out, active_container);
+                service::draw_logs(f, info_chunks[2], selected, logs, focus, auto_scroll, *scroll_offset_out, active_container)
             } else {
                 service::draw_info(f, right_chunks[0], selected, has_deployment, has_lang, is_ejected_now);
-                service::draw_logs(f, right_chunks[1], selected, logs, focus, auto_scroll, *scroll_offset_out, active_container);
-            }
+                service::draw_logs(f, right_chunks[1], selected, logs, focus, auto_scroll, *scroll_offset_out, active_container)
+            };
+
+            *log_max_scroll_out = svc_max;
         }
     }
 

@@ -142,9 +142,10 @@ async fn run_tui(
         };
 
         // ── Draw ──────────────────────────────────────────────────────────────
-        let mut scroll_offset_tmp    = state.scroll_offset;
-        let mut db_last_max_scroll_tmp = state.db_last_max_scroll;
-        let mut sidebar_scroll_tmp   = state.sidebar_scroll;
+        let mut scroll_offset_tmp      = state.scroll_offset;
+        let mut db_last_max_scroll_tmp = 0usize; // retained only for panels::draw signature compat
+        let mut sidebar_scroll_tmp     = 0usize;
+        let mut log_max_scroll_tmp     = state.log_max_scroll;
 
         terminal.draw(|f| {
             panels::draw(
@@ -161,12 +162,13 @@ async fn run_tui(
                 &mut db_last_max_scroll_tmp,
                 &mut scroll_offset_tmp,
                 &mut sidebar_scroll_tmp,
+                &mut log_max_scroll_tmp,
             );
         })?;
 
-        state.db_last_max_scroll = db_last_max_scroll_tmp;
-        state.scroll_offset      = scroll_offset_tmp;
-        state.sidebar_scroll     = sidebar_scroll_tmp;
+        state.scroll_offset  = scroll_offset_tmp;
+        state.log_max_scroll = log_max_scroll_tmp;
+        // sidebar_scroll_tmp is not stored on state — ratatui owns the list offset
 
         // ── Poll for events (keyboard only) ───────────────────────────────────
         if !event::poll(Duration::from_millis(100))? { continue; }
@@ -312,14 +314,12 @@ fn drain_background_messages(
                     };
 
                     if let Some(idx) = target_idx {
-                        let is_active = matches!(state.sidebar_item, SidebarItem::Service(i) if i == svc_idx);
                         let svcs_snap = state.services.lock().unwrap().clone();
                         select_container(
                             svc_idx, idx, &svcs_snap[svc_idx..=svc_idx],
                             &mut state.container_selection,
                             &mut state.svc_log_generation, bg_tx, &state.logs,
                         );
-                        if is_active { /* log stream already started by select_container */ }
                     } else if !state.container_selection.contains_key(&svc_idx) {
                         state.container_selection.insert(svc_idx, 0);
                         let svcs = state.services.lock().unwrap();
@@ -344,6 +344,7 @@ fn drain_background_messages(
                             .unwrap_or_default();
 
                         if !slug.is_empty() {
+                            use background::spawn_db_log_stream as dls;
                             dls(bg_tx.clone(), slug, Some(first), state.db_log_generation);
                         }
                     }
