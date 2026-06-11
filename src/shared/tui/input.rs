@@ -416,8 +416,11 @@ fn is_deployed_non_ejected(state: &TuiState, services_snap: &[K8sService]) -> bo
     let idx       = *state.container_selection.get(&i).unwrap_or(&0);
     let container = svc.containers.get(idx).map(|s| s.as_str());
 
+    // `ejected_container_name()` falls back to `deployment_name` when
+    // `ejected_container` hasn't been populated, so this correctly disables
+    // shelling into the ejected container even for multi-container services.
     let is_ejected_container = svc.ejected && (
-        matches!((container, svc.ejected_container.as_deref()), (Some(ac), Some(ec)) if ac == ec)
+        matches!((container, svc.ejected_container_name()), (Some(ac), Some(ec)) if ac == ec)
         || svc.containers.len() <= 1
     );
 
@@ -478,8 +481,10 @@ pub fn switch_service_logs(
     }
 
     let container            = svc.containers.get(container_idx).cloned();
+    // Falls back to `deployment_name` when `ejected_container` hasn't been
+    // populated (see `K8sService::ejected_container_name`).
     let is_ejected_container = svc.ejected
-        && svc.ejected_container.as_deref() == container.as_deref();
+        && svc.ejected_container_name() == container.as_deref();
 
     if is_ejected_container {
         logs.lock().unwrap().remove(&svc.meta_name);
@@ -508,8 +513,10 @@ pub fn select_container(
 
     container_selection.insert(svc_i, container_idx);
 
+    // Falls back to `deployment_name` when `ejected_container` hasn't been
+    // populated (see `K8sService::ejected_container_name`).
     let is_ejected_container = svc.ejected
-        && svc.ejected_container.as_deref() == container.as_deref();
+        && svc.ejected_container_name() == container.as_deref();
 
     logs.lock().unwrap().remove(&svc.meta_name);
     if is_ejected_container { return; }

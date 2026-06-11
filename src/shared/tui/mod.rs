@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crossterm::{
     cursor::MoveTo,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, Event},
     execute,
     terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
                disable_raw_mode, enable_raw_mode},
@@ -86,7 +86,11 @@ async fn run_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture is intentionally NOT enabled. Mouse events were ignored
+    // anyway (see the catch-all below), and leaving it off lets the user's
+    // terminal emulator handle click-drag text selection and copy in the
+    // logs panel normally.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -258,7 +262,7 @@ async fn run_tui(
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -392,7 +396,7 @@ fn is_viewing_ejected(
     let SidebarItem::Service(i) = sidebar_item else { return false };
     let Some(svc) = services_snap.get(*i) else { return false };
     if !svc.ejected { return false; }
-    match (active_container, svc.ejected_container.as_deref()) {
+    match (active_container, svc.ejected_container_name()) {
         (Some(ac), Some(ec)) => ac == ec,
         _                    => svc.containers.len() <= 1,
     }
@@ -404,7 +408,7 @@ fn leave_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture,
+    execute!(terminal.backend_mut(), LeaveAlternateScreen,
              Clear(ClearType::All), MoveTo(0, 0))?;
     terminal.show_cursor()?;
     io::stdout().flush()?;
@@ -415,7 +419,7 @@ fn enter_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.hide_cursor()?;
     terminal.clear()?;
     Ok(())

@@ -10,6 +10,7 @@ use tokio::time::sleep;
 
 use crate::shared::core::{
     k8_info::{get_k8s_deployments, get_pod_containers, is_ejected, stream_pod_logs},
+    k8s_ops::get_deployment_annotation,
     types::K8sService,
 };
 
@@ -178,8 +179,24 @@ pub fn spawn_deployment_watcher(services: Arc<Mutex<Vec<K8sService>>>) {
             };
             for (i, dep) in deps {
                 let ejected = is_ejected(&dep).await;
+
+                // Mirror the GUI's spawn_service_refresh: when ejected, read
+                // the actual ejected container name back from the
+                // `ginger-main-container` Deployment annotation written by
+                // `eject::eject`. This is the source of truth — it does NOT
+                // assume the ejected container shares the deployment's name.
+                let ejected_container = if ejected {
+                    get_deployment_annotation(
+                        &dep,
+                        ".metadata.annotations['ginger-main-container']",
+                    ).await
+                } else {
+                    None
+                };
+
                 if let Some(svc) = services.lock().unwrap().get_mut(i) {
-                    svc.ejected = ejected;
+                    svc.ejected           = ejected;
+                    svc.ejected_container = ejected_container;
                 }
             }
             sleep(Duration::from_secs(5)).await;

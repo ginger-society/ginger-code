@@ -86,7 +86,9 @@ pub fn draw_container_tabs(
     };
 
     let containers   = &svc.containers;
-    let ejected_name = svc.ejected_container.as_deref().unwrap_or("");
+    // Falls back to `deployment_name` when `ejected_container` hasn't been
+    // populated, matching `eject::resolve_main_container`'s own fallback.
+    let ejected_name = svc.ejected_container_name().unwrap_or("");
     let tab_w        = (area.width as usize / containers.len().max(1)).max(1) as u16;
     let mut spans    = tab_spans(containers, active_idx, ejected_name, svc.ejected, tab_w);
     spans.push(Span::styled("  ⇧←/⇧→", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
@@ -149,9 +151,14 @@ pub fn draw_logs(
     active_container: Option<&str>,
 ) -> usize {
     // Ejected-container splash
+    //
+    // `ejected_container_name()` falls back to `deployment_name` when
+    // `ejected_container` hasn't been populated, so this correctly fires for
+    // multi-container ejected services even though `K8sService.ejected_container`
+    // is currently always `None` in practice.
     let viewing_ejected = selected.map(|s| {
         if !s.ejected { return false; }
-        match (active_container, s.ejected_container.as_deref()) {
+        match (active_container, s.ejected_container_name()) {
             (Some(ac), Some(ec)) => ac == ec,
             _                    => s.containers.len() <= 1,
         }
@@ -159,7 +166,7 @@ pub fn draw_logs(
 
     if viewing_ejected {
         let container_label = selected
-            .and_then(|s| s.ejected_container.as_deref())
+            .and_then(|s| s.ejected_container_name())
             .unwrap_or("container");
 
         f.render_widget(
