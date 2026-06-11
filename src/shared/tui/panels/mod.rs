@@ -82,7 +82,7 @@ pub fn draw(
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(root[0]);
 
     // ── Sidebar ───────────────────────────────────────────────────────────────

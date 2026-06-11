@@ -26,6 +26,22 @@ pub struct K8sService {
     pub transitioning: bool,
 }
 
+impl K8sService {
+    /// The name of the container considered "ejected" (dev-mode) for this
+    /// service.
+    ///
+    /// `ejected_container` is currently never populated from k8s (eject
+    /// stores `ginger-main-container` as a Deployment annotation, which we
+    /// don't read back into this struct), so we fall back to
+    /// `deployment_name` — the same fallback `eject::resolve_main_container`
+    /// uses when the `x-ginger-code-ejectable` annotation is absent.
+    pub fn ejected_container_name(&self) -> Option<&str> {
+        self.ejected_container
+            .as_deref()
+            .or(self.deployment_name.as_deref())
+    }
+}
+
 /// A package from the metadata service — not deployed on k8s.
 #[derive(Clone, Debug)]
 pub struct Package {
