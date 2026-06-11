@@ -24,7 +24,7 @@ use crate::shared::core::{
     image::{builder_image, meta_to_repo_name, pkg_to_slug, supports_ssh},
     k8s_ops::{
         apply_pvc, delete_deployment, delete_pvc, is_workspace_empty,
-        wait_for_pod_scheduled, write_ssh_principal,
+        wait_for_pod_ready, wait_for_pod_scheduled, write_ssh_principal,
     },
     port::find_free_22xx_port,
     ssh_config::{add_source_ssh_config, add_ssh_config, remove_ssh_config},
@@ -165,10 +165,8 @@ pub async fn mount(
     let client = Client::try_default().await.expect("kube client");
     let api: Api<Deployment> = Api::default_namespaced(client);
 
-    // Deserialise the manifest we already built as serde_json::Value into the typed struct
     let deployment: Deployment = serde_json::from_value(deployment_manifest)?;
 
-    // SSA (server-side apply) is idempotent — safe to re-run
     api.patch(
         &slug,
         &PatchParams::apply("ginger-code").force(),
@@ -188,13 +186,7 @@ pub async fn mount(
 
         let final_pod = wait_for_pod_scheduled(&slug).await?;
 
-        tokio::process::Command::new("kubectl")
-            .args([
-                "wait", &format!("pod/{}", final_pod),
-                "--for=condition=Ready", "--timeout=300s",
-            ])
-            .status()
-            .await?;
+        wait_for_pod_ready(&final_pod).await?;
         println!("✓ Pod ready: {}", final_pod);
 
         write_ssh_principal(&final_pod, &slug, &user).await?;
@@ -214,8 +206,8 @@ pub async fn mount(
                 Ok(()) => {
                     setup_repo_branch(
                         &final_pod, &slug,
-                        &git_repo,  // source:ginger-society-iamservice.git
-                        &format!("{}-{}", org_id, slug),      // /workspace/iamservice
+                        &git_repo,
+                        &format!("{}-{}", org_id, slug),
                         &branch,
                     ).await?;
                     if let Err(e) = delete_dev_ssh_keys(&final_pod, &slug).await {
