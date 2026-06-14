@@ -53,6 +53,7 @@ kube = { version = "3.1.0", features = ["runtime", "derive", "client", "ws"] }
 k8s-openapi = { version = "0.27.0", features = ["latest", "schemars"] }
 schemars = { version = "1" }
 futures = "0.3"
+ginger-gitter = { path = "./ginger-gitter_client" }
 
 [package.metadata]
 organization = "ginger-society"

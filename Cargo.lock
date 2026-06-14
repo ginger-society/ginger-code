@@ -2398,6 +2398,7 @@ dependencies = [
  "eframe",
  "egui",
  "futures",
+ "ginger-gitter",
  "ginger-shared-rs",
  "image",
  "indexmap 2.1.0",
@@ -2418,6 +2419,17 @@ dependencies = [
  "tray-icon",
  "vte",
  "winit 0.30.9",
+]
+
+[[package]]
+name = "ginger-gitter"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "url",
 ]
 
 [[package]]

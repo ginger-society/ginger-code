@@ -3,29 +3,35 @@ organization_id = "ginger-society"
 dir = "."
 spec_url = "/openapi.json"
 
-[services."@ginger-society/MetadataService"]
-stage_k8 = "http://metadata-service-api-service/metadata"
-prod = "https://api.gingersociety.org/metadata"
-stage = "https://api.gingersociety.org/metadata"
+[services."@ginger-society/ginger-gitter"]
+stage = "https://source.gingersociety.org"
+prod = "https://source.gingersociety.org"
 
 [services."@ginger-society/IAMService"]
 prod = "https://api.gingersociety.org/iam"
-stage = "https://api.gingersociety.org/iam"
-stage_k8 = "http://iam-service-api-service/iam"
 prod_k8 = "http://iam-service-api-service/iam"
+stage_k8 = "http://iam-service-api-service/iam"
+stage = "https://api.gingersociety.org/iam"
+
+[services."@ginger-society/MetadataService"]
+prod = "https://api.gingersociety.org/metadata"
+stage = "https://api.gingersociety.org/metadata"
 
 [portals_refs]
 
-[ws_refs."@ginger-society/MetadataService"]
-stage_k8 = ""
+[ws_refs."@ginger-society/ginger-gitter"]
 prod = ""
 stage = ""
 
 [ws_refs."@ginger-society/IAMService"]
-prod = ""
-stage_k8 = ""
-stage = ""
 prod_k8 = ""
+prod = ""
+stage = ""
+stage_k8 = ""
+
+[ws_refs."@ginger-society/MetadataService"]
+stage = ""
+prod = ""
 
 [urls]
 
