@@ -5,7 +5,6 @@ use crate::shared::tui::fetch_metadata_and_process;
 
 // The outer fn main() is sync; this bridges into async for the one
 // command that needs it.
-#[tokio::main]
 pub async fn check_session_guard(
     iam_config:      &IAMConfiguration,
     metadata_config: &MetadataConfiguration,

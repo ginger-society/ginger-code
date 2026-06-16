@@ -1,12 +1,16 @@
 //! Background worker threads / tasks and the channel message type.
 //!
-//! The TUI loop owns the receiving end; all background helpers send into it.
+//! Design: a single background thread owns one Tokio runtime. Log streams run
+//! as tasks inside that runtime and are cancelled (not just orphaned) when the
+//! user navigates away. This eliminates the file-descriptor leak that came from
+//! spawning a new runtime + thread on every navigation event.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc as async_mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::shared::core::{
     k8_info::{get_k8s_deployments, get_pod_containers, is_ejected, stream_pod_logs},
@@ -23,6 +27,19 @@ pub enum TuiMsg {
     DbContainers { schema_idx: usize, containers: Vec<String> },
 }
 
+// ── Shared background runtime ─────────────────────────────────────────────────
+//
+// All stream tasks run inside this single runtime so we never open more than
+// O(1) kqueue/epoll handles regardless of how many times the user navigates.
+
+lazy_static::lazy_static! {
+    static ref BG_RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("background tokio runtime");
+}
+
 // ── Service log stream ────────────────────────────────────────────────────────
 
 pub fn spawn_service_log_stream(
@@ -30,22 +47,28 @@ pub fn spawn_service_log_stream(
     deployment_name: String,
     container:       Option<String>,
     generation:      u64,
+    cancel:          CancellationToken,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+    BG_RT.spawn(async move {
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            if cancel.is_cancelled() { return; }
 
-        rt.block_on(async move {
-            let mut lines: Vec<String> = Vec::new();
+            let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+            let dep  = deployment_name.clone();
+            let cont = container.clone();
+            let cancel2 = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel2.cancelled() => {}
+                    _ = stream_pod_logs(&dep, cont, line_tx) => {}
+                }
+            });
+
             loop {
-                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
-                let dep  = deployment_name.clone();
-                let cont = container.clone();
-                tokio::spawn(async move { stream_pod_logs(&dep, cont, line_tx).await });
-                loop {
-                    match line_rx.recv().await {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    msg = line_rx.recv() => match msg {
                         None => break,
                         Some(line) => {
                             lines.push(line);
@@ -56,12 +79,16 @@ pub fn spawn_service_log_stream(
                         }
                     }
                 }
-                if tx.send(TuiMsg::ServiceLogs { lines: lines.clone(), generation }).is_err() {
-                    return;
-                }
-                sleep(Duration::from_secs(2)).await;
             }
-        });
+
+            if tx.send(TuiMsg::ServiceLogs { lines: lines.clone(), generation }).is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = sleep(Duration::from_secs(2)) => {}
+            }
+        }
     });
 }
 
@@ -72,22 +99,28 @@ pub fn spawn_db_log_stream(
     slug:       String,
     container:  Option<String>,
     generation: u64,
+    cancel:     CancellationToken,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
+    BG_RT.spawn(async move {
+        let mut lines: Vec<String> = Vec::new();
+        loop {
+            if cancel.is_cancelled() { return; }
 
-        rt.block_on(async move {
-            let mut lines: Vec<String> = Vec::new();
+            let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
+            let dep    = slug.clone();
+            let cont   = container.clone();
+            let cancel2 = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel2.cancelled() => {}
+                    _ = stream_pod_logs(&dep, cont, line_tx) => {}
+                }
+            });
+
             loop {
-                let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
-                let dep  = slug.clone();
-                let cont = container.clone();
-                tokio::spawn(async move { stream_pod_logs(&dep, cont, line_tx).await });
-                loop {
-                    match line_rx.recv().await {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    msg = line_rx.recv() => match msg {
                         None => break,
                         Some(line) => {
                             lines.push(line);
@@ -103,12 +136,16 @@ pub fn spawn_db_log_stream(
                         }
                     }
                 }
-                if tx.send(TuiMsg::DbLogs { lines: lines.clone(), generation }).is_err() {
-                    return;
-                }
-                sleep(Duration::from_secs(2)).await;
             }
-        });
+
+            if tx.send(TuiMsg::DbLogs { lines: lines.clone(), generation }).is_err() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = sleep(Duration::from_secs(2)) => {}
+            }
+        }
     });
 }
 
@@ -119,16 +156,10 @@ pub fn spawn_container_fetch(
     deployment_name: String,
     svc_idx:         usize,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
-        rt.block_on(async move {
-            if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
-                let _ = tx.send(TuiMsg::Containers { svc_idx, containers });
-            }
-        });
+    BG_RT.spawn(async move {
+        if let Some((_pod, containers)) = get_pod_containers(&deployment_name).await {
+            let _ = tx.send(TuiMsg::Containers { svc_idx, containers });
+        }
     });
 }
 
@@ -137,23 +168,17 @@ pub fn spawn_db_container_fetch(
     slug:       String,
     schema_idx: usize,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio rt");
-        rt.block_on(async move {
-            if let Some((_pod, containers)) = get_pod_containers(&slug).await {
-                let _ = tx.send(TuiMsg::DbContainers { schema_idx, containers });
-            }
-        });
+    BG_RT.spawn(async move {
+        if let Some((_pod, containers)) = get_pod_containers(&slug).await {
+            let _ = tx.send(TuiMsg::DbContainers { schema_idx, containers });
+        }
     });
 }
 
 // ── Deployment status watcher ─────────────────────────────────────────────────
 
 pub fn spawn_deployment_watcher(services: Arc<Mutex<Vec<K8sService>>>) {
-    tokio::spawn(async move {
+    BG_RT.spawn(async move {
         loop {
             let deployments = get_k8s_deployments().await;
             {
@@ -179,12 +204,6 @@ pub fn spawn_deployment_watcher(services: Arc<Mutex<Vec<K8sService>>>) {
             };
             for (i, dep) in deps {
                 let ejected = is_ejected(&dep).await;
-
-                // Mirror the GUI's spawn_service_refresh: when ejected, read
-                // the actual ejected container name back from the
-                // `ginger-main-container` Deployment annotation written by
-                // `eject::eject`. This is the source of truth — it does NOT
-                // assume the ejected container shares the deployment's name.
                 let ejected_container = if ejected {
                     get_deployment_annotation(
                         &dep,
@@ -193,7 +212,6 @@ pub fn spawn_deployment_watcher(services: Arc<Mutex<Vec<K8sService>>>) {
                 } else {
                     None
                 };
-
                 if let Some(svc) = services.lock().unwrap().get_mut(i) {
                     svc.ejected           = ejected;
                     svc.ejected_container = ejected_container;

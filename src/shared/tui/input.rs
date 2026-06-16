@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tokio_util::sync::CancellationToken;
 
 use crate::shared::core::types::{DbSchema, K8sService, Package};
 use super::{
@@ -313,16 +314,19 @@ fn on_sidebar_move(
 ) {
     match item {
         SidebarItem::Service(i) => {
+            let cancel = &mut state.svc_cancel;
             switch_service_logs(*i, services_snap, &mut state.svc_log_generation,
-                                &state.container_selection, bg_tx, &state.logs);
+                                &state.container_selection, bg_tx, &state.logs, cancel);
             state.auto_scroll    = true;
             state.scroll_offset  = 0;
             state.log_max_scroll = 0;
         }
         SidebarItem::DbSchema(i) => {
+            let cancel = &mut state.db_cancel;
             maybe_start_db_stream(*i, db_schemas_snap, &mut state.db_log_schema,
                                   &mut state.db_log_generation, &state.db_logs, bg_tx,
-                                  &mut state.db_containers, &mut state.db_selected_container);
+                                  &mut state.db_containers, &mut state.db_selected_container,
+                                  cancel);
             state.auto_scroll    = true;
             state.scroll_offset  = 0;
             state.log_max_scroll = 0;
@@ -349,9 +353,11 @@ fn shift_container(
                     } else {
                         (cur + 1) % n
                     };
+                    let cancel = &mut state.svc_cancel;
                     select_container(svc_i, next, &[svc.clone()],
                                      &mut state.container_selection,
-                                     &mut state.svc_log_generation, bg_tx, &state.logs);
+                                     &mut state.svc_log_generation, bg_tx, &state.logs,
+                                     cancel);
                 }
             }
         }
@@ -366,10 +372,11 @@ fn shift_container(
                 } else {
                     (cur + 1) % n
                 };
+                let cancel = &mut state.db_cancel;
                 select_db_container(schema_i, next, &state.db_containers.clone(),
                                     db_schemas_snap, &mut state.db_selected_container,
                                     &mut state.db_log_generation, &mut state.db_log_schema,
-                                    &state.db_logs, bg_tx);
+                                    &state.db_logs, bg_tx, cancel);
                 state.auto_scroll    = true;
                 state.scroll_offset  = 0;
                 state.log_max_scroll = 0;
@@ -464,18 +471,19 @@ pub fn switch_service_logs(
     container_selection: &HashMap<usize, usize>,
     bg_tx:               &std::sync::mpsc::Sender<TuiMsg>,
     logs:                &Arc<Mutex<HashMap<String, Vec<String>>>>,
+    svc_cancel:          &mut CancellationToken,
 ) {
     let Some(svc) = services.get(svc_i) else { return };
     let Some(dep) = svc.deployment_name.clone() else { return };
 
-    let container_idx        = *container_selection.get(&svc_i).unwrap_or(&0);
+    let container_idx = *container_selection.get(&svc_i).unwrap_or(&0);
 
     if svc.ejected && svc.containers.is_empty() {
         spawn_container_fetch(bg_tx.clone(), dep, svc_i);
         return;
     }
 
-    let container            = svc.containers.get(container_idx).cloned();
+    let container = svc.containers.get(container_idx).cloned();
     let is_ejected_container = svc.ejected
         && svc.ejected_container_name() == container.as_deref();
 
@@ -485,8 +493,13 @@ pub fn switch_service_logs(
         return;
     }
 
+    svc_cancel.cancel();
+    *svc_cancel = CancellationToken::new();
+
     *svc_log_generation += 1;
-    spawn_service_log_stream(bg_tx.clone(), dep.clone(), container, *svc_log_generation);
+    spawn_service_log_stream(
+        bg_tx.clone(), dep.clone(), container, *svc_log_generation, svc_cancel.clone(),
+    );
 
     if svc.containers.is_empty() { spawn_container_fetch(bg_tx.clone(), dep, svc_i); }
 }
@@ -499,6 +512,7 @@ pub fn select_container(
     svc_log_generation:  &mut u64,
     bg_tx:               &std::sync::mpsc::Sender<TuiMsg>,
     logs:                &Arc<Mutex<HashMap<String, Vec<String>>>>,
+    svc_cancel:          &mut CancellationToken,
 ) {
     let Some(svc) = services.first() else { return };
     let Some(dep) = svc.deployment_name.clone() else { return };
@@ -512,8 +526,13 @@ pub fn select_container(
     logs.lock().unwrap().remove(&svc.meta_name);
     if is_ejected_container { return; }
 
+    svc_cancel.cancel();
+    *svc_cancel = CancellationToken::new();
+
     *svc_log_generation += 1;
-    spawn_service_log_stream(bg_tx.clone(), dep, container, *svc_log_generation);
+    spawn_service_log_stream(
+        bg_tx.clone(), dep, container, *svc_log_generation, svc_cancel.clone(),
+    );
 }
 
 pub fn maybe_start_db_stream(
@@ -525,8 +544,12 @@ pub fn maybe_start_db_stream(
     bg_tx:                 &std::sync::mpsc::Sender<TuiMsg>,
     db_containers:         &mut Vec<String>,
     db_selected_container: &mut Option<String>,
+    db_cancel:             &mut CancellationToken,
 ) {
     if *db_log_schema == Some(idx) { return; }
+
+    db_cancel.cancel();
+    *db_cancel = CancellationToken::new();
 
     *db_log_schema         = Some(idx);
     *db_log_generation    += 1;
@@ -544,7 +567,7 @@ pub fn maybe_start_db_stream(
     }
 
     spawn_db_container_fetch(bg_tx.clone(), slug.clone(), idx);
-    spawn_db_log_stream(bg_tx.clone(), slug, None, *db_log_generation);
+    spawn_db_log_stream(bg_tx.clone(), slug, None, *db_log_generation, db_cancel.clone());
 }
 
 pub fn select_db_container(
@@ -557,8 +580,12 @@ pub fn select_db_container(
     db_log_schema:         &mut Option<usize>,
     db_logs:               &Arc<Mutex<Option<Vec<String>>>>,
     bg_tx:                 &std::sync::mpsc::Sender<TuiMsg>,
+    db_cancel:             &mut CancellationToken,
 ) {
     let Some(container) = db_containers.get(container_idx).cloned() else { return };
+
+    db_cancel.cancel();
+    *db_cancel = CancellationToken::new();
 
     *db_selected_container = Some(container.clone());
     *db_log_schema         = Some(schema_idx);
@@ -574,5 +601,7 @@ pub fn select_db_container(
         return;
     }
 
-    spawn_db_log_stream(bg_tx.clone(), slug, Some(container), *db_log_generation);
+    spawn_db_log_stream(
+        bg_tx.clone(), slug, Some(container), *db_log_generation, db_cancel.clone(),
+    );
 }

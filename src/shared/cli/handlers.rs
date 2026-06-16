@@ -1,18 +1,28 @@
 use super::colour::{Colour, BOLD, CYAN, GREEN, RED, RESET, YELLOW};
 use super::config::{branch_toml_path, CodeConfig};
 use super::socket::daemon_running;
+use ginger_gitter::apis::configuration::Configuration as GingerGitterConfiguration;
+use ginger_gitter::apis::default_api::{HandleRunPipelineParams, HandleTriggerPipelineParams, handle_run_pipeline, handle_trigger_pipeline};
+use ginger_gitter::get_configuration as get_ginger_gitter_configuration;
+use ginger_gitter::models::{PipelineParam, RunPipelineRequest, TriggerPipelineRequest};
+use ginger_shared_rs::utils::get_token_from_file_storage;
 
-pub fn handle_branch(branch: &str, url: Option<&str>) {
+
+pub async fn handle_branch(branch: &str, url: Option<&str>, rebuild_env: bool) {
     let c = Colour::new();
+    let token = get_token_from_file_storage();
+    let gitter_config = get_ginger_gitter_configuration(Some(token));
 
     let mut cfg = CodeConfig::load();
     let prev = cfg.active_branch.clone();
     let switching = prev.as_deref() != Some(branch);
+    // Trigger if switching to a new branch OR explicitly asked to rebuild
+    let should_trigger = switching || rebuild_env;
 
     cfg.active_branch = Some(branch.to_string());
     cfg.active_url = url
         .map(|s| s.to_string())
-        .or_else(|| if switching { None } else { cfg.active_url.clone() });
+        .or_else(|| cfg.active_url.clone()); // preserve existing url if not switching
     cfg.save();
 
     let branch_path = branch_toml_path(branch);
@@ -20,11 +30,11 @@ pub fn handle_branch(branch: &str, url: Option<&str>) {
         if let Some(p) = branch_path.parent() {
             std::fs::create_dir_all(p).ok();
         }
-        // Write empty valid toml (no deployments yet)
         std::fs::write(&branch_path, "")
             .unwrap_or_else(|e| eprintln!("warn: could not init branch toml: {e}"));
     }
 
+    // ── Print what we did ─────────────────────────────────────────────────
     if switching {
         if let Some(ref prev_branch) = prev {
             println!(
@@ -36,17 +46,68 @@ pub fn handle_branch(branch: &str, url: Option<&str>) {
             );
         } else {
             println!(
-                "{}  Active branch set to: {}",
+                "{}  Active branch set to: {}{}",
                 c.paint(CYAN, "⎇"),
                 c.paint(GREEN, branch),
+                RESET,
             );
         }
+    } else if rebuild_env {
+        println!(
+            "{}  Re-triggering pipeline for branch: {} {}(--rebuild-env){}",
+            c.paint(CYAN, "⎇"),
+            c.paint(GREEN, branch),
+            YELLOW, RESET,
+        );
     } else {
         println!(
             "{}  Already on branch: {}  (env/url updated)",
             c.paint(CYAN, "⎇"),
             c.paint(GREEN, branch),
         );
+    }
+
+    // ── Trigger pipeline if needed ────────────────────────────────────────
+    if should_trigger {
+        let vault_path = {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            std::path::PathBuf::from(home)
+                .join(".ginger-society")
+                .join("ephimeral_env_vault.json")
+        };
+        let vault_json = std::fs::read_to_string(&vault_path).unwrap_or_else(|e| {
+            eprintln!("warn: could not read vault at {}: {e}", vault_path.display());
+            "{}".to_string()
+        });
+        let vault_compact = serde_json::from_str::<serde_json::Value>(&vault_json)
+            .map(|v| v.to_string())
+            .unwrap_or(vault_json);
+
+        let hosting_fqdn = cfg.active_url.clone().unwrap_or_default();
+
+        match handle_run_pipeline(
+            &gitter_config,
+            HandleRunPipelineParams {
+                run_pipeline_request: RunPipelineRequest {
+                    branch: "main".to_string(),
+                    pipeline_name: "debug.yml".to_string(),
+                    repo: "ginger-society-iac".to_string(),
+                    triggered_by: Some("ginger-code".to_string()),
+                    params: Some(vec![
+                        PipelineParam { key: "HOSTING_FQDN".to_string(), val: hosting_fqdn },
+                        PipelineParam { key: "vault".to_string(),        val: vault_compact },
+                    ]),
+                },
+            },
+        )
+        .await
+        {
+            Ok(resp) => println!("{:?}", resp),
+            Err(e) => {
+                eprintln!("{:?}", e);
+                eprintln!("❌ Error triggering the pipeline");
+            }
+        }
     }
 
     if let Some(e) = &cfg.active_env {

@@ -5,11 +5,9 @@ use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, daemon_running, handle_branch,
+    check_session_guard, handle_branch,
     print_deployments, print_status, send,
 };
-
-// ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -26,6 +24,10 @@ struct Cli {
     /// Base URL for the ephemeral env
     #[arg(short = 'u', long = "url", value_name = "URL", requires = "branch")]
     url: Option<String>,
+
+    /// Force re-trigger the pipeline even if already on this branch
+    #[arg(long = "rebuild-env", requires = "branch")]
+    rebuild_env: bool,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -58,14 +60,13 @@ enum Cmd {
     Config,
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     if let Some(ref branch) = cli.branch {
         let url = cli.url.as_deref().map(|u| format!("{branch}.{u}"));
-        handle_branch(branch, url.as_deref());
+        handle_branch(branch, url.as_deref(), cli.rebuild_env).await;
         return;
     }
 
@@ -75,7 +76,7 @@ fn main() {
         let token           = get_token_from_file_storage();
         let iam_config      = get_iam_configuration(Some(token.clone()));
         let metadata_config = get_metadata_configuration(Some(token.clone()));
-        check_session_guard(&iam_config, &metadata_config);
+        check_session_guard(&iam_config, &metadata_config).await;
         return;
     }
 
