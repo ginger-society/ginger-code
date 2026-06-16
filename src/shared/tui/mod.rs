@@ -38,8 +38,6 @@ use input::{Action, handle_key, maybe_start_db_stream, switch_service_logs};
 use state::TuiState;
 use types::SidebarItem;
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
     session_user:    &str,
@@ -76,8 +74,6 @@ pub async fn fetch_metadata_and_process(
     }
 }
 
-// ── TUI loop ──────────────────────────────────────────────────────────────────
-
 async fn run_tui(
     initial_services:   Vec<K8sService>,
     initial_packages:   Vec<Package>,
@@ -93,33 +89,32 @@ async fn run_tui(
     let mut state = TuiState::new(initial_services, initial_packages, initial_db_schemas);
     let (bg_tx, bg_rx) = std::sync::mpsc::channel::<TuiMsg>();
 
-    // Start deployment watcher
     spawn_deployment_watcher(state.services.clone());
 
-    // Kick off logs for first service
     {
         let svcs = state.services.lock().unwrap();
         if let Some(svc) = svcs.first() {
             if let Some(ref dep) = svc.deployment_name {
                 state.svc_log_generation += 1;
-                spawn_service_log_stream(bg_tx.clone(), dep.clone(), None, state.svc_log_generation);
+                // FIX 1: pass cancel token
+                spawn_service_log_stream(
+                    bg_tx.clone(), dep.clone(), None,
+                    state.svc_log_generation, state.svc_cancel.clone(),
+                );
                 spawn_container_fetch(bg_tx.clone(), dep.clone(), 0);
             }
         }
     }
 
     'main: loop {
-        // ── Drain background messages ─────────────────────────────────────────
         drain_background_messages(&bg_rx, &mut state, &bg_tx);
 
-        // ── Snapshot all shared state ─────────────────────────────────────────
         let services_snap   = state.services.lock().unwrap().clone();
         let packages_snap   = state.packages.lock().unwrap().clone();
         let db_schemas_snap = state.db_schemas.lock().unwrap().clone();
         let logs_snap       = state.logs.lock().unwrap().clone();
         let db_logs_snap    = state.db_logs.lock().unwrap().clone();
 
-        // ── Compute view-derived flags ────────────────────────────────────────
         let (has_deployment, has_lang, is_ejected_now) =
             service_flags(&state.sidebar_item, &services_snap);
 
@@ -141,7 +136,6 @@ async fn run_tui(
             _ => None,
         };
 
-        // ── Draw ──────────────────────────────────────────────────────────────
         let mut scroll_offset_tmp      = state.scroll_offset;
         let mut db_last_max_scroll_tmp = 0usize;
         let mut sidebar_scroll_tmp     = 0usize;
@@ -169,7 +163,6 @@ async fn run_tui(
         state.scroll_offset  = scroll_offset_tmp;
         state.log_max_scroll = log_max_scroll_tmp;
 
-        // ── Poll for events (keyboard only) ───────────────────────────────────
         if !event::poll(Duration::from_millis(100))? { continue; }
 
         match event::read()? {
@@ -251,7 +244,7 @@ async fn run_tui(
                     }
                 }
             }
-            _ => {} // Mouse events and resize events are deliberately ignored.
+            _ => {}
         }
     }
 
@@ -260,8 +253,6 @@ async fn run_tui(
     terminal.show_cursor()?;
     Ok(())
 }
-
-// ── Background message drain ──────────────────────────────────────────────────
 
 fn drain_background_messages(
     bg_rx: &std::sync::mpsc::Receiver<TuiMsg>,
@@ -312,10 +303,12 @@ fn drain_background_messages(
 
                     if let Some(idx) = target_idx {
                         let svcs_snap = state.services.lock().unwrap().clone();
+                        // FIX 2: pass cancel token
                         select_container(
                             svc_idx, idx, &svcs_snap[svc_idx..=svc_idx],
                             &mut state.container_selection,
                             &mut state.svc_log_generation, bg_tx, &state.logs,
+                            &mut state.svc_cancel,
                         );
                     } else if !state.container_selection.contains_key(&svc_idx) {
                         state.container_selection.insert(svc_idx, 0);
@@ -332,6 +325,9 @@ fn drain_background_messages(
                     state.db_containers = containers.clone();
                     if let Some(first) = containers.first().cloned() {
                         state.db_selected_container = Some(first.clone());
+                        // FIX 3: cancel old stream, pass new cancel token
+                        state.db_cancel.cancel();
+                        state.db_cancel = tokio_util::sync::CancellationToken::new();
                         state.db_log_generation += 1;
                         *state.db_logs.lock().unwrap() = None;
 
@@ -342,7 +338,7 @@ fn drain_background_messages(
 
                         if !slug.is_empty() {
                             use background::spawn_db_log_stream as dls;
-                            dls(bg_tx.clone(), slug, Some(first), state.db_log_generation);
+                            dls(bg_tx.clone(), slug, Some(first), state.db_log_generation, state.db_cancel.clone());
                         }
                     }
                 }
@@ -352,8 +348,6 @@ fn drain_background_messages(
         }
     }
 }
-
-// ── View-derived flag helpers ─────────────────────────────────────────────────
 
 fn service_flags(
     sidebar_item:  &SidebarItem,
@@ -394,8 +388,6 @@ fn is_viewing_ejected(
         _                    => svc.containers.len() <= 1,
     }
 }
-
-// ── TUI suspend / resume ──────────────────────────────────────────────────────
 
 fn leave_tui<B: ratatui::backend::Backend + io::Write>(
     terminal: &mut Terminal<B>,

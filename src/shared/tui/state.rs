@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::shared::core::types::{DbSchema, K8sService, Package};
 use super::types::{Focus, Popup, SidebarItem};
 
@@ -21,6 +23,10 @@ pub struct TuiState {
     pub db_log_generation:  u64,
     pub db_log_schema:      Option<usize>,
 
+    // ── Cancellation tokens — cancel the old stream before starting a new one
+    pub svc_cancel: CancellationToken,
+    pub db_cancel:  CancellationToken,
+
     // ── Container state ───────────────────────────────────────────────────────
     pub container_selection:     HashMap<usize, usize>,
     pub db_containers:           Vec<String>,
@@ -33,11 +39,6 @@ pub struct TuiState {
     // ── Scroll ────────────────────────────────────────────────────────────────
     pub auto_scroll:   bool,
     pub scroll_offset: usize,
-
-    /// The true maximum scroll offset for whatever log panel is currently
-    /// visible (service *or* db schema). Written every draw frame by
-    /// `panels::draw` so that pressing Up while auto-scrolling snaps to the
-    /// real bottom instead of jumping to 0.
     pub log_max_scroll: usize,
 
     // ── Popup ─────────────────────────────────────────────────────────────────
@@ -59,6 +60,8 @@ impl TuiState {
             svc_log_generation: 0,
             db_log_generation:  0,
             db_log_schema:      None,
+            svc_cancel: CancellationToken::new(),
+            db_cancel:  CancellationToken::new(),
             container_selection:     HashMap::new(),
             db_containers:           Vec::new(),
             db_selected_container:   None,
