@@ -6,6 +6,7 @@
 //!                       (replaces the kubectl-exec + portable_pty approach in terminal.rs).
 
 use std::sync::Arc;
+use super::k8s_client::{get_client, handle_unauthorized, is_unauthorized};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{AttachParams, ListParams};
@@ -24,7 +25,8 @@ async fn client() -> Client {
 // ── Pod resolution ────────────────────────────────────────────────────────────
 
 pub async fn resolve_running_pod(deployment_name: &str) -> Option<String> {
-    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let client = get_client().await;
+    let api: Api<Pod> = Api::default_namespaced(client);
 
     let label_strategies = [
         format!("app={}", deployment_name),
@@ -34,44 +36,42 @@ pub async fn resolve_running_pod(deployment_name: &str) -> Option<String> {
 
     for label in &label_strategies {
         let lp = ListParams::default().labels(label);
-        if let Ok(list) = api.list(&lp).await {
-            if let Some(name) = list
-                .items
-                .into_iter()
-                .find(|p| {
-                    p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
-                        && p.metadata.deletion_timestamp.is_none()
-                })
-                .and_then(|p| p.metadata.name)
-            {
-                return Some(name);
+        match api.list(&lp).await {
+            Ok(list) => {
+                if let Some(name) = list.items.into_iter()
+                    .find(|p| {
+                        p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+                            && p.metadata.deletion_timestamp.is_none()
+                    })
+                    .and_then(|p| p.metadata.name)
+                {
+                    return Some(name);
+                }
             }
+            Err(ref e) if is_unauthorized(e) => {
+                handle_unauthorized().await;
+                return None;
+            }
+            Err(_) => {}
         }
     }
 
-    // Name-prefix fallback — covers StatefulSets like my-db-postgresql-0
-    if let Ok(all) = api.list(&ListParams::default()).await {
-        return all
-            .items
-            .into_iter()
+    match api.list(&ListParams::default()).await {
+        Ok(all) => all.items.into_iter()
             .find(|p| {
-                let matches = p
-                    .metadata
-                    .name
-                    .as_deref()
-                    .map(|n| {
-                        n == deployment_name
-                            || n.starts_with(&format!("{}-", deployment_name))
-                    })
+                let matches = p.metadata.name.as_deref()
+                    .map(|n| n == deployment_name || n.starts_with(&format!("{}-", deployment_name)))
                     .unwrap_or(false);
-                let running = p.status.as_ref().and_then(|s| s.phase.as_deref())
-                    == Some("Running");
+                let running = p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running");
                 matches && running && p.metadata.deletion_timestamp.is_none()
             })
-            .and_then(|p| p.metadata.name);
+            .and_then(|p| p.metadata.name),
+        Err(ref e) if is_unauthorized(e) => {
+            handle_unauthorized().await;
+            None
+        }
+        Err(_) => None,
     }
-
-    None
 }
 
 // ── One-shot exec ─────────────────────────────────────────────────────────────
@@ -86,7 +86,8 @@ pub async fn exec_in_pod(
     container: &str,
     command:   &[&str],
 ) -> Result<(String, String, bool), Box<dyn std::error::Error + Send + Sync>> {
-    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let client = get_client().await;
+    let api: Api<Pod> = Api::default_namespaced(client);
 
     let ap = AttachParams {
         container: Some(container.to_string()),
@@ -170,7 +171,8 @@ pub async fn attach_to_pod(
     ctx:             eframe::egui::Context,
     container:       Option<String>,
 ) -> Result<SshSession, Box<dyn std::error::Error>> {
-    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let client = get_client().await;
+    let api: Api<Pod> = Api::default_namespaced(client);
 
     let pod_name = resolve_running_pod(deployment_name)
         .await
