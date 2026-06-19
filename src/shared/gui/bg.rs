@@ -246,9 +246,6 @@ pub fn spawn_unmount(
 
 /// Mount the IAC dev container.
 ///
-/// Uses `mount(&org_id, "iac", "alpine")` — identical to how any package
-/// is mounted.  `pkg_to_slug("iac")` → `"iac"` (k8s slug) and
-/// `meta_to_repo_name(org_id, "iac")` → `"{org_id}-iac"` (git remote).
 pub fn spawn_mount_iac(
     tx:     mpsc::Sender<BgMsg>,
     ctx:    egui::Context,
@@ -259,7 +256,7 @@ pub fn spawn_mount_iac(
             .enable_all().build().expect("tokio rt");
 
         rt.block_on(async move {
-            let result = mount(&org_id, "iac", "alpine").await;
+            let result = mount(&org_id, "iac", "iac").await;
             let (success, message) = match result {
                 Ok(())  => (true,  "✓ Mounted IAC dev container".to_string()),
                 Err(e)  => (false, format!("✗ IAC mount failed: {}", e)),
