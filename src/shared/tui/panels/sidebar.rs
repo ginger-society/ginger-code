@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::shared::core::types::{DbSchema, K8sService, Package};
+use crate::shared::core::types::{DbSchema, InfraAsCode, K8sService, Package};
 use crate::shared::tui::types::{Focus, SidebarItem};
 use super::{status_color, status_icon};
 
@@ -20,6 +20,7 @@ pub fn draw(
     services:     &[K8sService],
     packages:     &[Package],
     db_schemas:   &[DbSchema],
+    iac:          &InfraAsCode,
     sidebar_item: &SidebarItem,
     focus:        &Focus,
 ) -> usize {
@@ -170,27 +171,75 @@ pub fn draw(
         }
     }
 
+    // ── Infra as Code ─────────────────────────────────────────────────────────
+    {
+        items.push(section_header("── Infra as Code ───────────"));
+
+        let is_sel = *sidebar_item == SidebarItem::InfraAsCode && sidebar_focus;
+        let is_cur = *sidebar_item == SidebarItem::InfraAsCode;
+
+        let name_style   = selected_style(is_sel, is_cur);
+        let dot_color    = if iac.mounted { Color::Green } else { Color::DarkGray };
+        let dot_style    = if is_sel {
+            Style::default().bg(Color::Yellow).fg(dot_color)
+        } else if is_cur {
+            Style::default().bg(Color::DarkGray).fg(dot_color)
+        } else {
+            Style::default().fg(dot_color)
+        };
+        let mounted_style = if is_sel {
+            Style::default().bg(Color::Yellow).fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        let mounted = if iac.mounted {
+            Span::styled(" [MOUNTED]", mounted_style)
+        } else {
+            Span::raw("")
+        };
+        let sub_style = sub_text_style(is_sel, is_cur);
+
+        items.push(ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(if iac.mounted { "● " } else { "○ " }, dot_style),
+                Span::styled("Infra As Code", name_style),
+                mounted,
+                fill(is_sel, is_cur),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("  iac  ·  {}", iac.slug()),
+                    sub_style,
+                ),
+                fill(is_sel, is_cur),
+            ]),
+        ]));
+    }
+
     // ── Render list + scrollbar ───────────────────────────────────────────────
     let pkg_header = if packages.is_empty()   { 0usize } else { 1 };
     let db_header  = if db_schemas.is_empty() { 0usize } else { 1 };
+    // IAC always has its section header (1) + its single item (1)
+    let iac_header = 1usize;
 
     let selected_flat = match sidebar_item {
         SidebarItem::Service(i)  => *i,
         SidebarItem::Package(i)  => services.len() + pkg_header + i,
         SidebarItem::DbSchema(i) => services.len() + pkg_header + packages.len() + db_header + i,
+        SidebarItem::InfraAsCode =>
+            services.len() + pkg_header + packages.len() + db_header + db_schemas.len() + iac_header,
     };
 
-    // Each item occupies 2 rows in the list.
     let visible_rows  = (inner.height as usize / 2).max(1);
-    let total_slots   = services.len() + pkg_header + packages.len() + db_header + db_schemas.len();
+    let total_slots   = services.len()
+        + pkg_header + packages.len()
+        + db_header  + db_schemas.len()
+        + iac_header + 1; // header + 1 IAC item
     let max_offset    = total_slots.saturating_sub(visible_rows);
 
     let mut list_state = ListState::default();
     list_state.select(Some(selected_flat));
 
-    // Override ratatui's default "stick selected to bottom" behaviour:
-    // keep the selected item one row from the top of the viewport so
-    // scrolling up doesn't leave it anchored at the bottom.
     let desired_offset = selected_flat.saturating_sub(1);
     *list_state.offset_mut() = desired_offset.min(max_offset);
 

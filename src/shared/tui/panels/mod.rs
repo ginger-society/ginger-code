@@ -6,6 +6,7 @@ pub mod service;
 pub mod db_schema;
 pub mod package;
 pub mod help_bar;
+pub mod iac;
 
 use std::collections::HashMap;
 
@@ -14,7 +15,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::shared::core::types::{DbSchema, K8sService, Package};
+use crate::shared::core::types::{DbSchema, InfraAsCode, K8sService, Package};
 use crate::shared::tui::{
     popup::render_popup,
     types::{Focus, Popup, SidebarItem},
@@ -53,6 +54,7 @@ pub fn draw(
     services:              &[K8sService],
     packages:              &[Package],
     db_schemas:            &[DbSchema],
+    iac:                   &InfraAsCode,
     sidebar_item:          &SidebarItem,
     logs:                  &HashMap<String, Vec<String>>,
     db_logs:               Option<&[String]>,
@@ -71,7 +73,7 @@ pub fn draw(
     db_last_max_scroll:    &mut usize,
     scroll_offset_out:     &mut usize,
     sidebar_scroll_out:    &mut usize,
-    log_max_scroll_out:    &mut usize,  // ← always written; covers both service and db panels
+    log_max_scroll_out:    &mut usize,
 ) {
     let area = f.size();
 
@@ -86,7 +88,7 @@ pub fn draw(
         .split(root[0]);
 
     // ── Sidebar ───────────────────────────────────────────────────────────────
-    let sidebar_scroll = sidebar::draw(f, chunks[0], services, packages, db_schemas, sidebar_item, focus);
+    let sidebar_scroll = sidebar::draw(f, chunks[0], services, packages, db_schemas, iac, sidebar_item, focus);
     *sidebar_scroll_out = sidebar_scroll;
 
     // ── Right panel ───────────────────────────────────────────────────────────
@@ -100,13 +102,16 @@ pub fn draw(
     } else { false };
 
     // Clear the entire right panel before rendering so no characters from a
-    // previously selected service bleed through (e.g. after switching items
-    // while scrolled, or when the new content is shorter than the old).
+    // previously selected service bleed through.
     f.render_widget(ratatui::widgets::Clear, chunks[1]);
 
     match sidebar_item {
         SidebarItem::Package(i) => {
             package::draw(f, chunks[1], packages.get(*i), focus);
+        }
+
+        SidebarItem::InfraAsCode => {
+            iac::draw(f, chunks[1], iac, focus);
         }
 
         SidebarItem::DbSchema(i) => {
@@ -123,7 +128,6 @@ pub fn draw(
         SidebarItem::Service(svc_idx) => {
             let selected = services.get(*svc_idx);
 
-            // Calculate scroll before drawing
             if let Some(svc) = selected {
                 let log_text  = logs.get(&svc.meta_name).map(|l| l.join("\n")).unwrap_or_default();
                 let max_scroll = log_text.lines().count()
@@ -159,7 +163,7 @@ pub fn draw(
         || (matches!(sidebar_item, SidebarItem::DbSchema(_)) && db_containers.len() > 1);
 
     help_bar::draw(f, root[1], focus, sidebar_item, has_deployment, has_lang,
-                   is_ejected_now, help_multi, can_shell);
+                   is_ejected_now, help_multi, can_shell, iac);
 
     // ── Popup overlay ─────────────────────────────────────────────────────────
     if let Some(p) = popup { render_popup(f, p, area); }

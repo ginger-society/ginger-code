@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio_util::sync::CancellationToken;
 
-use crate::shared::core::types::{DbSchema, K8sService, Package};
+use crate::shared::core::types::{DbSchema, InfraAsCode, K8sService, Package};
 use super::{
     background::{
         TuiMsg, spawn_container_fetch, spawn_db_container_fetch,
@@ -28,6 +28,10 @@ pub enum Action {
     Uneject { deployment: String },
     Mount   { org: String, id: String, lang: String },
     Unmount { org: String, id: String },
+    /// Mount the IAC repo: slug = "{org_id}-iac", lang = "dev-iac"
+    MountIac   { org: String },
+    /// Unmount the IAC repo
+    UnmountIac { org: String },
     Quit,
 }
 
@@ -40,9 +44,10 @@ pub fn handle_key(
     services_snap:   &[K8sService],
     packages_snap:   &[Package],
     db_schemas_snap: &[DbSchema],
+    iac_snap:        &InfraAsCode,
 ) -> Action {
     if state.popup.is_some() {
-        return handle_popup_key(key, state, services_snap, packages_snap);
+        return handle_popup_key(key, state, services_snap, packages_snap, iac_snap);
     }
 
     let can_shell = state.focus == Focus::Logs
@@ -144,21 +149,31 @@ pub fn handle_key(
 
         // ── Mount / unmount ───────────────────────────────────────────────────
         KeyCode::Char('m') => {
-            if let SidebarItem::Package(pkg_i) = state.sidebar_item {
-                if let Some(pkg) = packages_snap.get(pkg_i) {
+            match state.sidebar_item {
+                SidebarItem::Package(pkg_i) => {
+                    if let Some(pkg) = packages_snap.get(pkg_i) {
+                        state.popup = Some(Popup {
+                            service_name: pkg.identifier.clone(),
+                            action: if pkg.mounted { PopupAction::Unmount } else { PopupAction::Mount },
+                            selected: 0,
+                        });
+                    }
+                }
+                SidebarItem::InfraAsCode => {
                     state.popup = Some(Popup {
-                        service_name: pkg.identifier.clone(),
-                        action: if pkg.mounted { PopupAction::Unmount } else { PopupAction::Mount },
+                        service_name: iac_snap.slug(),
+                        action: if iac_snap.mounted { PopupAction::Unmount } else { PopupAction::Mount },
                         selected: 0,
                     });
                 }
+                _ => {}
             }
             Action::Continue
         }
 
         // ── VS Code ───────────────────────────────────────────────────────────
         KeyCode::Char('c') => {
-            if let Some(uri) = vscode_uri(&state.sidebar_item, services_snap, packages_snap) {
+            if let Some(uri) = vscode_uri(&state.sidebar_item, services_snap, packages_snap, iac_snap) {
                 Action::OpenVsCode(uri)
             } else {
                 Action::Continue
@@ -210,6 +225,7 @@ fn handle_popup_key(
     state:         &mut TuiState,
     services_snap: &[K8sService],
     packages_snap: &[Package],
+    iac_snap:      &InfraAsCode,
 ) -> Action {
     let popup = match state.popup.as_mut() {
         Some(p) => p,
@@ -240,7 +256,7 @@ fn handle_popup_key(
                 Some(p) => p.action,
                 None    => return Action::Continue,
             };
-            confirm_popup_action(action, state, services_snap, packages_snap)
+            confirm_popup_action(action, state, services_snap, packages_snap, iac_snap)
         }
         _ => Action::Continue,
     }
@@ -251,6 +267,7 @@ fn confirm_popup_action(
     state:         &mut TuiState,
     services_snap: &[K8sService],
     packages_snap: &[Package],
+    iac_snap:      &InfraAsCode,
 ) -> Action {
     match action {
         PopupAction::Quit         => Action::Quit,
@@ -277,26 +294,42 @@ fn confirm_popup_action(
         }
 
         PopupAction::Mount => {
-            if let SidebarItem::Package(pkg_i) = state.sidebar_item {
-                if let Some(pkg) = packages_snap.get(pkg_i) {
-                    return Action::Mount {
-                        org:  pkg.organization_id.clone(),
-                        id:   pkg.identifier.clone(),
-                        lang: pkg.lang.clone(),
+            match state.sidebar_item {
+                SidebarItem::Package(pkg_i) => {
+                    if let Some(pkg) = packages_snap.get(pkg_i) {
+                        return Action::Mount {
+                            org:  pkg.organization_id.clone(),
+                            id:   pkg.identifier.clone(),
+                            lang: pkg.lang.clone(),
+                        };
+                    }
+                }
+                SidebarItem::InfraAsCode => {
+                    return Action::MountIac {
+                        org: iac_snap.organization_id.clone(),
                     };
                 }
+                _ => {}
             }
             Action::Continue
         }
 
         PopupAction::Unmount => {
-            if let SidebarItem::Package(pkg_i) = state.sidebar_item {
-                if let Some(pkg) = packages_snap.get(pkg_i) {
-                    return Action::Unmount {
-                        org: pkg.organization_id.clone(),
-                        id:  pkg.identifier.clone(),
+            match state.sidebar_item {
+                SidebarItem::Package(pkg_i) => {
+                    if let Some(pkg) = packages_snap.get(pkg_i) {
+                        return Action::Unmount {
+                            org: pkg.organization_id.clone(),
+                            id:  pkg.identifier.clone(),
+                        };
+                    }
+                }
+                SidebarItem::InfraAsCode => {
+                    return Action::UnmountIac {
+                        org: iac_snap.organization_id.clone(),
                     };
                 }
+                _ => {}
             }
             Action::Continue
         }
@@ -331,7 +364,7 @@ fn on_sidebar_move(
             state.scroll_offset  = 0;
             state.log_max_scroll = 0;
         }
-        SidebarItem::Package(_) => {}
+        SidebarItem::Package(_) | SidebarItem::InfraAsCode => {}
     }
 }
 
@@ -382,7 +415,7 @@ fn shift_container(
                 state.log_max_scroll = 0;
             }
         }
-        SidebarItem::Package(_) => {}
+        SidebarItem::Package(_) | SidebarItem::InfraAsCode => {}
     }
 }
 
@@ -392,6 +425,7 @@ fn vscode_uri(
     sidebar_item:  &SidebarItem,
     services_snap: &[K8sService],
     packages_snap: &[Package],
+    iac_snap:      &InfraAsCode,
 ) -> Option<String> {
     match sidebar_item {
         SidebarItem::Package(i) => {
@@ -406,6 +440,14 @@ fn vscode_uri(
             let dep = svc.deployment_name.as_ref()?;
             Some(format!("vscode-remote://ssh-remote+{}-local/workspace/{}-{}",
                 dep, svc.organization_id, dep))
+        }
+        SidebarItem::InfraAsCode => {
+            if !iac_snap.mounted { return None; }
+            let slug = iac_snap.slug();
+            Some(format!(
+                "vscode-remote://ssh-remote+iac-local/workspace/{}-iac",
+                iac_snap.organization_id,
+            ))
         }
         SidebarItem::DbSchema(_) => None,
     }
@@ -430,36 +472,44 @@ fn is_deployed_non_ejected(state: &TuiState, services_snap: &[K8sService]) -> bo
 }
 
 // ── Sidebar prev/next (pure, no side-effects) ─────────────────────────────────
+//
+// Layout (flat indices):
+//   0 .. sc-1                        → Service(i)
+//   sc .. sc+pc-1                    → Package(i)   (if any; no header slot)
+//   sc+pc .. sc+pc+dc-1              → DbSchema(i)  (if any)
+//   sc+pc+dc                         → InfraAsCode  (always present, single slot)
 
 fn sidebar_total(s: &[K8sService], p: &[Package], d: &[DbSchema]) -> usize {
-    s.len() + p.len() + d.len()
+    s.len() + p.len() + d.len() + 1 // +1 for InfraAsCode
 }
 
-fn sidebar_flat(item: &SidebarItem, sc: usize, pc: usize) -> usize {
+fn sidebar_flat(item: &SidebarItem, sc: usize, pc: usize, dc: usize) -> usize {
     match item {
         SidebarItem::Service(i)  => *i,
         SidebarItem::Package(i)  => sc + i,
         SidebarItem::DbSchema(i) => sc + pc + i,
+        SidebarItem::InfraAsCode => sc + pc + dc,
     }
 }
 
-fn sidebar_from_flat(flat: usize, sc: usize, pc: usize) -> SidebarItem {
-    if flat < sc           { SidebarItem::Service(flat) }
-    else if flat < sc + pc { SidebarItem::Package(flat - sc) }
-    else                   { SidebarItem::DbSchema(flat - sc - pc) }
+fn sidebar_from_flat(flat: usize, sc: usize, pc: usize, dc: usize) -> SidebarItem {
+    if flat < sc              { SidebarItem::Service(flat) }
+    else if flat < sc + pc    { SidebarItem::Package(flat - sc) }
+    else if flat < sc + pc + dc { SidebarItem::DbSchema(flat - sc - pc) }
+    else                      { SidebarItem::InfraAsCode }
 }
 
 pub fn sidebar_next(cur: &SidebarItem, s: &[K8sService], p: &[Package], d: &[DbSchema]) -> SidebarItem {
     let total = sidebar_total(s, p, d);
     if total == 0 { return cur.clone(); }
-    let flat  = sidebar_flat(cur, s.len(), p.len());
-    sidebar_from_flat((flat + 1).min(total - 1), s.len(), p.len())
+    let flat  = sidebar_flat(cur, s.len(), p.len(), d.len());
+    sidebar_from_flat((flat + 1).min(total - 1), s.len(), p.len(), d.len())
 }
 
 pub fn sidebar_prev(cur: &SidebarItem, s: &[K8sService], p: &[Package], d: &[DbSchema]) -> SidebarItem {
     if sidebar_total(s, p, d) == 0 { return cur.clone(); }
-    let flat = sidebar_flat(cur, s.len(), p.len());
-    sidebar_from_flat(flat.saturating_sub(1), s.len(), p.len())
+    let flat = sidebar_flat(cur, s.len(), p.len(), d.len());
+    sidebar_from_flat(flat.saturating_sub(1), s.len(), p.len(), d.len())
 }
 
 // ── Log / container switch helpers ───────────────────────────────────────────

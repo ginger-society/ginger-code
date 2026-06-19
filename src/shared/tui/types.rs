@@ -4,6 +4,8 @@ pub enum SidebarItem {
     Service(usize),
     Package(usize),
     DbSchema(usize),
+    /// The single Infra-as-Code entry (no index — there is always exactly one).
+    InfraAsCode,
 }
 
 /// Which panel has keyboard focus — sidebar or the right-hand logs/detail pane.

@@ -26,9 +26,9 @@ use MetadataService::apis::configuration::Configuration as MetadataConfiguration
 
 use crate::shared::core::{
     eject::{eject, uneject},
-    k8_info::is_ejected,
+    k8_info::{is_ejected, is_mounted},
     mount::{mount, unmount},
-    types::{DbSchema, K8sService, Package},
+    types::{DbSchema, InfraAsCode, K8sService, Package},
 };
 use crate::shared::core::data_source::{self, fetch_current_workspace};
 use crate::shared::tui::kubernetes::shell_into_pod;
@@ -37,6 +37,12 @@ use background::{TuiMsg, spawn_deployment_watcher, spawn_service_log_stream, spa
 use input::{Action, handle_key, maybe_start_db_stream, switch_service_logs};
 use state::TuiState;
 use types::SidebarItem;
+
+// ── IAC mount slug helper ─────────────────────────────────────────────────────
+
+fn iac_slug(org_id: &str) -> String {
+    format!("{}-iac", org_id)
+}
 
 pub async fn fetch_metadata_and_process(
     metadata_config: &MetadataConfiguration,
@@ -68,7 +74,14 @@ pub async fn fetch_metadata_and_process(
         Err(e)      => { eprintln!("Warning: DB schema fetch failed: {e:?}"); vec![] }
     };
 
-    if let Err(e) = run_tui(initial_services, packages, initial_db_schemas, session_user).await {
+    // Check whether the IAC dev container is currently mounted.
+    let iac_mounted  = is_mounted("iac").await;
+    let iac = InfraAsCode {
+        organization_id: org_id.clone(),
+        mounted:         iac_mounted,
+    };
+
+    if let Err(e) = run_tui(initial_services, packages, initial_db_schemas, iac, session_user).await {
         eprintln!("TUI error: {}", e);
         exit(1);
     }
@@ -78,6 +91,7 @@ async fn run_tui(
     initial_services:   Vec<K8sService>,
     initial_packages:   Vec<Package>,
     initial_db_schemas: Vec<DbSchema>,
+    initial_iac:        InfraAsCode,
     _session_user:      &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
@@ -86,7 +100,7 @@ async fn run_tui(
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut state = TuiState::new(initial_services, initial_packages, initial_db_schemas);
+    let mut state = TuiState::new(initial_services, initial_packages, initial_db_schemas, initial_iac);
     let (bg_tx, bg_rx) = std::sync::mpsc::channel::<TuiMsg>();
 
     spawn_deployment_watcher(state.services.clone());
@@ -96,7 +110,6 @@ async fn run_tui(
         if let Some(svc) = svcs.first() {
             if let Some(ref dep) = svc.deployment_name {
                 state.svc_log_generation += 1;
-                // FIX 1: pass cancel token
                 spawn_service_log_stream(
                     bg_tx.clone(), dep.clone(), None,
                     state.svc_log_generation, state.svc_cancel.clone(),
@@ -112,6 +125,7 @@ async fn run_tui(
         let services_snap   = state.services.lock().unwrap().clone();
         let packages_snap   = state.packages.lock().unwrap().clone();
         let db_schemas_snap = state.db_schemas.lock().unwrap().clone();
+        let iac_snap        = state.iac.lock().unwrap().clone();
         let logs_snap       = state.logs.lock().unwrap().clone();
         let db_logs_snap    = state.db_logs.lock().unwrap().clone();
 
@@ -144,7 +158,7 @@ async fn run_tui(
         terminal.draw(|f| {
             panels::draw(
                 f,
-                &services_snap, &packages_snap, &db_schemas_snap,
+                &services_snap, &packages_snap, &db_schemas_snap, &iac_snap,
                 &state.sidebar_item, &logs_snap, db_logs_opt,
                 &state.focus,
                 state.auto_scroll, state.scroll_offset,
@@ -169,7 +183,7 @@ async fn run_tui(
             Event::Key(key) => {
                 let action = handle_key(
                     key, &mut state, &bg_tx,
-                    &services_snap, &packages_snap, &db_schemas_snap,
+                    &services_snap, &packages_snap, &db_schemas_snap, &iac_snap,
                 );
                 match action {
                     Action::Continue => {}
@@ -242,6 +256,35 @@ async fn run_tui(
                         sleep(Duration::from_secs(1)).await;
                         enter_tui(&mut terminal)?;
                     }
+
+                    // ── IAC mount ─────────────────────────────────────────────
+                    Action::MountIac { org } => {
+                        leave_tui(&mut terminal)?;
+                        let slug = iac_slug(&org);
+                        match mount(&org, "iac", "iac").await {
+                            Ok(()) => {
+                                state.iac.lock().unwrap().mounted = true;
+                                println!("✓ Mounted IAC dev container ({slug})");
+                            }
+                            Err(e) => eprintln!("✗ IAC mount failed: {e}"),
+                        }
+                        sleep(Duration::from_secs(1)).await;
+                        enter_tui(&mut terminal)?;
+                    }
+
+                    // ── IAC unmount ───────────────────────────────────────────
+                    Action::UnmountIac { org } => {
+                        leave_tui(&mut terminal)?;
+                        match unmount(&org, "iac").await {
+                            Ok(()) => {
+                                state.iac.lock().unwrap().mounted = false;
+                                println!("✓ Unmounted IAC dev container");
+                            }
+                            Err(e) => eprintln!("✗ IAC unmount failed: {e}"),
+                        }
+                        sleep(Duration::from_secs(1)).await;
+                        enter_tui(&mut terminal)?;
+                    }
                 }
             }
             _ => {}
@@ -303,7 +346,6 @@ fn drain_background_messages(
 
                     if let Some(idx) = target_idx {
                         let svcs_snap = state.services.lock().unwrap().clone();
-                        // FIX 2: pass cancel token
                         select_container(
                             svc_idx, idx, &svcs_snap[svc_idx..=svc_idx],
                             &mut state.container_selection,
@@ -325,7 +367,6 @@ fn drain_background_messages(
                     state.db_containers = containers.clone();
                     if let Some(first) = containers.first().cloned() {
                         state.db_selected_container = Some(first.clone());
-                        // FIX 3: cancel old stream, pass new cancel token
                         state.db_cancel.cancel();
                         state.db_cancel = tokio_util::sync::CancellationToken::new();
                         state.db_log_generation += 1;

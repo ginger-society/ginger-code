@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::shared::core::types::{DbSchema, K8sService, Package};
+use crate::shared::core::types::{DbSchema, InfraAsCode, K8sService, Package};
 use super::types::{Focus, Popup, SidebarItem};
 
 pub struct TuiState {
@@ -13,6 +13,8 @@ pub struct TuiState {
     pub services:   Arc<Mutex<Vec<K8sService>>>,
     pub packages:   Arc<Mutex<Vec<Package>>>,
     pub db_schemas: Arc<Mutex<Vec<DbSchema>>>,
+    /// Single IAC entry for this workspace. Always present after init.
+    pub iac:        Arc<Mutex<InfraAsCode>>,
 
     // ── Log buffers ───────────────────────────────────────────────────────────
     pub logs:    Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -50,11 +52,13 @@ impl TuiState {
         services:   Vec<K8sService>,
         packages:   Vec<Package>,
         db_schemas: Vec<DbSchema>,
+        iac:        InfraAsCode,
     ) -> Self {
         Self {
             services:   Arc::new(Mutex::new(services)),
             packages:   Arc::new(Mutex::new(packages)),
             db_schemas: Arc::new(Mutex::new(db_schemas)),
+            iac:        Arc::new(Mutex::new(iac)),
             logs:    Arc::new(Mutex::new(HashMap::new())),
             db_logs: Arc::new(Mutex::new(None)),
             svc_log_generation: 0,

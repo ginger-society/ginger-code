@@ -55,6 +55,8 @@ schemars = { version = "1" }
 futures = "0.3"
 ginger-gitter = { path = "./ginger-gitter_client" }
 lazy_static = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata]
 organization = "ginger-society"

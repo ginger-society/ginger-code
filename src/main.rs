@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,15 +16,167 @@ use kube::api::ListParams;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod tray;
 mod shared;
+
+// ── Logging ────────────────────────────────────────────────────────────────────
+//
+// Replaces println!/eprintln! with `tracing`, writing exclusively to
+// ~/.ginger-society/logs/ginger-code.log — never to stdout/stderr — since the
+// tray-launched binary has no controlling terminal to write to anyway, and a
+// single stable file path means there's always exactly one place to look,
+// whether ginger-code was launched from the tray icon, `--daemon`, or a
+// terminal during development.
+//
+// The file is capped at LOG_MAX_BYTES. Once exceeded, oldest *lines* are
+// dropped (never a mid-line cut) so the file stays a valid, readable log of
+// the most recent activity rather than growing forever.
+
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024; // 5MB
+// Only run the (more expensive) trim pass once the file has grown this much
+// past the cap, so we're not re-scanning the file on every single log line.
+const LOG_TRIM_SLACK_BYTES: u64 = 256 * 1024; // 256KB
+
+fn log_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home)
+        .join(".ginger-society")
+        .join("logs")
+        .join("ginger-code.log")
+}
+
+/// A `Write` impl that appends to a fixed log file path and periodically
+/// trims it from the front (oldest lines first) once it grows past
+/// `max_bytes + LOG_TRIM_SLACK_BYTES`, so the file never grows unbounded but
+/// also isn't rewritten on every single write.
+struct CappedFileWriter {
+    path:      PathBuf,
+    max_bytes: u64,
+}
+
+impl CappedFileWriter {
+    fn new(path: PathBuf, max_bytes: u64) -> Self {
+        if let Some(parent) = path.parent() {
+            // Best-effort — if this fails, the subsequent file open will
+            // surface the real error.
+            let _ = fs::create_dir_all(parent);
+        }
+        Self { path, max_bytes }
+    }
+
+    fn open_append(&self) -> std::io::Result<File> {
+        OpenOptions::new().create(true).append(true).open(&self.path)
+    }
+
+    /// Drops oldest lines until the file is back under `max_bytes`. Reads the
+    /// whole file into memory — fine at a few MB, which is the entire point
+    /// of capping it at 5MB in the first place.
+    fn trim(&self) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let len = file.metadata()?.len();
+        if len <= self.max_bytes {
+            return Ok(());
+        }
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        // Drop oldest lines (from the start) until we're under the cap.
+        // Walk forward summing line byte-lengths so we cut on a line
+        // boundary, never mid-line.
+        let target = self.max_bytes as usize;
+        let bytes  = contents.as_bytes();
+
+        if bytes.len() <= target {
+            return Ok(());
+        }
+
+        // Find the earliest newline at or after (bytes.len() - target), so
+        // everything kept is a suffix starting right after a '\n'.
+        let cut_from = bytes.len() - target;
+        let keep_from = match contents[cut_from..].find('\n') {
+            Some(rel_idx) => cut_from + rel_idx + 1,
+            None => cut_from, // no newline found in the tail; fall back as-is
+        };
+
+        let trimmed = &contents[keep_from..];
+
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(trimmed.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+impl Write for CappedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self.open_append()?;
+        let written = file.write(buf)?;
+
+        // Cheap check on every write; only do the expensive trim pass once
+        // we've actually grown past cap + slack.
+        if let Ok(meta) = file.metadata() {
+            if meta.len() > self.max_bytes + LOG_TRIM_SLACK_BYTES {
+                drop(file);
+                let _ = self.trim();
+            }
+        }
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `tracing_subscriber` needs a `MakeWriter`, which means a type that can
+/// produce a fresh `Write` instance per log event. `CappedFileWriter` is
+/// cheap to construct (just a path + a size cap, no open handle held across
+/// calls), so we just clone its (small, Clone) config per call.
+#[derive(Clone)]
+struct CappedFileWriterFactory {
+    path:      PathBuf,
+    max_bytes: u64,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CappedFileWriterFactory {
+    type Writer = CappedFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CappedFileWriter::new(self.path.clone(), self.max_bytes)
+    }
+}
+
+fn init_logging() {
+    let factory = CappedFileWriterFactory {
+        path:      log_path(),
+        max_bytes: LOG_MAX_BYTES,
+    };
+
+    // RUST_LOG can still override verbosity (e.g. RUST_LOG=debug) for
+    // development; defaults to "info" so routine operational messages
+    // (forward status changes, branch switches, hook runs) are always
+    // captured without being noisy with trace-level kube-rs internals.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(factory)
+        .with_ansi(false) // no color codes in a file you might `cat`/grep
+        .with_target(false)
+        .init();
+}
 
 // ── Shared kube client ────────────────────────────────────────────────────────
 
 pub type SharedClient = Arc<tokio::sync::Mutex<Client>>;
 pub type HookCooldown = Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>;
-
 
 const AUTH_HOOK_COOLDOWN: Duration = Duration::from_secs(180);
 
@@ -55,17 +207,14 @@ async fn run_auth_refresh_hook(cooldown: &HookCooldown) {
             .unwrap_or(false);
 
         if !executable {
-            eprintln!(
-                "[ginger-code] hook '{}' exists but is not executable — skipping (chmod +x it to enable)",
-                hook.display()
+            warn!(
+                path = %hook.display(),
+                "hook exists but is not executable — skipping (chmod +x it to enable)"
             );
             return;
         }
     }
 
-    // Decide under the lock whether we're the one running it, and if so,
-    // stamp "now" immediately so concurrent callers see a fresh cooldown
-    // even before the hook process actually finishes.
     {
         let mut last_run = cooldown.lock().await;
         let should_run = match *last_run {
@@ -74,10 +223,10 @@ async fn run_auth_refresh_hook(cooldown: &HookCooldown) {
         };
 
         if !should_run {
-            println!(
-                "[ginger-code] auth-refresh hook skipped — ran {:.0}s ago, within {}s cooldown",
-                last_run.unwrap().elapsed().as_secs_f64(),
-                AUTH_HOOK_COOLDOWN.as_secs()
+            info!(
+                seconds_ago = last_run.unwrap().elapsed().as_secs_f64(),
+                cooldown_secs = AUTH_HOOK_COOLDOWN.as_secs(),
+                "auth-refresh hook skipped — within cooldown"
             );
             return;
         }
@@ -85,32 +234,32 @@ async fn run_auth_refresh_hook(cooldown: &HookCooldown) {
         *last_run = Some(tokio::time::Instant::now());
     }
 
-    println!("[ginger-code] running auth-refresh hook: {}", hook.display());
+    info!(path = %hook.display(), "running auth-refresh hook");
 
     let run = tokio::process::Command::new(&hook).output();
 
     match tokio::time::timeout(Duration::from_secs(30), run).await {
         Ok(Ok(output)) => {
             if !output.stdout.is_empty() {
-                print!("[ginger-code] hook stdout: {}", String::from_utf8_lossy(&output.stdout));
+                info!(stdout = %String::from_utf8_lossy(&output.stdout), "hook stdout");
             }
             if !output.stderr.is_empty() {
-                eprint!("[ginger-code] hook stderr: {}", String::from_utf8_lossy(&output.stderr));
+                warn!(stderr = %String::from_utf8_lossy(&output.stderr), "hook stderr");
             }
             if output.status.success() {
-                println!("[ginger-code] auth-refresh hook completed successfully");
+                info!("auth-refresh hook completed successfully");
             } else {
-                eprintln!(
-                    "[ginger-code] auth-refresh hook exited with status {:?} — continuing with kubeconfig reload anyway",
-                    output.status.code()
+                warn!(
+                    code = ?output.status.code(),
+                    "auth-refresh hook exited non-zero — continuing with kubeconfig reload anyway"
                 );
             }
         }
         Ok(Err(e)) => {
-            eprintln!("[ginger-code] failed to spawn auth-refresh hook: {e}");
+            error!(error = %e, "failed to spawn auth-refresh hook");
         }
         Err(_) => {
-            eprintln!("[ginger-code] auth-refresh hook timed out after 30s — continuing");
+            warn!("auth-refresh hook timed out after 30s — continuing");
         }
     }
 }
@@ -303,9 +452,11 @@ async fn run_forward(
         match TcpListener::bind(("127.0.0.1", entry.forwarding_port)).await {
             Ok(l) => break l,
             Err(e) => {
-                eprintln!(
-                    "[ginger-code] cannot bind :{} for '{}': {e} — retrying in 3s",
-                    entry.forwarding_port, name
+                warn!(
+                    port = entry.forwarding_port,
+                    deployment = %name,
+                    error = %e,
+                    "cannot bind port — retrying in 3s"
                 );
                 tokio::select! {
                     _ = token.cancelled() => return,
@@ -315,16 +466,18 @@ async fn run_forward(
         }
     };
 
-    println!(
-        "[ginger-code] listening on :{} → {}:{}",
-        entry.forwarding_port, name, entry.deployment_port
+    info!(
+        port = entry.forwarding_port,
+        deployment = %name,
+        deployment_port = entry.deployment_port,
+        "listening"
     );
 
     let mut attempt: u32 = 0;
 
     loop {
         if token.is_cancelled() {
-            println!("[ginger-code] stopping forward for '{}'", name);
+            info!(deployment = %name, "stopping forward");
             return;
         }
 
@@ -352,10 +505,7 @@ async fn run_forward(
             // ── 401: reload kubeconfig and retry without counting the attempt ──
             Err(ResolveError::Unauthorized) => {
                 run_auth_refresh_hook(&hook_cooldown).await;
-                eprintln!(
-                    "[ginger-code] 401 Unauthorized for '{}' — reloading kubeconfig",
-                    name
-                );
+                warn!(deployment = %name, "401 Unauthorized — reloading kubeconfig");
                 update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
 
                 // Brief pause before reloading so we don't hammer the API.
@@ -367,10 +517,10 @@ async fn run_forward(
                 match fresh_client().await {
                     Ok(new_client) => {
                         *shared_client.lock().await = new_client;
-                        println!("[ginger-code] kubeconfig reloaded for '{}'", name);
+                        info!(deployment = %name, "kubeconfig reloaded");
                     }
                     Err(e) => {
-                        eprintln!("[ginger-code] kubeconfig reload failed for '{}': {e}", name);
+                        error!(deployment = %name, error = %e, "kubeconfig reload failed");
                         // Wait with backoff before retrying the reload.
                         tokio::select! {
                             _ = token.cancelled() => return,
@@ -385,7 +535,7 @@ async fn run_forward(
             }
 
             Err(ResolveError::Other(e)) => {
-                eprintln!("[ginger-code] resolve pod for '{}': {e}", name);
+                warn!(deployment = %name, error = %e, "resolve pod failed");
                 update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
                 attempt += 1;
                 tokio::select! {
@@ -396,7 +546,7 @@ async fn run_forward(
             }
         };
 
-        println!("[ginger-code] '{}' resolved to pod '{}'", name, pod_name);
+        info!(deployment = %name, pod = %pod_name, "resolved pod");
         update_status(&state_map, &name, ForwardStatus::Connected);
 
         // Grab a fresh portforward-capable client snapshot for this pod session.
@@ -408,7 +558,7 @@ async fn run_forward(
         'accept: loop {
             tokio::select! {
                 _ = token.cancelled() => {
-                    println!("[ginger-code] stopping forward for '{}'", name);
+                    info!(deployment = %name, "stopping forward");
                     return;
                 }
 
@@ -426,7 +576,7 @@ async fn run_forward(
                     let (tcp, peer) = match accept_result {
                         Ok(v)  => v,
                         Err(e) => {
-                            eprintln!("[ginger-code] accept error on '{}': {e}", name);
+                            warn!(deployment = %name, error = %e, "accept error");
                             break 'accept;
                         }
                     };
@@ -437,9 +587,11 @@ async fn run_forward(
                     {
                         Ok(pf) => pf,
                         Err(e) => {
-                            eprintln!(
-                                "[ginger-code] portforward failed for '{}' (pod '{}'): {e}",
-                                name, pod_name
+                            warn!(
+                                deployment = %name,
+                                pod = %pod_name,
+                                error = %e,
+                                "portforward failed"
                             );
                             update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
                             break 'accept;
@@ -449,15 +601,16 @@ async fn run_forward(
                     let stream = match pf.take_stream(entry.deployment_port) {
                         Some(s) => s,
                         None => {
-                            eprintln!(
-                                "[ginger-code] take_stream returned None for '{}' port {}",
-                                name, entry.deployment_port
+                            warn!(
+                                deployment = %name,
+                                port = entry.deployment_port,
+                                "take_stream returned None"
                             );
                             break 'accept;
                         }
                     };
 
-                    println!("[ginger-code] '{}' ← new connection from {}", name, peer);
+                    info!(deployment = %name, peer = %peer, "new connection");
 
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) {
@@ -476,18 +629,18 @@ async fn run_forward(
                         tokio::select! {
                             r = client_to_pod => {
                                 if let Err(e) = r {
-                                    eprintln!("[ginger-code] '{}' client→pod: {e}", name_clone);
+                                    warn!(deployment = %name_clone, error = %e, "client→pod copy error");
                                 }
                             }
                             r = pod_to_client => {
                                 if let Err(e) = r {
-                                    eprintln!("[ginger-code] '{}' pod→client: {e}", name_clone);
+                                    warn!(deployment = %name_clone, error = %e, "pod→client copy error");
                                 }
                             }
                         }
 
                         let _ = pf_w.shutdown().await;
-                        println!("[ginger-code] '{}' connection closed", name_clone);
+                        info!(deployment = %name_clone, "connection closed");
                     });
                 }
             }
@@ -513,7 +666,7 @@ fn update_status(state_map: &StateMap, name: &str, status: ForwardStatus) {
     if let Ok(mut map) = state_map.lock() {
         if let Some(fw) = map.get_mut(name) {
             if fw.status != status {
-                println!("[ginger-code] '{}' status → {:?}", name, status);
+                info!(deployment = name, status = ?status, "status changed");
                 fw.status = status;
             }
         }
@@ -560,7 +713,7 @@ pub async fn stop_all_forwards(state_map: &StateMap) {
         task.await.ok();
     }
     state_map.lock().unwrap().clear();
-    println!("[ginger-code] all forwards stopped");
+    info!("all forwards stopped");
 }
 
 // ── shutdown_all_threads kept for tray.rs compatibility ──────────────────────
@@ -572,7 +725,7 @@ pub fn shutdown_all_threads(state_map: &StateMap) {
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     state_map.lock().unwrap().clear();
-    println!("[ginger-code] all forwards stopped");
+    info!("all forwards stopped");
 }
 
 // ── Start forwards for a branch ───────────────────────────────────────────────
@@ -588,7 +741,7 @@ async fn start_branch_forwards(
     let entries = BranchConfig::load(cfg_path, branch).deployments;
 
     if entries.is_empty() {
-        println!("[ginger-code] no deployments in branch '{}'", branch);
+        info!(branch = branch, "no deployments in branch");
         return;
     }
 
@@ -603,13 +756,10 @@ async fn start_branch_forwards(
 
     let count = new_entries.len();
     for entry in new_entries {
-        start_forward(&entry, Arc::clone(shared_client), offline, state_map, &rt, hook_cooldown );
+        start_forward(&entry, Arc::clone(shared_client), offline, state_map, &rt, hook_cooldown);
     }
 
-    println!(
-        "[ginger-code] started {} forward(s) for branch '{}'",
-        count, branch
-    );
+    info!(branch = branch, count = count, "started forward(s)");
 }
 
 // ── Network monitor ───────────────────────────────────────────────────────────
@@ -630,7 +780,7 @@ async fn run_net_monitor(
         let online = has_network();
 
         if !was_online && online {
-            println!("[ginger-code] network restored");
+            info!("network restored");
             offline.store(false, Ordering::Relaxed);
             // NOTE: We intentionally do NOT reset statuses to Retrying here.
             // Forward tasks sitting in the 'accept loop will self-correct back
@@ -638,7 +788,7 @@ async fn run_net_monitor(
             // the local TCP listener never dropped. Resetting to Retrying here
             // was the root cause of the tray staying amber after reconnect.
         } else if was_online && !online {
-            println!("[ginger-code] network lost");
+            warn!("network lost");
             offline.store(true, Ordering::Relaxed);
             if let Ok(mut map) = state_map.lock() {
                 for fw in map.values_mut() {
@@ -693,17 +843,14 @@ async fn run_watcher(
 
         // ── Branch switched ───────────────────────────────────────────────────
         if cfg_changed && branch != last_branch {
-            println!(
-                "[ginger-code] branch changed: {:?} → {:?}",
-                last_branch, branch
-            );
+            info!(from = ?last_branch, to = ?branch, "branch changed");
 
             stop_all_forwards(&state_map).await;
 
             if let Ok(mut guard) = tray::GUI_CHILD.lock() {
                 if let Some(mut child) = guard.take() {
                     let _ = child.kill();
-                    println!("[ginger-code] GUI closed for branch switch");
+                    info!("GUI closed for branch switch");
                 }
             }
 
@@ -740,10 +887,10 @@ async fn run_watcher(
         };
 
         for (name, tok, task) in to_stop {
-            eprintln!("[ginger-code] removing '{}'", name);
+            info!(deployment = %name, "removing");
             tok.cancel();
             if let Some(t) = task { t.await.ok(); }
-            println!("[ginger-code] forward for '{}' stopped", name);
+            info!(deployment = %name, "forward stopped");
         }
 
         // Start new deployments
@@ -755,7 +902,7 @@ async fn run_watcher(
             for entry in &entries {
                 if existing.contains(&entry.deployment_name) { continue; }
                 start_forward(entry, Arc::clone(&shared_client), &offline, &state_map, &rt, &hook_cooldown);
-                println!("[ginger-code] registered '{}'", entry.deployment_name);
+                info!(deployment = %entry.deployment_name, "registered");
             }
         }
     }
@@ -845,7 +992,7 @@ fn dispatch(
                         forwarding_port,
                         organization_id,
                     };
-                    start_forward(&entry, Arc::clone(shared_client), offline, state_map, rt, &hook_cooldown);
+                    start_forward(&entry, Arc::clone(shared_client), offline, state_map, rt, hook_cooldown);
                 }
             }
 
@@ -938,11 +1085,11 @@ fn handle_client(
     shared_client: SharedClient,
     offline:       Arc<AtomicBool>,
     rt:            tokio::runtime::Handle,
-    hook_cooldown: &HookCooldown,
+    hook_cooldown: HookCooldown, // owned — this fn runs on its own spawned thread
 ) {
     let mut writer = match stream.try_clone() {
         Ok(s)  => s,
-        Err(e) => { eprintln!("[ginger-code] clone stream: {e}"); return; }
+        Err(e) => { error!(error = %e, "clone stream failed"); return; }
     };
     let reader = BufReader::new(stream);
 
@@ -976,16 +1123,17 @@ fn socket_path() -> PathBuf {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    init_logging();
+
     let args: Vec<String> = std::env::args().collect();
     let hook_cooldown: HookCooldown = Arc::new(tokio::sync::Mutex::new(None));
-
 
     if args.contains(&"--gui".to_string()) {
         shared::gui::run_gui().unwrap();
         return;
     }
 
-    println!("{:?}", args);
+    info!(args = ?args, "starting");
 
     let daemon_mode = args.contains(&"--daemon".to_string());
 
@@ -1006,6 +1154,7 @@ fn main() {
 
     let sock_path = socket_path();
     let cfg_path  = config_path();
+    info!(log_path = %log_path().display(), "logging to file");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1017,16 +1166,16 @@ fn main() {
     let offline:        Arc<AtomicBool>   = Arc::new(AtomicBool::new(!has_network()));
 
     let shared_client: SharedClient = rt.block_on(async {
-        let cfg_path  = cfg_path.clone();
-        let state_map = Arc::clone(&state_map);
-        let offline   = Arc::clone(&offline);
-        let tok       = shutdown_token.clone();
+        let cfg_path      = cfg_path.clone();
+        let state_map     = Arc::clone(&state_map);
+        let offline       = Arc::clone(&offline);
+        let tok           = shutdown_token.clone();
         let hook_cooldown = Arc::clone(&hook_cooldown);
 
         let client = match Client::try_default().await {
             Ok(c)  => c,
             Err(e) => {
-                eprintln!("[ginger-code] failed to build kube client: {e}");
+                error!(error = %e, "failed to build kube client");
                 panic!("cannot build kube client — is KUBECONFIG set?");
             }
         };
@@ -1037,12 +1186,12 @@ fn main() {
         let initial_branch = {
             let cfg = Config::load(&cfg_path);
             if let Some(ref branch) = cfg.active_branch {
-                println!("[ginger-code] active branch: '{}'", branch);
+                info!(branch = branch, "active branch");
                 start_branch_forwards(
-                    &cfg_path, branch, &shared_client, &state_map, &offline, &hook_cooldown
+                    &cfg_path, branch, &shared_client, &state_map, &offline, &hook_cooldown,
                 ).await;
             } else {
-                println!("[ginger-code] no active branch — run `ginger-code -b <branch>`");
+                info!("no active branch — run `ginger-code -b <branch>`");
             }
             cfg.active_branch.clone()
         };
@@ -1060,7 +1209,7 @@ fn main() {
             Arc::clone(&offline),
             tok.clone(),
             initial_branch,
-            hook_cooldown,
+            Arc::clone(&hook_cooldown),
         ));
 
         shared_client
@@ -1082,7 +1231,7 @@ fn main() {
             let listener = match UnixListener::bind(&sp) {
                 Ok(l)  => l,
                 Err(e) => {
-                    eprintln!("[ginger-code] socket bind failed: {e}");
+                    error!(error = %e, "socket bind failed");
                     return;
                 }
             };
@@ -1092,7 +1241,7 @@ fn main() {
                 fs::set_permissions(&sp, fs::Permissions::from_mode(0o600)).ok();
             }
 
-            println!("[ginger-code] socket listening on {}", sp.display());
+            info!(path = %sp.display(), "socket listening");
 
             for stream in listener.incoming() {
                 match stream {
@@ -1104,11 +1253,11 @@ fn main() {
                         let rt_handle     = rt_handle.clone();
                         let hook_cooldown = Arc::clone(&hook_cooldown);
                         std::thread::spawn(move || {
-                            handle_client(s, cp, sm, shared_client, offline, rt_handle, &hook_cooldown);
+                            handle_client(s, cp, sm, shared_client, offline, rt_handle, hook_cooldown);
                         });
                     }
                     Err(e) => {
-                        eprintln!("[ginger-code] accept error: {e}");
+                        error!(error = %e, "accept error");
                         break;
                     }
                 }
@@ -1116,15 +1265,15 @@ fn main() {
         });
     }
 
-    println!("{:?}", daemon_mode);
+    info!(daemon_mode = daemon_mode, "mode");
 
     // ── Tray or daemon ────────────────────────────────────────────────────────
     if daemon_mode {
-        println!("[ginger-code] running in daemon mode (no tray)");
+        info!("running in daemon mode (no tray)");
         rt.block_on(async {
             tokio::signal::ctrl_c().await.expect("set signal handler");
         });
-        println!("[ginger-code] signal received, shutting down...");
+        info!("signal received, shutting down...");
         shutdown_token.cancel();
     } else {
         let tray_shutdown = Arc::new(AtomicBool::new(false));
@@ -1150,8 +1299,8 @@ fn main() {
     }
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
-    println!("[ginger-code] shutting down...");
+    info!("shutting down...");
     rt.block_on(stop_all_forwards(&state_map));
     let _ = fs::remove_file(&sock_path);
-    println!("[ginger-code] bye");
+    info!("bye");
 }

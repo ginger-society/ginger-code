@@ -2428,6 +2428,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.7.8",
+ "tracing",
+ "tracing-subscriber",
  "tray-icon",
  "vte",
  "winit 0.30.9",

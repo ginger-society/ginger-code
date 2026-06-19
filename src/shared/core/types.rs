@@ -75,3 +75,24 @@ pub struct DbSchema {
     pub k8s_status:      String,
     pub k8s_ready:       String,
 }
+
+/// Represents the single Infra-as-Code repo entry in the TUI sidebar.
+///
+/// There is exactly one IAC entry per workspace.  It has no k8s deployment of
+/// its own — the user mounts it to get a dev container with `kubectl` available
+/// for debugging / testing.
+#[derive(Clone, Debug)]
+pub struct InfraAsCode {
+    /// The workspace / org identifier, e.g. "ginger-society".
+    /// Used to derive the mount slug: `{org_id}-iac`.
+    pub organization_id: String,
+    /// True when the dev container is currently mounted.
+    pub mounted:         bool,
+}
+
+impl InfraAsCode {
+    pub fn slug(&self) -> String {
+        // k8s deployment name — matches pkg_to_slug("iac")
+        "iac".to_string()
+    }
+}

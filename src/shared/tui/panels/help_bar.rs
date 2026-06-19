@@ -7,21 +7,23 @@ use ratatui::{
     Frame,
 };
 
+use crate::shared::core::types::InfraAsCode;
 use crate::shared::tui::types::{Focus, SidebarItem};
 
 pub fn draw(
-    f:              &mut Frame,
-    area:           Rect,
-    focus:          &Focus,
-    sidebar_item:   &SidebarItem,
-    has_deployment: bool,
-    has_lang:       bool,
-    ejected:        bool,
+    f:               &mut Frame,
+    area:            Rect,
+    focus:           &Focus,
+    sidebar_item:    &SidebarItem,
+    has_deployment:  bool,
+    has_lang:        bool,
+    ejected:         bool,
     multi_container: bool,
-    can_shell:      bool,
+    can_shell:       bool,
+    iac:             &InfraAsCode,
 ) {
     f.render_widget(
-        Paragraph::new(help_text(focus, sidebar_item, has_deployment, has_lang, ejected, multi_container, can_shell))
+        Paragraph::new(help_text(focus, sidebar_item, has_deployment, has_lang, ejected, multi_container, can_shell, iac))
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::TOP)),
         area,
@@ -36,6 +38,7 @@ pub fn help_text(
     ejected:         bool,
     multi_container: bool,
     can_shell:       bool,
+    iac:             &InfraAsCode,
 ) -> String {
     match focus {
         Focus::Sidebar => match sidebar_item {
@@ -54,6 +57,13 @@ pub fn help_text(
             }
             SidebarItem::DbSchema(_) => {
                 "↑/↓ navigate  |  → logs  |  ⇧←/⇧→ container  |  q quit".to_string()
+            }
+            SidebarItem::InfraAsCode => {
+                if iac.mounted {
+                    "↑/↓ navigate  |  m unmount  |  c VS Code  |  q quit".to_string()
+                } else {
+                    "↑/↓ navigate  |  m mount  |  q quit".to_string()
+                }
             }
         },
         Focus::Logs => {
