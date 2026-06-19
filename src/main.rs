@@ -20,6 +20,108 @@ use tokio_util::sync::CancellationToken;
 mod tray;
 mod shared;
 
+// ── Shared kube client ────────────────────────────────────────────────────────
+
+pub type SharedClient = Arc<tokio::sync::Mutex<Client>>;
+pub type HookCooldown = Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>;
+
+
+const AUTH_HOOK_COOLDOWN: Duration = Duration::from_secs(180);
+
+fn hooks_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".ginger-society").join("hooks")
+}
+
+/// Run ~/.ginger-society/hooks/k8-auth-refresh.sh if present and executable,
+/// before reloading the kubeconfig on a 401 — but at most once per
+/// AUTH_HOOK_COOLDOWN window, since many forwards can hit 401 at once when a
+/// shared credential expires and they all converge on the same fix. 3 minutes
+/// is on the high end deliberately: it's meant to comfortably outlast the time
+/// it takes every forward loop to notice the reloaded kubeconfig and recover,
+/// not to bound the hook's own runtime.
+async fn run_auth_refresh_hook(cooldown: &HookCooldown) {
+    let hook = hooks_path().join("k8-auth-refresh.sh");
+
+    if !hook.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = fs::metadata(&hook)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+
+        if !executable {
+            eprintln!(
+                "[ginger-code] hook '{}' exists but is not executable — skipping (chmod +x it to enable)",
+                hook.display()
+            );
+            return;
+        }
+    }
+
+    // Decide under the lock whether we're the one running it, and if so,
+    // stamp "now" immediately so concurrent callers see a fresh cooldown
+    // even before the hook process actually finishes.
+    {
+        let mut last_run = cooldown.lock().await;
+        let should_run = match *last_run {
+            None => true,
+            Some(t) => t.elapsed() >= AUTH_HOOK_COOLDOWN,
+        };
+
+        if !should_run {
+            println!(
+                "[ginger-code] auth-refresh hook skipped — ran {:.0}s ago, within {}s cooldown",
+                last_run.unwrap().elapsed().as_secs_f64(),
+                AUTH_HOOK_COOLDOWN.as_secs()
+            );
+            return;
+        }
+
+        *last_run = Some(tokio::time::Instant::now());
+    }
+
+    println!("[ginger-code] running auth-refresh hook: {}", hook.display());
+
+    let run = tokio::process::Command::new(&hook).output();
+
+    match tokio::time::timeout(Duration::from_secs(30), run).await {
+        Ok(Ok(output)) => {
+            if !output.stdout.is_empty() {
+                print!("[ginger-code] hook stdout: {}", String::from_utf8_lossy(&output.stdout));
+            }
+            if !output.stderr.is_empty() {
+                eprint!("[ginger-code] hook stderr: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            if output.status.success() {
+                println!("[ginger-code] auth-refresh hook completed successfully");
+            } else {
+                eprintln!(
+                    "[ginger-code] auth-refresh hook exited with status {:?} — continuing with kubeconfig reload anyway",
+                    output.status.code()
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("[ginger-code] failed to spawn auth-refresh hook: {e}");
+        }
+        Err(_) => {
+            eprintln!("[ginger-code] auth-refresh hook timed out after 30s — continuing");
+        }
+    }
+}
+
+/// Rebuild a kube Client from the latest kubeconfig on disk.
+async fn fresh_client() -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    let config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions::default())
+        .await?;
+    Ok(Client::try_from(config)?)
+}
+
 // ── Config (code.toml) ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -139,14 +241,38 @@ fn backoff(attempt: u32) -> Duration {
     }
 }
 
+// ── Resolve error ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum ResolveError {
+    Unauthorized,
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Unauthorized => write!(f, "Unauthorized (401)"),
+            ResolveError::Other(e)     => write!(f, "{}", e),
+        }
+    }
+}
+
 // ── Resolve running pod for a deployment ─────────────────────────────────────
 
 async fn resolve_pod(
     pods:            &Api<Pod>,
     deployment_name: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, ResolveError> {
     let lp   = ListParams::default().labels(&format!("app={}", deployment_name));
-    let list = pods.list(&lp).await?;
+    let list = pods.list(&lp).await.map_err(|e| {
+        if let kube::Error::Api(ref ae) = e {
+            if ae.code == 401 {
+                return ResolveError::Unauthorized;
+            }
+        }
+        ResolveError::Other(Box::new(e))
+    })?;
 
     list.items
         .into_iter()
@@ -156,20 +282,22 @@ async fn resolve_pod(
                 == Some("Running")
         })
         .and_then(|p| p.metadata.name)
-        .ok_or_else(|| format!("no running pod found for '{}'", deployment_name).into())
+        .ok_or_else(|| ResolveError::Other(
+            format!("no running pod found for '{}'", deployment_name).into()
+        ))
 }
 
 // ── Core forward loop ─────────────────────────────────────────────────────────
 
 async fn run_forward(
-    client:    Client,
-    entry:     DeploymentEntry,
-    token:     CancellationToken,
-    offline:   Arc<AtomicBool>,
-    state_map: StateMap,
+    shared_client: SharedClient,
+    entry:         DeploymentEntry,
+    token:         CancellationToken,
+    offline:       Arc<AtomicBool>,
+    state_map:     StateMap,
+    hook_cooldown: HookCooldown,
 ) {
     let name = entry.deployment_name.clone();
-    let pods: Api<Pod> = Api::default_namespaced(client.clone());
 
     let listener = loop {
         match TcpListener::bind(("127.0.0.1", entry.forwarding_port)).await {
@@ -209,12 +337,54 @@ async fn run_forward(
             continue;
         }
 
+        // Build an Api handle from the current (possibly refreshed) client.
+        let pods: Api<Pod> = {
+            let c = shared_client.lock().await;
+            Api::default_namespaced(c.clone())
+        };
+
         let pod_name = match resolve_pod(&pods, &name).await {
             Ok(p) => {
                 attempt = 0;
                 p
             }
-            Err(e) => {
+
+            // ── 401: reload kubeconfig and retry without counting the attempt ──
+            Err(ResolveError::Unauthorized) => {
+                run_auth_refresh_hook(&hook_cooldown).await;
+                eprintln!(
+                    "[ginger-code] 401 Unauthorized for '{}' — reloading kubeconfig",
+                    name
+                );
+                update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
+
+                // Brief pause before reloading so we don't hammer the API.
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+
+                match fresh_client().await {
+                    Ok(new_client) => {
+                        *shared_client.lock().await = new_client;
+                        println!("[ginger-code] kubeconfig reloaded for '{}'", name);
+                    }
+                    Err(e) => {
+                        eprintln!("[ginger-code] kubeconfig reload failed for '{}': {e}", name);
+                        // Wait with backoff before retrying the reload.
+                        tokio::select! {
+                            _ = token.cancelled() => return,
+                            _ = tokio::time::sleep(backoff(attempt)) => {}
+                        }
+                        attempt += 1;
+                    }
+                }
+                // Don't increment attempt on a pure 401 — the credential is
+                // transient, not a pod-resolve failure.
+                continue;
+            }
+
+            Err(ResolveError::Other(e)) => {
                 eprintln!("[ginger-code] resolve pod for '{}': {e}", name);
                 update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
                 attempt += 1;
@@ -229,6 +399,12 @@ async fn run_forward(
         println!("[ginger-code] '{}' resolved to pod '{}'", name, pod_name);
         update_status(&state_map, &name, ForwardStatus::Connected);
 
+        // Grab a fresh portforward-capable client snapshot for this pod session.
+        let pods_for_pf: Api<Pod> = {
+            let c = shared_client.lock().await;
+            Api::default_namespaced(c.clone())
+        };
+
         'accept: loop {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -236,11 +412,9 @@ async fn run_forward(
                     return;
                 }
 
-                // Heartbeat: while we're sitting in the accept loop the local
-                // TCP listener is working fine. Re-assert Connected every second
-                // so that a post-reconnect Retrying/Offline status that was set
-                // by run_net_monitor gets corrected without requiring a full
-                // pod re-resolve cycle.
+                // Heartbeat: re-assert Connected every second so that a
+                // post-reconnect Retrying/Offline status gets corrected without
+                // requiring a full pod re-resolve cycle.
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     if !offline.load(Ordering::Relaxed) {
                         update_status(&state_map, &name, ForwardStatus::Connected);
@@ -257,7 +431,7 @@ async fn run_forward(
                         }
                     };
 
-                    let mut pf = match pods
+                    let mut pf = match pods_for_pf
                         .portforward(&pod_name, &[entry.deployment_port])
                         .await
                     {
@@ -349,18 +523,21 @@ fn update_status(state_map: &StateMap, name: &str, status: ForwardStatus) {
 // ── Start forward task ────────────────────────────────────────────────────────
 
 fn start_forward(
-    entry:     &DeploymentEntry,
-    client:    Client,
-    offline:   &Arc<AtomicBool>,
-    state_map: &StateMap,
+    entry:         &DeploymentEntry,
+    shared_client: SharedClient,
+    offline:       &Arc<AtomicBool>,
+    state_map:     &StateMap,
+    rt:            &tokio::runtime::Handle,
+    hook_cooldown: &HookCooldown,
 ) {
     let token  = CancellationToken::new();
-    let handle = tokio::spawn(run_forward(
-        client,
+    let handle = rt.spawn(run_forward(
+        Arc::clone(&shared_client),
         entry.clone(),
         token.clone(),
         Arc::clone(offline),
         Arc::clone(state_map),
+        Arc::clone(hook_cooldown),
     ));
 
     state_map.lock().unwrap().insert(
@@ -401,11 +578,12 @@ pub fn shutdown_all_threads(state_map: &StateMap) {
 // ── Start forwards for a branch ───────────────────────────────────────────────
 
 async fn start_branch_forwards(
-    cfg_path:  &PathBuf,
-    branch:    &str,
-    client:    &Client,
-    state_map: &StateMap,
-    offline:   &Arc<AtomicBool>,
+    cfg_path:      &PathBuf,
+    branch:        &str,
+    shared_client: &SharedClient,
+    state_map:     &StateMap,
+    offline:       &Arc<AtomicBool>,
+    hook_cooldown: &HookCooldown,
 ) {
     let entries = BranchConfig::load(cfg_path, branch).deployments;
 
@@ -413,6 +591,8 @@ async fn start_branch_forwards(
         println!("[ginger-code] no deployments in branch '{}'", branch);
         return;
     }
+
+    let rt = tokio::runtime::Handle::current();
 
     let map = state_map.lock().unwrap();
     let new_entries: Vec<DeploymentEntry> = entries
@@ -423,7 +603,7 @@ async fn start_branch_forwards(
 
     let count = new_entries.len();
     for entry in new_entries {
-        start_forward(&entry, client.clone(), offline, state_map);
+        start_forward(&entry, Arc::clone(shared_client), offline, state_map, &rt, hook_cooldown );
     }
 
     println!(
@@ -483,10 +663,11 @@ fn has_network() -> bool {
 async fn run_watcher(
     state_map:      StateMap,
     cfg_path:       PathBuf,
-    client:         Client,
+    shared_client:  SharedClient,
     offline:        Arc<AtomicBool>,
     token:          CancellationToken,
     initial_branch: Option<String>,
+    hook_cooldown:  HookCooldown,
 ) {
     let mut last_branch: Option<String> = initial_branch;
 
@@ -529,7 +710,7 @@ async fn run_watcher(
             last_branch = branch.clone();
 
             if let Some(ref active) = branch {
-                start_branch_forwards(&cfg_path, active, &client, &state_map, &offline).await;
+                start_branch_forwards(&cfg_path, active, &shared_client, &state_map, &offline, &hook_cooldown).await;
             }
 
             continue;
@@ -567,12 +748,13 @@ async fn run_watcher(
 
         // Start new deployments
         {
+            let rt = tokio::runtime::Handle::current();
             let existing: Vec<String> = state_map.lock().unwrap()
                 .keys().cloned().collect();
 
             for entry in &entries {
                 if existing.contains(&entry.deployment_name) { continue; }
-                start_forward(entry, client.clone(), &offline, &state_map);
+                start_forward(entry, Arc::clone(&shared_client), &offline, &state_map, &rt, &hook_cooldown);
                 println!("[ginger-code] registered '{}'", entry.deployment_name);
             }
         }
@@ -616,11 +798,13 @@ enum Response {
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 fn dispatch(
-    req:       Request,
-    cfg_path:  &PathBuf,
-    state_map: &StateMap,
-    client:    &Client,
-    offline:   &Arc<AtomicBool>,
+    req:           Request,
+    cfg_path:      &PathBuf,
+    state_map:     &StateMap,
+    shared_client: &SharedClient,
+    offline:       &Arc<AtomicBool>,
+    rt:            &tokio::runtime::Handle,
+    hook_cooldown: &HookCooldown,
 ) -> Response {
     match req {
         Request::Ping => Response::Ok { message: "pong".to_string() },
@@ -661,7 +845,7 @@ fn dispatch(
                         forwarding_port,
                         organization_id,
                     };
-                    start_forward(&entry, client.clone(), offline, state_map);
+                    start_forward(&entry, Arc::clone(shared_client), offline, state_map, rt, &hook_cooldown);
                 }
             }
 
@@ -731,7 +915,7 @@ fn dispatch(
             if let Some(fw) = state_map.lock().unwrap().remove(&deployment_name) {
                 fw.token.cancel();
                 if let Some(task) = fw.task {
-                    tokio::spawn(async move { task.await.ok(); });
+                    rt.spawn(async move { task.await.ok(); });
                 }
             }
 
@@ -748,11 +932,13 @@ fn dispatch(
 // ── Socket listener ───────────────────────────────────────────────────────────
 
 fn handle_client(
-    stream:    UnixStream,
-    cfg_path:  PathBuf,
-    state_map: StateMap,
-    client:    Client,
-    offline:   Arc<AtomicBool>,
+    stream:        UnixStream,
+    cfg_path:      PathBuf,
+    state_map:     StateMap,
+    shared_client: SharedClient,
+    offline:       Arc<AtomicBool>,
+    rt:            tokio::runtime::Handle,
+    hook_cooldown: &HookCooldown,
 ) {
     let mut writer = match stream.try_clone() {
         Ok(s)  => s,
@@ -766,7 +952,7 @@ fn handle_client(
 
         let resp = match serde_json::from_str::<Request>(&line) {
             Err(e)  => Response::Error { message: format!("Parse error: {e}") },
-            Ok(req) => dispatch(req, &cfg_path, &state_map, &client, &offline),
+            Ok(req) => dispatch(req, &cfg_path, &state_map, &shared_client, &offline, &rt, &hook_cooldown),
         };
 
         let mut json = serde_json::to_string(&resp).unwrap();
@@ -791,6 +977,8 @@ fn socket_path() -> PathBuf {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let hook_cooldown: HookCooldown = Arc::new(tokio::sync::Mutex::new(None));
+
 
     if args.contains(&"--gui".to_string()) {
         shared::gui::run_gui().unwrap();
@@ -828,11 +1016,12 @@ fn main() {
     let shutdown_token: CancellationToken = CancellationToken::new();
     let offline:        Arc<AtomicBool>   = Arc::new(AtomicBool::new(!has_network()));
 
-    let kube_client: Client = rt.block_on(async {
+    let shared_client: SharedClient = rt.block_on(async {
         let cfg_path  = cfg_path.clone();
         let state_map = Arc::clone(&state_map);
         let offline   = Arc::clone(&offline);
         let tok       = shutdown_token.clone();
+        let hook_cooldown = Arc::clone(&hook_cooldown);
 
         let client = match Client::try_default().await {
             Ok(c)  => c,
@@ -842,12 +1031,15 @@ fn main() {
             }
         };
 
+        // Wrap in a shared, async-lockable handle so tasks can swap it on 401.
+        let shared_client: SharedClient = Arc::new(tokio::sync::Mutex::new(client));
+
         let initial_branch = {
             let cfg = Config::load(&cfg_path);
             if let Some(ref branch) = cfg.active_branch {
                 println!("[ginger-code] active branch: '{}'", branch);
                 start_branch_forwards(
-                    &cfg_path, branch, &client, &state_map, &offline,
+                    &cfg_path, branch, &shared_client, &state_map, &offline, &hook_cooldown
                 ).await;
             } else {
                 println!("[ginger-code] no active branch — run `ginger-code -b <branch>`");
@@ -864,22 +1056,25 @@ fn main() {
         tokio::spawn(run_watcher(
             Arc::clone(&state_map),
             cfg_path.clone(),
-            client.clone(),
+            Arc::clone(&shared_client),
             Arc::clone(&offline),
             tok.clone(),
             initial_branch,
+            hook_cooldown,
         ));
 
-        client
+        shared_client
     });
 
     // ── Socket listener ───────────────────────────────────────────────────────
     {
-        let sp      = sock_path.clone();
-        let cp      = cfg_path.clone();
-        let sm      = Arc::clone(&state_map);
-        let client  = kube_client.clone();
-        let offline = Arc::clone(&offline);
+        let sp            = sock_path.clone();
+        let cp            = cfg_path.clone();
+        let sm            = Arc::clone(&state_map);
+        let shared_client = Arc::clone(&shared_client);
+        let offline       = Arc::clone(&offline);
+        let rt_handle     = rt.handle().clone();
+        let hook_cooldown = Arc::clone(&hook_cooldown);
 
         std::thread::spawn(move || {
             if sp.exists() { let _ = fs::remove_file(&sp); }
@@ -902,12 +1097,14 @@ fn main() {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
-                        let cp      = cp.clone();
-                        let sm      = Arc::clone(&sm);
-                        let client  = client.clone();
-                        let offline = Arc::clone(&offline);
+                        let cp            = cp.clone();
+                        let sm            = Arc::clone(&sm);
+                        let shared_client = Arc::clone(&shared_client);
+                        let offline       = Arc::clone(&offline);
+                        let rt_handle     = rt_handle.clone();
+                        let hook_cooldown = Arc::clone(&hook_cooldown);
                         std::thread::spawn(move || {
-                            handle_client(s, cp, sm, client, offline);
+                            handle_client(s, cp, sm, shared_client, offline, rt_handle, &hook_cooldown);
                         });
                     }
                     Err(e) => {
