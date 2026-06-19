@@ -32,7 +32,8 @@ use crate::shared::core::{
     },
     image::{builder_image, meta_to_repo_name, supports_ssh},
     k8s_ops::{
-        apply_pvc, get_deployment_annotation, is_workspace_empty, wait_for_pod_ready, wait_for_pod_scheduled, write_ssh_principal
+        apply_pvc, get_deployment_annotation, is_workspace_empty,
+        wait_for_pod_running_image, wait_for_pod_scheduled, write_ssh_principal,
     },
     port::find_free_22xx_port,
     ssh_config::{add_source_ssh_config, add_ssh_config, remove_ssh_config},
@@ -288,14 +289,15 @@ pub async fn eject(
         let pod_name = wait_for_pod_scheduled(deployment_name).await?;
         println!("  pod scheduled: {}", pod_name);
 
-        println!("\n⏸  Sleeping 5s to allow rollout to stabilize...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        println!("⏳ Waiting for rollout to land the dev image ('{}')...", image);
+        let final_pod = wait_for_pod_running_image(
+            deployment_name,
+            &main_container,
+            &image,
+            std::time::Duration::from_secs(300), // generous: covers a cold/uncached image pull
+        ).await?;
 
-        let final_pod = wait_for_pod_scheduled(deployment_name).await?;
-
-        wait_for_pod_ready(&final_pod).await?;
-        
-        println!("✓ Pod ready: {}", final_pod);
+        println!("✓ Pod ready on dev image: {}", final_pod);
 
         write_ssh_principal(&final_pod, &main_container, &session_user).await?;
 

@@ -286,3 +286,127 @@ pub async fn write_ssh_principal(
     println!("✓ SSH principal '{}' written", session_user);
     Ok(())
 }
+
+
+// ── Pod image inspection ──────────────────────────────────────────────────────
+
+/// Returns the current image of `container_name` inside a specific **pod**
+/// (not a deployment). During a rolling update, the deployment spec's image
+/// updates immediately on patch, but a given pod can still be running the
+/// old image for as long as it takes to terminate — so this must be checked
+/// against the pod directly, not inferred from the deployment.
+async fn get_pod_container_image(pod_name: &str, container_name: &str) -> Option<String> {
+    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let pod = api.get(pod_name).await.ok()?;
+
+    pod.spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|c| c.name == container_name)?
+        .image
+        .clone()
+}
+
+/// Polls for a pod belonging to `deployment_name` whose `container_name`
+/// container is running `expected_image` AND is Ready.
+///
+/// This replaces "wait for any pod to be scheduled, sleep a fixed amount,
+/// then assume the next pod found is the new one." During a rolling update
+/// — especially with an image that isn't cached on the node and is slow to
+/// pull — the old pod can remain Scheduled and Ready well past any fixed
+/// sleep, while the new pod sits Pending on the image pull. A pod existing
+/// and being ready says nothing about *which* image it's running, so the
+/// image is checked explicitly on every poll rather than inferred from
+/// elapsed time.
+pub async fn wait_for_pod_running_image(
+    deployment_name: &str,
+    container_name:  &str,
+    expected_image:  &str,
+    timeout:         std::time::Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api: Api<Pod> = Api::default_namespaced(client().await);
+    let lp  = ListParams::default().labels(&format!("app={}", deployment_name));
+
+    let start = std::time::Instant::now();
+    let mut last_seen_image: Option<String> = None;
+
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "Timed out after {:?} waiting for '{}' container '{}' to run image '{}' \
+                 (last seen image: {:?}). The image may still be pulling on the node — \
+                 check `kubectl describe pod` for ImagePullBackOff or slow pulls.",
+                timeout, deployment_name, container_name, expected_image, last_seen_image
+            ).into());
+        }
+
+        let list = api.list(&lp).await?;
+
+        // Check every live pod for this deployment, not just the first one
+        // found — during a rollout there can be two (old terminating, new
+        // starting) at once.
+        let matching_pod = list
+            .items
+            .into_iter()
+            .filter(|p| {
+                p.metadata.deletion_timestamp.is_none()
+                    && p.status.as_ref().and_then(|s| s.phase.as_deref()) != Some("Failed")
+            })
+            .find(|p| {
+                let image = p
+                    .spec.as_ref()
+                    .and_then(|s| s.containers.iter().find(|c| c.name == container_name))
+                    .and_then(|c| c.image.as_deref());
+
+                image == Some(expected_image)
+            });
+
+        if let Some(pod) = matching_pod {
+            let pod_name = pod.metadata.name.clone().ok_or("pod missing metadata.name")?;
+
+            let ready = pod
+                .status.as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .map(|conds| conds.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
+                .unwrap_or(false);
+
+            if ready {
+                println!("✓ Pod '{}' running expected image and ready", pod_name);
+                return Ok(pod_name);
+            }
+
+            last_seen_image = Some(expected_image.to_string());
+            println!("  … '{}' has the new image but isn't Ready yet, retrying in 3s", pod_name);
+        } else {
+            // Report whatever image we *did* find, to make timeouts diagnosable.
+            last_seen_image = get_pod_container_image_from_list(&api, &lp, container_name).await;
+            println!(
+                "  … no pod yet running image '{}' (currently seeing {:?}), retrying in 3s",
+                expected_image, last_seen_image
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+/// Best-effort helper used only for diagnostic logging on timeout/retry —
+/// returns the image of the first live pod found, if any.
+async fn get_pod_container_image_from_list(
+    api:            &Api<Pod>,
+    lp:             &ListParams,
+    container_name: &str,
+) -> Option<String> {
+    let list = api.list(lp).await.ok()?;
+    list.items
+        .into_iter()
+        .find(|p| p.metadata.deletion_timestamp.is_none())
+        .and_then(|p| {
+            p.spec?
+                .containers
+                .into_iter()
+                .find(|c| c.name == container_name)
+                .and_then(|c| c.image)
+        })
+}
