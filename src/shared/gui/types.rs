@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::colors::{COLOR_DIM, COLOR_RED, COLOR_YELLOW};
 use super::terminal::{Cell, ScrollbackSink, SshSession, TermPerformer};
-use crate::shared::core::types::{DbSchema, Package, K8sService};
+use crate::shared::core::types::{DbSchema, InfraAsCode, Package, K8sService};
 
 pub const MAX_TERM_TABS: usize = 5;
 
@@ -44,6 +44,8 @@ pub enum RightPane {
     PackageDetail(usize),
     /// Detail view for a DB schema at the given index in `AppState::db_schemas`.
     DbSchemaDetail(usize),
+    /// Detail view for the single Infra-as-Code entry.
+    IacDetail,
 }
 
 // ── Per-terminal-tab state ────────────────────────────────────────────────────
@@ -96,12 +98,14 @@ pub struct AppState {
     pub services:        Vec<K8sService>,
     pub packages:        Vec<Package>,
     pub db_schemas:      Vec<DbSchema>,
+    /// The single Infra-as-Code entry for this workspace.
+    pub iac:             Option<InfraAsCode>,
     pub selected_idx:    usize,
     pub right_pane:      RightPane,
     pub logs:            Vec<String>,
     /// Live logs for the currently selected DB schema deployment (if any).
     pub db_logs:         Vec<String>,
-    pub db_containers:        Vec<String>,        
+    pub db_containers:        Vec<String>,
     pub db_selected_container: Option<String>,
     pub db_log_generation:     u64,
     pub term_tabs:       Vec<TermTab>,
@@ -116,7 +120,6 @@ pub struct AppState {
     pub raised_on_open:  bool,
 
     /// Cancels the currently running service-log stream.
-    /// Replaced (and the old one cancelled) every time a new stream starts.
     pub log_cancel:      CancellationToken,
 
     /// Cancels the currently running DB-schema-log stream.
@@ -129,6 +132,7 @@ impl AppState {
             services,
             packages:        Vec::new(),
             db_schemas:      Vec::new(),
+            iac:             None,
             selected_idx:    0,
             right_pane:      RightPane::Logs,
             logs:            vec!["Fetching logs…".into()],
@@ -143,8 +147,8 @@ impl AppState {
             blink:           true,
             blink_timer:     0.0,
             raised_on_open:  false,
-            db_containers:         Vec::new(),    
-            db_selected_container: None,   
+            db_containers:         Vec::new(),
+            db_selected_container: None,
             db_log_generation:     0,
             log_cancel:            CancellationToken::new(),
             db_log_cancel:         CancellationToken::new(),
@@ -153,16 +157,12 @@ impl AppState {
 
     // ── Cancel helpers ────────────────────────────────────────────────────────
 
-    /// Cancel any running service-log stream and return a fresh token for the
-    /// next one.
     pub fn new_log_cancel(&mut self) -> CancellationToken {
         self.log_cancel.cancel();
         self.log_cancel = CancellationToken::new();
         self.log_cancel.clone()
     }
 
-    /// Cancel any running DB-schema-log stream and return a fresh token for
-    /// the next one.
     pub fn new_db_log_cancel(&mut self) -> CancellationToken {
         self.db_log_cancel.cancel();
         self.db_log_cancel = CancellationToken::new();

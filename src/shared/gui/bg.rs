@@ -13,9 +13,10 @@ use MetadataService::get_configuration as get_metadata_configuration;
 
 use crate::shared::core::{
     data_source::{fetch_current_workspace, fetch_dbs_enriched, fetch_packages, fetch_services},
-    k8_info::{get_k8s_deployments, get_pod_containers, get_transitioning_deployments, is_ejected},
+    k8_info::{get_k8s_deployments, get_pod_containers, get_transitioning_deployments, is_ejected, is_mounted},
     k8s_ops::get_deployment_annotation,
-    mount, types::{DbSchema, K8sService, Package}, unmount,
+    mount, unmount,
+    types::{DbSchema, InfraAsCode, K8sService, Package},
 };
 
 // ── Channel messages ──────────────────────────────────────────────────────────
@@ -24,6 +25,8 @@ pub enum BgMsg {
     Services(Vec<K8sService>),
     Packages(Vec<Package>),
     DbSchemas(Vec<DbSchema>),
+    /// The single IAC entry for this workspace.
+    Iac(InfraAsCode),
     K8sStatuses(HashMap<String, (String, String)>),
     EjectedFlag { idx: usize, ejected: bool, ejected_container: Option<String> },
     Logs { lines: Vec<String>, generation: u64 },
@@ -31,6 +34,8 @@ pub enum BgMsg {
     Error(String),
     EjectResult { success: bool, message: String, idx: usize },
     MountResult { success: bool, message: String, pkg_idx: usize, mounted: bool },
+    /// Result of a mount/unmount for the IAC entry.
+    IacMountResult { success: bool, message: String, mounted: bool },
     Containers { svc_idx: usize, containers: Vec<String> },
     TransitioningSet(std::collections::HashSet<String>),
     DbContainers { schema_idx: usize, containers: Vec<String> },
@@ -44,17 +49,11 @@ pub enum BgMsg {
     },
 }
 
-// ── How many new lines to buffer before sending a snapshot to the UI.
-//
-// Lower  = more responsive tail, more channel traffic + repaints.
-// Higher = less GPU churn, slightly more lag on fast log bursts.
-// 8 is a good middle ground: at 60 fps that's ~480 lines/s visible
-// with essentially zero perceptible lag.
 const LOG_BATCH_SIZE: usize = 8;
 
 // ── Spawn helpers ─────────────────────────────────────────────────────────────
 
-/// One-shot: fetch packages, services, and DB schemas from the metadata API.
+/// One-shot: fetch packages, services, DB schemas, and IAC state.
 pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -74,12 +73,12 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                 }
             };
 
-            // ── Packages (non-fatal) ──────────────────────────────────────────
+            // ── Packages ──────────────────────────────────────────────────────
             match fetch_packages(&config, &org_id, "stage").await {
                 Ok(mut packages) => {
                     for pkg in &mut packages {
                         let slug = crate::shared::core::image::pkg_to_slug(&pkg.identifier);
-                        pkg.mounted = crate::shared::core::k8_info::is_mounted(&slug).await;
+                        pkg.mounted = is_mounted(&slug).await;
                     }
                     let _ = tx.send(BgMsg::Packages(packages));
                     ctx.request_repaint();
@@ -87,7 +86,17 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                 Err(e) => eprintln!("Package fetch error: {e:?}"),
             }
 
-            // ── Services ─────────────────────────────────────────────────────
+            // ── IAC mount status ──────────────────────────────────────────────
+            // The k8s deployment for IAC is named "iac" (pkg_to_slug("iac")).
+            let iac_mounted = is_mounted("iac").await;
+            let iac = InfraAsCode {
+                organization_id: org_id.clone(),
+                mounted:         iac_mounted,
+            };
+            let _ = tx.send(BgMsg::Iac(iac));
+            ctx.request_repaint();
+
+            // ── Services ──────────────────────────────────────────────────────
             match fetch_services(&config, &org_id, 100).await {
                 Ok(services) => {
                     let _ = tx.send(BgMsg::Services(services));
@@ -99,7 +108,7 @@ pub fn spawn_metadata_fetch(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                 }
             }
 
-            // ── DB Schemas (non-fatal) ────────────────────────────────────────
+            // ── DB Schemas ────────────────────────────────────────────────────
             match fetch_dbs_enriched(&config, &org_id).await {
                 Ok(schemas) => {
                     let _ = tx.send(BgMsg::DbSchemas(schemas));
@@ -123,7 +132,6 @@ pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
                 let transitioning = get_transitioning_deployments().await;
                 let _ = tx.send(BgMsg::K8sStatuses(deployments));
                 let _ = tx.send(BgMsg::TransitioningSet(transitioning));
-                // Single repaint for the k8s status update — fires every 5 s.
                 ctx.request_repaint();
                 sleep(Duration::from_secs(5)).await;
             }
@@ -131,7 +139,7 @@ pub fn spawn_k8s_poller(tx: mpsc::Sender<BgMsg>, ctx: egui::Context) {
     });
 }
 
-/// Check ejected flag, then start a log poller if not ejected.
+/// Check ejected flag, then optionally start a log poller.
 pub fn spawn_service_refresh(
     tx:              mpsc::Sender<BgMsg>,
     ctx:             egui::Context,
@@ -181,14 +189,13 @@ pub fn spawn_bulk_ejected_check(
                     None
                 };
                 let _ = tx.send(BgMsg::EjectedFlag { idx, ejected, ejected_container });
-                // One repaint per service — these fire once at startup, acceptable.
                 ctx.request_repaint();
             }
         });
     });
 }
 
-/// Mount a dev container for `pkg_idx`.
+/// Mount a dev container for a package.
 pub fn spawn_mount(
     tx:         mpsc::Sender<BgMsg>,
     ctx:        egui::Context,
@@ -213,7 +220,7 @@ pub fn spawn_mount(
     });
 }
 
-/// Unmount the dev container for `pkg_idx`.
+/// Unmount a dev container for a package.
 pub fn spawn_unmount(
     tx:         mpsc::Sender<BgMsg>,
     ctx:        egui::Context,
@@ -232,6 +239,54 @@ pub fn spawn_unmount(
                 Err(e)  => (false, format!("✗ Unmount failed for {}: {}", identifier, e)),
             };
             let _ = tx.send(BgMsg::MountResult { success, message, pkg_idx, mounted: false });
+            ctx.request_repaint();
+        });
+    });
+}
+
+/// Mount the IAC dev container.
+///
+/// Uses `mount(&org_id, "iac", "alpine")` — identical to how any package
+/// is mounted.  `pkg_to_slug("iac")` → `"iac"` (k8s slug) and
+/// `meta_to_repo_name(org_id, "iac")` → `"{org_id}-iac"` (git remote).
+pub fn spawn_mount_iac(
+    tx:     mpsc::Sender<BgMsg>,
+    ctx:    egui::Context,
+    org_id: String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            let result = mount(&org_id, "iac", "alpine").await;
+            let (success, message) = match result {
+                Ok(())  => (true,  "✓ Mounted IAC dev container".to_string()),
+                Err(e)  => (false, format!("✗ IAC mount failed: {}", e)),
+            };
+            let _ = tx.send(BgMsg::IacMountResult { success, message, mounted: true });
+            ctx.request_repaint();
+        });
+    });
+}
+
+/// Unmount the IAC dev container.
+pub fn spawn_unmount_iac(
+    tx:     mpsc::Sender<BgMsg>,
+    ctx:    egui::Context,
+    org_id: String,
+) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().expect("tokio rt");
+
+        rt.block_on(async move {
+            let result = unmount(&org_id, "iac").await;
+            let (success, message) = match result {
+                Ok(())  => (true,  "✓ Unmounted IAC dev container".to_string()),
+                Err(e)  => (false, format!("✗ IAC unmount failed: {}", e)),
+            };
+            let _ = tx.send(BgMsg::IacMountResult { success, message, mounted: false });
             ctx.request_repaint();
         });
     });
@@ -278,11 +333,6 @@ pub fn spawn_container_fetch(
 pub use spawn_service_logs as spawn_logs_for_container;
 
 // ── Log stream helpers ────────────────────────────────────────────────────────
-//
-// Each log-streaming function now accepts a `CancellationToken`. The inner
-// loop selects between a new log line and cancellation so the thread exits
-// promptly when the user switches service/schema/container — instead of
-// running forever and silently discarding every message it sends.
 
 use tokio::sync::mpsc as async_mpsc;
 use crate::shared::core::k8_info::stream_pod_logs;
@@ -304,11 +354,9 @@ pub fn spawn_service_logs(
             let mut since_repaint: usize = 0;
 
             loop {
-                // ── Check for cancellation before starting a new stream ────
                 if cancel.is_cancelled() { return; }
 
                 let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
-
                 let dep  = deployment_name.clone();
                 let cont = container.clone();
                 tokio::spawn(async move {
@@ -317,30 +365,22 @@ pub fn spawn_service_logs(
 
                 loop {
                     tokio::select! {
-                        // Cancellation wins immediately — exit the thread.
                         _ = cancel.cancelled() => return,
-
                         msg = line_rx.recv() => {
                             match msg {
-                                None => break, // stream ended, restart after delay
+                                None => break,
                                 Some(line) => {
                                     lines.push(line);
-                                    // Cap buffer to avoid unbounded memory growth.
                                     if lines.len() > 2000 {
                                         lines.drain(0..500);
                                     }
                                     since_repaint += 1;
-
                                     if tx.send(BgMsg::Logs {
                                         lines: lines.clone(),
                                         generation,
                                     }).is_err() {
-                                        return; // app closed
+                                        return;
                                     }
-
-                                    // Only wake egui after every LOG_BATCH_SIZE lines,
-                                    // or immediately for the very first line so the UI
-                                    // doesn't stay blank.
                                     if since_repaint == 1 || since_repaint >= LOG_BATCH_SIZE {
                                         ctx.request_repaint();
                                         since_repaint = 0;
@@ -351,14 +391,12 @@ pub fn spawn_service_logs(
                     }
                 }
 
-                // Stream ended — send final snapshot and repaint once.
                 if tx.send(BgMsg::Logs { lines: lines.clone(), generation }).is_err() {
                     return;
                 }
                 ctx.request_repaint();
                 since_repaint = 0;
 
-                // Wait before reconnecting, but bail immediately if cancelled.
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = sleep(Duration::from_secs(2)) => {}
@@ -367,8 +405,6 @@ pub fn spawn_service_logs(
         });
     });
 }
-
-// ── spawn_db_schema_logs ──────────────────────────────────────────────────────
 
 pub fn spawn_db_schema_logs(
     tx:         mpsc::Sender<BgMsg>,
@@ -388,11 +424,9 @@ pub fn spawn_db_schema_logs(
             let mut since_repaint: usize = 0;
 
             loop {
-                // ── Check for cancellation before starting a new stream ────
                 if cancel.is_cancelled() { return; }
 
                 let (line_tx, mut line_rx) = async_mpsc::unbounded_channel::<String>();
-
                 let dep  = slug.clone();
                 let cont = container.clone();
                 tokio::spawn(async move {
@@ -402,7 +436,6 @@ pub fn spawn_db_schema_logs(
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-
                         msg = line_rx.recv() => {
                             match msg {
                                 None => break,
@@ -428,7 +461,6 @@ pub fn spawn_db_schema_logs(
                                     }).is_err() {
                                         return;
                                     }
-
                                     if since_repaint == 1 || since_repaint >= LOG_BATCH_SIZE {
                                         ctx.request_repaint();
                                         since_repaint = 0;

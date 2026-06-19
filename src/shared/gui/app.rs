@@ -9,17 +9,19 @@ use super::bg::{
     spawn_k8s_poller,
     spawn_metadata_fetch,
     spawn_mount,
+    spawn_mount_iac,
     spawn_service_refresh,
     spawn_unmount,
+    spawn_unmount_iac,
     spawn_service_logs,
     spawn_container_fetch,
     spawn_db_container_fetch,
 };
 use super::colors::{COLOR_BG, COLOR_CYAN, COLOR_SIDEBAR_BG};
 use super::panels::{
-    draw_db_schema_detail, draw_info_strip, draw_logs_pane, draw_package_detail,
-    draw_service_list, draw_tab_bar, draw_terminal_pane, draw_titlebar,
-    TabBarAction,
+    draw_db_schema_detail, draw_iac_detail, draw_info_strip, draw_logs_pane,
+    draw_package_detail, draw_service_list, draw_tab_bar, draw_terminal_pane,
+    draw_titlebar, IacDetailAction, TabBarAction,
 };
 use super::terminal::TermPerformer;
 use super::types::{AppState, RightPane, TermState};
@@ -29,14 +31,16 @@ use crate::shared::core::k8s_exec::attach_to_pod;
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
-    state:    AppState,
-    rx:       mpsc::Receiver<BgMsg>,
-    tx:       mpsc::Sender<BgMsg>,
-    loading:  bool,
-    ejecting: Option<String>,
-    mounting: Option<(usize, String)>,
-    ctx:      egui::Context,
-    pub rt: tokio::runtime::Runtime,
+    state:       AppState,
+    rx:          mpsc::Receiver<BgMsg>,
+    tx:          mpsc::Sender<BgMsg>,
+    loading:     bool,
+    ejecting:    Option<String>,
+    mounting:    Option<(usize, String)>,
+    /// In-flight IAC mount/unmount message (separate from per-package mounting).
+    iac_mounting: Option<String>,
+    ctx:         egui::Context,
+    pub rt:      tokio::runtime::Runtime,
 }
 
 impl App {
@@ -67,14 +71,15 @@ impl App {
         spawn_k8s_poller(tx.clone(), ctx.clone());
 
         App {
-            state:    AppState::new(13.0, vec![]),
+            state:        AppState::new(13.0, vec![]),
             rx,
             tx,
-            loading:  true,
-            ejecting: None,
-            mounting: None,
+            loading:      true,
+            ejecting:     None,
+            mounting:     None,
+            iac_mounting: None,
             ctx,
-            rt
+            rt,
         }
     }
 
@@ -105,8 +110,6 @@ impl App {
     // ── Package selection ─────────────────────────────────────────────────────
 
     fn select_package(&mut self, pkg_idx: usize) {
-        // Cancel any running service-log stream — the log pane is hidden while
-        // a package detail is shown, and we don't want stale threads running.
         self.state.new_log_cancel();
         self.state.right_pane = RightPane::PackageDetail(pkg_idx);
     }
@@ -114,7 +117,6 @@ impl App {
     // ── DB schema selection ───────────────────────────────────────────────────
 
     fn select_db_schema(&mut self, schema_idx: usize) {
-        // Cancel the previous DB-schema-log stream before starting a new one.
         let cancel = self.state.new_db_log_cancel();
 
         self.state.right_pane            = RightPane::DbSchemaDetail(schema_idx);
@@ -144,7 +146,6 @@ impl App {
     }
 
     fn select_db_container(&mut self, schema_idx: usize, container: String) {
-        // Cancel the previous DB-schema-log stream.
         let cancel = self.state.new_db_log_cancel();
 
         self.state.db_selected_container = Some(container.clone());
@@ -163,7 +164,15 @@ impl App {
         );
     }
 
-    // ── Mount / unmount ───────────────────────────────────────────────────────
+    // ── IAC selection ─────────────────────────────────────────────────────────
+
+    fn select_iac(&mut self) {
+        // Cancel any running log stream — IAC has no logs panel.
+        self.state.new_log_cancel();
+        self.state.right_pane = RightPane::IacDetail;
+    }
+
+    // ── Mount / unmount (packages) ────────────────────────────────────────────
 
     fn run_mount(&mut self, pkg_idx: usize) {
         let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
@@ -198,7 +207,25 @@ impl App {
         );
     }
 
-    // ── Open VS Code for a mounted package ────────────────────────────────────
+    // ── Mount / unmount (IAC) ─────────────────────────────────────────────────
+
+    fn run_mount_iac(&mut self) {
+        let Some(ref iac) = self.state.iac else { return };
+        if iac.mounted { return; }
+
+        self.iac_mounting = Some("Mounting IAC dev container…".to_string());
+        spawn_mount_iac(self.tx.clone(), self.ctx.clone(), iac.organization_id.clone());
+    }
+
+    fn run_unmount_iac(&mut self) {
+        let Some(ref iac) = self.state.iac else { return };
+        if !iac.mounted { return; }
+
+        self.iac_mounting = Some("Unmounting IAC dev container…".to_string());
+        spawn_unmount_iac(self.tx.clone(), self.ctx.clone(), iac.organization_id.clone());
+    }
+
+    // ── Open VS Code (packages) ───────────────────────────────────────────────
 
     fn open_package_editor(&self, pkg_idx: usize) {
         let Some(pkg) = self.state.packages.get(pkg_idx) else { return };
@@ -221,7 +248,53 @@ impl App {
         });
     }
 
-    // ── Service eject / uneject ───────────────────────────────────────────────
+    // ── Open VS Code (IAC) ────────────────────────────────────────────────────
+
+    fn open_iac_editor(&self) {
+        let Some(ref iac) = self.state.iac else { return };
+        if !iac.mounted { return; }
+
+        // slug = "iac", alias = "iac-local", workspace dir = "{org_id}-iac"
+        let remote_uri = format!(
+            "vscode-remote://ssh-remote+iac-local/workspace/{}-iac",
+            iac.organization_id,
+        );
+
+        std::thread::spawn(move || {
+            match std::process::Command::new("code")
+                .arg("--folder-uri").arg(&remote_uri).status()
+            {
+                Ok(s) if s.success() => println!("✓ VS Code launched"),
+                Ok(s)                => eprintln!("VS Code exited: {}", s),
+                Err(e)               => eprintln!("Failed to launch VS Code: {e}"),
+            }
+        });
+    }
+
+    // ── Open VS Code (ejected service) ────────────────────────────────────────
+
+    fn open_editor(&self) {
+        let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
+        if !svc.ejected { return; }
+        let Some(dep) = svc.deployment_name.as_ref() else { return };
+
+        let remote_uri = format!(
+            "vscode-remote://ssh-remote+{}-local/workspace/{}-{}",
+            dep, svc.organization_id, dep,
+        );
+
+        std::thread::spawn(move || {
+            match std::process::Command::new("code")
+                .arg("--folder-uri").arg(&remote_uri).status()
+            {
+                Ok(s) if s.success() => println!("✓ VS Code launched"),
+                Ok(s)                => eprintln!("VS Code exited: {}", s),
+                Err(e)               => eprintln!("Failed to launch VS Code: {e}"),
+            }
+        });
+    }
+
+    // ── Eject / uneject ───────────────────────────────────────────────────────
 
     fn run_eject(&mut self, ctx: &egui::Context) {
         let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
@@ -285,29 +358,6 @@ impl App {
                 let _ = tx.send(BgMsg::EjectResult { success, message, idx });
                 ctx.request_repaint();
             });
-        });
-    }
-
-    // ── Open VS Code for ejected service ─────────────────────────────────────
-
-    fn open_editor(&self) {
-        let Some(svc) = self.state.services.get(self.state.selected_idx) else { return };
-        if !svc.ejected { return; }
-        let Some(dep) = svc.deployment_name.as_ref() else { return };
-
-        let remote_uri = format!(
-            "vscode-remote://ssh-remote+{}-local/workspace/{}-{}",
-            dep, svc.organization_id, dep,
-        );
-
-        std::thread::spawn(move || {
-            match std::process::Command::new("code")
-                .arg("--folder-uri").arg(&remote_uri).status()
-            {
-                Ok(s) if s.success() => println!("✓ VS Code launched"),
-                Ok(s)                => eprintln!("VS Code exited: {}", s),
-                Err(e)               => eprintln!("Failed to launch VS Code: {e}"),
-            }
         });
     }
 
@@ -395,7 +445,6 @@ impl App {
             svc.selected_container = container.clone();
         }
 
-        // Extract everything we need before any mutable borrow of self.state.
         let (selected_is_ejected, meta_name, deployment_name) =
             if let Some(svc) = self.state.services.get(idx) {
                 let ejected = svc.ejected
@@ -427,15 +476,12 @@ impl App {
     }
 
     // ── Drain background channel ──────────────────────────────────────────────
-    //
-    // Returns true if any message was processed (caller should repaint).
 
     fn drain_bg_channel(&mut self) -> bool {
         let mut did_work = false;
 
         loop {
             match self.rx.try_recv() {
-                // ── Terminal session ready ────────────────────────────────────
                 Ok(BgMsg::TermConnected { tab_idx, session }) => {
                     if let Some(tab) = self.state.term_tabs.get_mut(tab_idx) {
                         tab.state = TermState::Connected(session);
@@ -456,8 +502,6 @@ impl App {
                         self.state.db_containers         = containers;
 
                         if let Some(container) = self.state.db_selected_container.clone() {
-                            // Cancel the initial (no-container) stream and start
-                            // a specific-container stream now that we know the name.
                             let cancel = self.state.new_db_log_cancel();
                             self.state.db_log_generation += 1;
                             let gen  = self.state.db_log_generation;
@@ -541,6 +585,12 @@ impl App {
                     did_work = true;
                 }
 
+                // ── IAC arrived from metadata fetch ───────────────────────────
+                Ok(BgMsg::Iac(iac)) => {
+                    self.state.iac = Some(iac);
+                    did_work = true;
+                }
+
                 Ok(BgMsg::K8sStatuses(deployments)) => {
                     for svc in &mut self.state.services {
                         if let Some(ref dep) = svc.deployment_name {
@@ -602,7 +652,6 @@ impl App {
                         self.state.logs = lines;
                         did_work = true;
                     }
-                    // Drop stale generations silently — no repaint needed.
                 }
 
                 Ok(BgMsg::DbSchemaLogs { lines, schema_idx, generation }) => {
@@ -653,6 +702,18 @@ impl App {
                     did_work = true;
                 }
 
+                // ── IAC mount result ──────────────────────────────────────────
+                Ok(BgMsg::IacMountResult { success, message, mounted }) => {
+                    self.iac_mounting = None;
+                    if success {
+                        if let Some(ref mut iac) = self.state.iac {
+                            iac.mounted = mounted;
+                        }
+                    }
+                    self.state.logs.push(message);
+                    did_work = true;
+                }
+
                 Err(_) => break,
             }
         }
@@ -665,10 +726,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Drain the background channel first ────────────────────────────────
         let _had_messages = self.drain_bg_channel();
 
-        // ── One-shot: raise the window on first frame only ────────────────────
         if !self.state.raised_on_open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -681,7 +740,6 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         }
 
-        // ── Cursor blink — only schedule when a terminal tab is visible ───────
         let terminal_visible = matches!(self.state.right_pane, RightPane::TerminalTab(_));
         if terminal_visible {
             let t = ctx.input(|i| i.time);
@@ -692,17 +750,14 @@ impl eframe::App for App {
             }
         }
 
-        // ── In-flight mount spinner ───────────────────────────────────────────
-        if self.mounting.is_some() {
+        if self.mounting.is_some() || self.iac_mounting.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
-        // ── Ejecting spinner ──────────────────────────────────────────────────
         if self.ejecting.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
-        // ── Drain scrollback into per-tab Vec (only for visible tab) ──────────
         if let RightPane::TerminalTab(i) = self.state.right_pane {
             if let Some(tab) = self.state.term_tabs.get_mut(i) {
                 if let Some(ref sink) = tab.scrollback_arc {
@@ -737,6 +792,7 @@ impl eframe::App for App {
                             SidebarAction::SelectService(idx)  => self.select_service(idx),
                             SidebarAction::SelectPackage(idx)  => self.select_package(idx),
                             SidebarAction::SelectDbSchema(idx) => self.select_db_schema(idx),
+                            SidebarAction::SelectIac           => self.select_iac(),
                         }
                     }
                 }
@@ -752,6 +808,19 @@ impl eframe::App for App {
                     return;
                 }
 
+                // ── IAC detail panel ──────────────────────────────────────────
+                if self.state.right_pane == RightPane::IacDetail {
+                    if let Some(ref iac) = self.state.iac.clone() {
+                        let mounting_msg = self.iac_mounting.as_deref();
+                        let action = draw_iac_detail(iac, mounting_msg, ui);
+                        if action.mount_clicked       { self.run_mount_iac(); }
+                        if action.unmount_clicked     { self.run_unmount_iac(); }
+                        if action.open_editor_clicked { self.open_iac_editor(); }
+                    }
+                    return;
+                }
+
+                // ── DB schema detail panel ────────────────────────────────────
                 if let RightPane::DbSchemaDetail(idx) = self.state.right_pane {
                     if let Some(schema) = self.state.db_schemas.get(idx).cloned() {
                         let logs_opt: Option<&[String]> =
@@ -773,6 +842,7 @@ impl eframe::App for App {
                     return;
                 }
 
+                // ── Package detail panel ──────────────────────────────────────
                 if let RightPane::PackageDetail(pkg_idx) = self.state.right_pane {
                     if let Some(pkg) = self.state.packages.get(pkg_idx).cloned() {
                         let mounting_msg = self.mounting.as_ref()
@@ -824,7 +894,9 @@ impl eframe::App for App {
                     match self.state.right_pane {
                         RightPane::Logs           => draw_logs_pane(&self.state, ui),
                         RightPane::TerminalTab(i) => draw_terminal_pane(&mut self.state, ui, i),
-                        RightPane::PackageDetail(_) | RightPane::DbSchemaDetail(_) => {}
+                        RightPane::PackageDetail(_)
+                        | RightPane::DbSchemaDetail(_)
+                        | RightPane::IacDetail => {}
                     }
                 });
             });

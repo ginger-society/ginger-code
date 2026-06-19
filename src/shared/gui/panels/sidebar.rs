@@ -14,10 +14,10 @@ pub enum SidebarAction {
     SelectService(usize),
     SelectPackage(usize),
     SelectDbSchema(usize),
+    SelectIac,
 }
 
-/// Draws the scrollable sidebar: services → packages → DB schemas.
-/// Returns the action (if any) taken by the user.
+/// Draws the scrollable sidebar: services → packages → DB schemas → IAC.
 pub fn draw_service_list(state: &AppState, ui: &mut egui::Ui) -> Option<SidebarAction> {
     let mut action = None;
 
@@ -62,6 +62,15 @@ pub fn draw_service_list(state: &AppState, ui: &mut egui::Ui) -> Option<SidebarA
                     }
                 }
             }
+
+            // ── Infra as Code ─────────────────────────────────────────────────
+            if let Some(ref iac) = state.iac {
+                draw_section_header(ui, "Infra as Code");
+                let selected = state.right_pane == RightPane::IacDetail;
+                if let Some(a) = draw_iac_row(ui, iac.mounted, selected) {
+                    action = Some(a);
+                }
+            }
         });
 
     action
@@ -78,16 +87,17 @@ fn draw_service_row(state: &AppState, ui: &mut egui::Ui, i: usize) -> Option<Sid
     let sub        = format!("status: {}", svc.status);
     let selected   = i == state.selected_idx
         && !matches!(state.right_pane, RightPane::PackageDetail(_))
-        && !matches!(state.right_pane, RightPane::DbSchemaDetail(_));
+        && !matches!(state.right_pane, RightPane::DbSchemaDetail(_))
+        && state.right_pane != RightPane::IacDetail;
 
     let (row_rect, row_resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), 42.0),
         egui::Sense::click(),
     );
 
-    let bg = if selected        { COLOR_SELECTED_BG }
+    let bg = if selected              { COLOR_SELECTED_BG }
              else if row_resp.hovered() { egui::Color32::from_rgb(40, 40, 40) }
-             else               { COLOR_SIDEBAR_BG };
+             else                     { COLOR_SIDEBAR_BG };
 
     let painter = ui.painter();
     painter.rect_filled(row_rect, 0.0, bg);
@@ -171,7 +181,6 @@ fn draw_package_row(
     };
     let name_color = if selected { egui::Color32::WHITE } else { COLOR_MUTED };
 
-    // Mounted indicator dot
     let dot       = if pkg.mounted { "●" } else { "○" };
     let dot_color = if pkg.mounted {
         egui::Color32::from_rgb(39, 201, 63)
@@ -183,15 +192,11 @@ fn draw_package_row(
         egui::Align2::CENTER_CENTER, dot,
         egui::FontId::new(11.0, egui::FontFamily::Monospace), dot_color,
     );
-
-    // Name
     painter.text(
         egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 8.0),
         egui::Align2::LEFT_TOP, short_name,
         egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
     );
-
-    // [MOUNTED] tag
     if pkg.mounted {
         let tag_x = row_rect.min.x + 24.0 + short_name.len() as f32 * 7.2 + 6.0;
         painter.text(
@@ -201,15 +206,12 @@ fn draw_package_row(
             egui::Color32::from_rgb(39, 201, 63),
         );
     }
-
-    // Type · lang
     let sub = format!("{}  ·  {}", pkg.package_type, pkg.lang);
     painter.text(
         egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
         egui::Align2::LEFT_TOP, &sub,
         egui::FontId::new(10.0, egui::FontFamily::Monospace), badge_color,
     );
-
     painter.line_segment(
         [egui::pos2(row_rect.min.x, row_rect.max.y), row_rect.max],
         egui::Stroke::new(0.5, COLOR_BORDER),
@@ -239,7 +241,7 @@ fn draw_db_schema_row(
              else if row_resp.hovered() { egui::Color32::from_rgb(35, 35, 35) }
              else                     { COLOR_SIDEBAR_BG };
 
-    let painter   = ui.painter();
+    let painter = ui.painter();
     painter.rect_filled(row_rect, 0.0, bg);
 
     if selected {
@@ -252,23 +254,6 @@ fn draw_db_schema_row(
     let name_color = if selected { egui::Color32::WHITE } else { COLOR_MUTED };
     let db_type    = schema.db_type.as_deref().unwrap_or("db");
 
-    // Database icon (cylinder-ish)
-    painter.text(
-        egui::pos2(row_rect.min.x + 14.0, row_rect.min.y + 13.0),
-        egui::Align2::CENTER_CENTER, "⬡",
-        egui::FontId::new(11.0, egui::FontFamily::Monospace), COLOR_CYAN,
-    );
-
-    // Name
-    painter.text(
-        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 8.0),
-        egui::Align2::LEFT_TOP, &schema.name,
-        egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
-    );
-
-    // Sub-line: db_type · N tables
-    let sub = format!("{}  ·  {}", db_type, schema.k8s_status);
-
     let dot = match schema.k8s_status.as_str() {
         "Running"      => "●",
         "Degraded"     => "◐",
@@ -277,9 +262,9 @@ fn draw_db_schema_row(
         _              => "✗",
     };
     let dot_color = match schema.k8s_status.as_str() {
-        "Running"  => egui::Color32::from_rgb(39, 201, 63),
+        "Running"              => egui::Color32::from_rgb(39, 201, 63),
         "Degraded" | "Pending" => COLOR_YELLOW,
-        _          => COLOR_DIM,
+        _                      => COLOR_DIM,
     };
 
     painter.text(
@@ -287,13 +272,17 @@ fn draw_db_schema_row(
         egui::Align2::CENTER_CENTER, dot,
         egui::FontId::new(11.0, egui::FontFamily::Monospace), dot_color,
     );
-
+    painter.text(
+        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 8.0),
+        egui::Align2::LEFT_TOP, &schema.name,
+        egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
+    );
+    let sub = format!("{}  ·  {}", db_type, schema.k8s_status);
     painter.text(
         egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
         egui::Align2::LEFT_TOP, &sub,
         egui::FontId::new(10.0, egui::FontFamily::Monospace), COLOR_CYAN,
     );
-
     painter.line_segment(
         [egui::pos2(row_rect.min.x, row_rect.max.y), row_rect.max],
         egui::Stroke::new(0.5, COLOR_BORDER),
@@ -301,6 +290,76 @@ fn draw_db_schema_row(
 
     if row_resp.clicked() {
         Some(SidebarAction::SelectDbSchema(idx))
+    } else {
+        None
+    }
+}
+
+// ── IAC row ───────────────────────────────────────────────────────────────────
+
+fn draw_iac_row(
+    ui:       &mut egui::Ui,
+    mounted:  bool,
+    selected: bool,
+) -> Option<SidebarAction> {
+    let (row_rect, row_resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 42.0),
+        egui::Sense::click(),
+    );
+
+    let bg = if selected              { COLOR_SELECTED_BG }
+             else if row_resp.hovered() { egui::Color32::from_rgb(35, 35, 35) }
+             else                     { COLOR_SIDEBAR_BG };
+
+    let painter = ui.painter();
+    painter.rect_filled(row_rect, 0.0, bg);
+
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(row_rect.min, egui::vec2(3.0, row_rect.height())),
+            0.0, COLOR_TAB_ACTIVE,
+        );
+    }
+
+    let dot       = if mounted { "●" } else { "○" };
+    let dot_color = if mounted {
+        egui::Color32::from_rgb(39, 201, 63)
+    } else {
+        COLOR_DIM
+    };
+    let name_color = if selected { egui::Color32::WHITE } else { COLOR_MUTED };
+
+    painter.text(
+        egui::pos2(row_rect.min.x + 14.0, row_rect.min.y + 13.0),
+        egui::Align2::CENTER_CENTER, dot,
+        egui::FontId::new(11.0, egui::FontFamily::Monospace), dot_color,
+    );
+    painter.text(
+        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 8.0),
+        egui::Align2::LEFT_TOP, "IAC",
+        egui::FontId::new(12.0, egui::FontFamily::Monospace), name_color,
+    );
+    if mounted {
+        let tag_x = row_rect.min.x + 24.0 + "IAC".len() as f32 * 7.2 + 6.0;
+        painter.text(
+            egui::pos2(tag_x, row_rect.min.y + 8.0),
+            egui::Align2::LEFT_TOP, "[MOUNTED]",
+            egui::FontId::new(10.0, egui::FontFamily::Monospace),
+            egui::Color32::from_rgb(39, 201, 63),
+        );
+    }
+    painter.text(
+        egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
+        egui::Align2::LEFT_TOP, "iac  ·  infra-as-code",
+        egui::FontId::new(10.0, egui::FontFamily::Monospace), COLOR_CYAN,
+    );
+    painter.line_segment(
+        [egui::pos2(row_rect.min.x, row_rect.max.y), row_rect.max],
+        egui::Stroke::new(0.5, COLOR_BORDER),
+    );
+
+    if row_resp.clicked() {
+        Some(SidebarAction::SelectIac)
     } else {
         None
     }
