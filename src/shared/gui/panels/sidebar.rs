@@ -350,7 +350,7 @@ fn draw_iac_row(
     }
     painter.text(
         egui::pos2(row_rect.min.x + 24.0, row_rect.min.y + 24.0),
-        egui::Align2::LEFT_TOP, "iac  ·  infra-as-code",
+        egui::Align2::LEFT_TOP, "infra-as-code",
         egui::FontId::new(10.0, egui::FontFamily::Monospace), COLOR_CYAN,
     );
     painter.line_segment(
