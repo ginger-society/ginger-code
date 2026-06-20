@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -132,6 +132,23 @@ fn init_logging() {
 // hook + kubeconfig-reload logic now lives in shared::core::k8s_client.
 
 pub type SharedClient = Arc<tokio::sync::Mutex<Client>>;
+
+// ── Active-connection counter (NEW) ───────────────────────────────────────────
+//
+// One shared counter across ALL forwards, not one per forward. It exists for
+// exactly one purpose: let the centralized heartbeat (see run_heartbeat below)
+// know whether ANY tunnel anywhere currently has a live, accepted TCP
+// connection flowing through it, so the heartbeat can skip probing the
+// apiserver while real traffic might be in flight.
+//
+// IMPORTANT: this counter never gates accept()ing new local connections and
+// is never used to close existing ones. It only gates whether the heartbeat
+// task makes an extra apiserver call. Already-open local sockets (e.g. an
+// active VS Code SSH session) are completely unaffected by this counter, by
+// the heartbeat, or by auth refreshes — exactly as today, a stalled portforward
+// just means the data path is slow until the client/portforward recovers; the
+// local listener and any accepted socket are never torn down because of it.
+pub type ActiveConnCounter = Arc<AtomicU32>;
 
 // ── Config (code.toml) ────────────────────────────────────────────────────────
 
@@ -294,13 +311,25 @@ async fn resolve_pod(
 }
 
 // ── Core forward loop ─────────────────────────────────────────────────────────
-
+//
+// CHANGED: takes `active_conns: ActiveConnCounter` now — the shared, global
+// counter (not a per-forward one). This loop's own per-second tick no longer
+// makes any apiserver call itself; that's been pulled out into run_heartbeat
+// so N forwards don't each redundantly probe the same shared client. This
+// loop's only new responsibility is incrementing/decrementing the shared
+// counter around each connection's lifetime so the heartbeat knows whether
+// it's safe to probe.
+//
+// Everything about local socket persistence is UNCHANGED: the listener is
+// still bound once up front, accepted connections are still handed to their
+// own spawned copy task and never torn down by anything in this function.
 async fn run_forward(
     shared_client: SharedClient,
     entry:         DeploymentEntry,
     token:         CancellationToken,
     offline:       Arc<AtomicBool>,
     state_map:     StateMap,
+    active_conns:  ActiveConnCounter, // NEW
 ) {
     let name = entry.deployment_name.clone();
 
@@ -393,10 +422,19 @@ async fn run_forward(
         info!(deployment = %name, pod = %pod_name, "resolved pod");
         update_status(&state_map, &name, ForwardStatus::Connected);
 
-        let pods_for_pf: Api<Pod> = {
-            let c = shared_client.lock().await;
-            Api::default_namespaced(c.clone())
-        };
+        // REMOVED the once-per-outer-loop `pods_for_pf` snapshot that used
+        // to live here. It was captured exactly once when this lap of the
+        // loop started and then reused for every accept() until something
+        // forced the loop back around — which meant a heartbeat-triggered
+        // refresh of `shared_client` had NO effect on any forward already
+        // sitting idle in 'accept: the snapshot just kept pointing at the
+        // old, now-401-ing client. `pods_for_pf` is now derived fresh from
+        // `shared_client` inside the accept_result arm below, right before
+        // each portforward() call — so it always reflects whatever the
+        // heartbeat (or anything else) most recently swapped in, with no
+        // staleness window at all. The lock + clone is cheap and this is
+        // off the hot data path (it only runs once per NEW connection, not
+        // per byte), so there's no meaningful cost to dropping the snapshot.
 
         'accept: loop {
             tokio::select! {
@@ -406,6 +444,10 @@ async fn run_forward(
                 }
 
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    // CHANGED: no apiserver call here anymore — that's now the
+                    // centralized run_heartbeat task's job. This just keeps the
+                    // displayed status honest for the common case (no network
+                    // loss, no auth issue) without making any API call.
                     if !offline.load(Ordering::Relaxed) {
                         update_status(&state_map, &name, ForwardStatus::Connected);
                     }
@@ -420,11 +462,68 @@ async fn run_forward(
                         }
                     };
 
+                    // NEW: build pods_for_pf fresh, from whatever client is
+                    // currently in shared_client, right here — not from a
+                    // stale snapshot. This is the actual fix for "heartbeat
+                    // refreshed the client but green tunnels still 401 on
+                    // first real use": there is no more snapshot to go stale.
+                    let mut pods_for_pf: Api<Pod> = {
+                        let c = shared_client.lock().await;
+                        Api::default_namespaced(c.clone())
+                    };
+
+                    // FIXED: portforward() can still 401 in the rare window
+                    // where the token expires AFTER this snapshot was taken
+                    // but BEFORE portforward() completes (a few hundred ms
+                    // wide at most, vs. the previous unbounded staleness
+                    // window that could last as long as the forward stayed
+                    // idle). Kept as defense in depth: detect the 401
+                    // specifically, refresh inline, and retry portforward()
+                    // ONCE on the SAME accepted `tcp` socket before giving up.
+                    // From VS Code's point of view this just looks like a
+                    // slow connect, not a failed one.
                     let mut pf = match pods_for_pf
                         .portforward(&pod_name, &[entry.deployment_port])
                         .await
                     {
                         Ok(pf) => pf,
+                        Err(e) if is_unauthorized(&e) => {
+                            warn!(deployment = %name, pod = %pod_name, "portforward 401 — refreshing inline and retrying same connection");
+                            update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
+
+                            let refreshed_pods: Option<Api<Pod>> = match handle_unauthorized_and_get().await {
+                                Some(new_client) => {
+                                    *shared_client.lock().await = new_client.clone();
+                                    info!(deployment = %name, "kubeconfig reloaded (inline, from portforward 401)");
+                                    let fresh = Api::default_namespaced(new_client);
+                                    pods_for_pf = fresh.clone(); // kept in sync for the retry call just below; harmless since pods_for_pf no longer outlives this accept()
+                                    Some(fresh)
+                                }
+                                None => {
+                                    error!(deployment = %name, "inline kubeconfig reload failed — dropping connection");
+                                    None
+                                }
+                            };
+
+                            let retry_result = match refreshed_pods {
+                                Some(ref fresh_pods) => {
+                                    fresh_pods.portforward(&pod_name, &[entry.deployment_port]).await
+                                }
+                                None => {
+                                    // Reuse the typed error path so the match below
+                                    // still has something to report/log against.
+                                    Err(e)
+                                }
+                            };
+
+                            match retry_result {
+                                Ok(pf) => pf,
+                                Err(e2) => {
+                                    warn!(deployment = %name, pod = %pod_name, error = %e2, "portforward retry after refresh also failed — giving up on this connection");
+                                    break 'accept;
+                                }
+                            }
+                        }
                         Err(e) => {
                             warn!(deployment = %name, pod = %pod_name, error = %e, "portforward failed");
                             update_status(&state_map, &name, ForwardStatus::Retrying { attempt });
@@ -442,6 +541,12 @@ async fn run_forward(
 
                     info!(deployment = %name, peer = %peer, "new connection");
 
+                    // NEW: mark this connection active in the shared counter
+                    // BEFORE spawning, so the heartbeat can never observe a
+                    // false "idle" window between accept() and the counter
+                    // being bumped.
+                    active_conns.fetch_add(1, Ordering::Relaxed);
+
                     if let Ok(mut map) = state_map.lock() {
                         if let Some(fw) = map.get_mut(&name) {
                             fw.restarts += 1;
@@ -449,6 +554,7 @@ async fn run_forward(
                     }
 
                     let name_clone = name.clone();
+                    let active_conns_for_task = Arc::clone(&active_conns); // NEW
                     tokio::spawn(async move {
                         let (mut tcp_r, mut tcp_w) = tcp.into_split();
                         let (mut pf_r,  mut pf_w)  = tokio::io::split(stream);
@@ -456,6 +562,12 @@ async fn run_forward(
                         let client_to_pod = tokio::io::copy(&mut tcp_r, &mut pf_w);
                         let pod_to_client = tokio::io::copy(&mut pf_r,  &mut tcp_w);
 
+                        // UNCHANGED: this select! and everything in it is the
+                        // part responsible for "internet drops, VS Code stays
+                        // connected, data just stalls". Nothing here checks
+                        // offline/auth/heartbeat state — a stalled copy just
+                        // sits here until the underlying stream errors or
+                        // recovers on its own. That behavior is fully preserved.
                         tokio::select! {
                             r = client_to_pod => {
                                 if let Err(e) = r {
@@ -470,6 +582,7 @@ async fn run_forward(
                         }
 
                         let _ = pf_w.shutdown().await;
+                        active_conns_for_task.fetch_sub(1, Ordering::Relaxed); // NEW
                         info!(deployment = %name_clone, "connection closed");
                     });
                 }
@@ -490,6 +603,91 @@ async fn run_forward(
     }
 }
 
+// ── Centralized heartbeat (NEW) ───────────────────────────────────────────────
+//
+// Replaces the idea of a per-forward version check with ONE check for the
+// whole daemon, because every forward shares the same `shared_client` — auth
+// staleness is a fact about that one client, not about any individual
+// forward. Runs every 5s, skips entirely if:
+//   - the daemon is currently marked offline (run_net_monitor already owns
+//     that signal), or
+//   - any forward anywhere has a live accepted connection right now
+//     (active_conns > 0) — we don't want to spend an extra apiserver call
+//     while real traffic might be in flight, even though the check itself
+//     wouldn't touch the data path.
+//
+// On success: clears any forward stuck in `Offline` (we now know the client
+// itself is healthy) but deliberately does NOT touch `Retrying { attempt }`
+// forwards — those are mid pod-resolution for reasons unrelated to auth
+// (e.g. no running pod yet), and that transition is already owned by
+// run_forward's own loop once resolve_pod succeeds. Overwriting it here would
+// blur two different failure dimensions (auth vs. pod-availability) together.
+//
+// On 401: runs the existing hook+rebuild path exactly once for the whole
+// daemon and swaps the shared client — every forward picks up the refreshed
+// client on its next lock acquisition, no per-forward duplication.
+async fn run_heartbeat(
+    shared_client: SharedClient,
+    active_conns:  ActiveConnCounter,
+    state_map:     StateMap,
+    offline:       Arc<AtomicBool>,
+    token:         CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+
+        if offline.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        if active_conns.load(Ordering::Relaxed) > 0 {
+            // Real traffic may be in flight somewhere — skip this tick
+            // entirely. Does NOT affect any open local socket either way;
+            // this is purely "don't bother probing right now."
+            continue;
+        }
+
+        let probe_result = {
+            let client = shared_client.lock().await;
+            client.apiserver_version().await
+        };
+
+        match probe_result {
+            Ok(_) => {
+                if let Ok(mut map) = state_map.lock() {
+                    for fw in map.values_mut() {
+                        if fw.status == ForwardStatus::Offline {
+                            fw.status = ForwardStatus::Connected;
+                        }
+                    }
+                }
+            }
+            Err(ref e) if is_unauthorized(e) => {
+                warn!("heartbeat detected 401 — refreshing shared client");
+                match handle_unauthorized_and_get().await {
+                    Some(new_client) => {
+                        *shared_client.lock().await = new_client;
+                        info!("kubeconfig reloaded via heartbeat");
+                    }
+                    None => {
+                        error!("heartbeat-triggered kubeconfig reload failed");
+                    }
+                }
+            }
+            Err(e) => {
+                // Transient error (network blip, apiserver hiccup) — not
+                // necessarily auth-related. Leave forward statuses alone;
+                // next tick retries. run_net_monitor owns the actual
+                // online/offline signal independently of this.
+                warn!(error = %e, "heartbeat probe failed (non-auth) — will retry");
+            }
+        }
+    }
+}
+
 // ── Status update ─────────────────────────────────────────────────────────────
 
 fn update_status(state_map: &StateMap, name: &str, status: ForwardStatus) {
@@ -504,12 +702,14 @@ fn update_status(state_map: &StateMap, name: &str, status: ForwardStatus) {
 }
 
 // ── Start forward task ────────────────────────────────────────────────────────
-
+//
+// CHANGED: now takes & threads through the shared `active_conns` counter.
 fn start_forward(
     entry:         &DeploymentEntry,
     shared_client: SharedClient,
     offline:       &Arc<AtomicBool>,
     state_map:     &StateMap,
+    active_conns:  &ActiveConnCounter, // NEW
     rt:            &tokio::runtime::Handle,
 ) {
     let token  = CancellationToken::new();
@@ -519,6 +719,7 @@ fn start_forward(
         token.clone(),
         Arc::clone(offline),
         Arc::clone(state_map),
+        Arc::clone(active_conns), // NEW
     ));
 
     state_map.lock().unwrap().insert(
@@ -553,13 +754,15 @@ pub fn shutdown_all_threads(state_map: &StateMap) {
 }
 
 // ── Start forwards for a branch ───────────────────────────────────────────────
-
+//
+// CHANGED: threads active_conns through to start_forward.
 async fn start_branch_forwards(
     cfg_path:      &PathBuf,
     branch:        &str,
     shared_client: &SharedClient,
     state_map:     &StateMap,
     offline:       &Arc<AtomicBool>,
+    active_conns:  &ActiveConnCounter, // NEW
 ) {
     let entries = BranchConfig::load(cfg_path, branch).deployments;
     if entries.is_empty() {
@@ -577,13 +780,17 @@ async fn start_branch_forwards(
 
     let count = new_entries.len();
     for entry in new_entries {
-        start_forward(&entry, Arc::clone(shared_client), offline, state_map, &rt);
+        start_forward(&entry, Arc::clone(shared_client), offline, state_map, active_conns, &rt);
     }
     info!(branch = branch, count = count, "started forward(s)");
 }
 
 // ── Network monitor ───────────────────────────────────────────────────────────
-
+//
+// UNCHANGED. Still only flips the `offline` flag and labels forwards
+// `Offline` for display purposes — never touches an accepted connection or
+// the listener. A network blip still leaves VS Code's local socket open;
+// only the data path stalls, exactly as before.
 async fn run_net_monitor(
     offline:   Arc<AtomicBool>,
     state_map: StateMap,
@@ -620,12 +827,17 @@ fn has_network() -> bool {
 }
 
 // ── Config watcher ────────────────────────────────────────────────────────────
-
+//
+// CHANGED: threads active_conns through to start_forward / start_branch_forwards.
+// Behaviorally unchanged otherwise — branch switches still tear down and
+// restart forwards explicitly (that's a deliberate, user-initiated teardown,
+// not something the heartbeat or network monitor does on their own).
 async fn run_watcher(
     state_map:      StateMap,
     cfg_path:       PathBuf,
     shared_client:  SharedClient,
     offline:        Arc<AtomicBool>,
+    active_conns:   ActiveConnCounter, // NEW
     token:          CancellationToken,
     initial_branch: Option<String>,
 ) {
@@ -660,7 +872,7 @@ async fn run_watcher(
 
             last_branch = branch.clone();
             if let Some(ref active) = branch {
-                start_branch_forwards(&cfg_path, active, &shared_client, &state_map, &offline).await;
+                start_branch_forwards(&cfg_path, active, &shared_client, &state_map, &offline, &active_conns).await;
             }
             continue;
         }
@@ -696,7 +908,7 @@ async fn run_watcher(
             let existing: Vec<String> = state_map.lock().unwrap().keys().cloned().collect();
             for entry in &entries {
                 if existing.contains(&entry.deployment_name) { continue; }
-                start_forward(entry, Arc::clone(&shared_client), &offline, &state_map, &rt);
+                start_forward(entry, Arc::clone(&shared_client), &offline, &state_map, &active_conns, &rt);
                 info!(deployment = %entry.deployment_name, "registered");
             }
         }
@@ -738,13 +950,16 @@ enum Response {
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
-
+//
+// CHANGED: takes & threads through active_conns for the Register path's
+// start_forward call.
 fn dispatch(
     req:           Request,
     cfg_path:      &PathBuf,
     state_map:     &StateMap,
     shared_client: &SharedClient,
     offline:       &Arc<AtomicBool>,
+    active_conns:  &ActiveConnCounter, // NEW
     rt:            &tokio::runtime::Handle,
 ) -> Response {
     match req {
@@ -783,7 +998,7 @@ fn dispatch(
                         forwarding_port,
                         organization_id,
                     };
-                    start_forward(&entry, Arc::clone(shared_client), offline, state_map, rt);
+                    start_forward(&entry, Arc::clone(shared_client), offline, state_map, active_conns, rt);
                 }
             }
 
@@ -864,13 +1079,15 @@ fn dispatch(
 }
 
 // ── Socket listener ───────────────────────────────────────────────────────────
-
+//
+// CHANGED: threads active_conns through to dispatch.
 fn handle_client(
     stream:        UnixStream,
     cfg_path:      PathBuf,
     state_map:     StateMap,
     shared_client: SharedClient,
     offline:       Arc<AtomicBool>,
+    active_conns:  ActiveConnCounter, // NEW
     rt:            tokio::runtime::Handle,
 ) {
     let mut writer = match stream.try_clone() {
@@ -885,7 +1102,7 @@ fn handle_client(
 
         let resp = match serde_json::from_str::<Request>(&line) {
             Err(e)  => Response::Error { message: format!("Parse error: {e}") },
-            Ok(req) => dispatch(req, &cfg_path, &state_map, &shared_client, &offline, &rt),
+            Ok(req) => dispatch(req, &cfg_path, &state_map, &shared_client, &offline, &active_conns, &rt),
         };
 
         let mut json = serde_json::to_string(&resp).unwrap();
@@ -949,6 +1166,9 @@ fn main() {
     let state_map:      StateMap          = Arc::new(Mutex::new(HashMap::new()));
     let shutdown_token: CancellationToken = CancellationToken::new();
     let offline:        Arc<AtomicBool>   = Arc::new(AtomicBool::new(!has_network()));
+    // NEW: single shared counter for "is any tunnel actively in use right now",
+    // consumed only by run_heartbeat. Never gates accept() or teardown.
+    let active_conns:   ActiveConnCounter = Arc::new(AtomicU32::new(0));
 
     // Build the initial client via the shared module so it seeds the global
     // OnceCell — after this, get_client() in k8_info/k8s_ops will reuse it.
@@ -956,17 +1176,18 @@ fn main() {
         let client = shared::core::k8s_client::get_client().await;
         let shared_client: SharedClient = Arc::new(tokio::sync::Mutex::new(client));
 
-        let cfg_path_c    = cfg_path.clone();
-        let state_map_c   = Arc::clone(&state_map);
-        let offline_c     = Arc::clone(&offline);
-        let tok           = shutdown_token.clone();
-        let sc            = Arc::clone(&shared_client);
+        let cfg_path_c     = cfg_path.clone();
+        let state_map_c    = Arc::clone(&state_map);
+        let offline_c      = Arc::clone(&offline);
+        let active_conns_c = Arc::clone(&active_conns); // NEW
+        let tok            = shutdown_token.clone();
+        let sc             = Arc::clone(&shared_client);
 
         let initial_branch = {
             let cfg = Config::load(&cfg_path_c);
             if let Some(ref branch) = cfg.active_branch {
                 info!(branch = branch, "active branch");
-                start_branch_forwards(&cfg_path_c, branch, &sc, &state_map_c, &offline_c).await;
+                start_branch_forwards(&cfg_path_c, branch, &sc, &state_map_c, &offline_c, &active_conns_c).await;
             } else {
                 info!("no active branch — run `ginger-code -b <branch>`");
             }
@@ -979,11 +1200,22 @@ fn main() {
             tok.clone(),
         ));
 
+        // NEW: the single centralized heartbeat task, replacing any idea of
+        // a per-forward periodic apiserver check.
+        tokio::spawn(run_heartbeat(
+            Arc::clone(&sc),
+            Arc::clone(&active_conns_c),
+            Arc::clone(&state_map_c),
+            Arc::clone(&offline_c),
+            tok.clone(),
+        ));
+
         tokio::spawn(run_watcher(
             Arc::clone(&state_map_c),
             cfg_path_c,
             Arc::clone(&sc),
             Arc::clone(&offline_c),
+            Arc::clone(&active_conns_c), // NEW
             tok.clone(),
             initial_branch,
         ));
@@ -998,6 +1230,7 @@ fn main() {
         let sm            = Arc::clone(&state_map);
         let shared_client = Arc::clone(&shared_client);
         let offline       = Arc::clone(&offline);
+        let active_conns  = Arc::clone(&active_conns); // NEW
         let rt_handle     = rt.handle().clone();
 
         std::thread::spawn(move || {
@@ -1022,9 +1255,10 @@ fn main() {
                         let sm            = Arc::clone(&sm);
                         let shared_client = Arc::clone(&shared_client);
                         let offline       = Arc::clone(&offline);
+                        let active_conns  = Arc::clone(&active_conns); // NEW
                         let rt_handle     = rt_handle.clone();
                         std::thread::spawn(move || {
-                            handle_client(s, cp, sm, shared_client, offline, rt_handle);
+                            handle_client(s, cp, sm, shared_client, offline, active_conns, rt_handle);
                         });
                     }
                     Err(e) => { error!(error = %e, "accept error"); break; }
