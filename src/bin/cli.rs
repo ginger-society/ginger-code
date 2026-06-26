@@ -62,6 +62,13 @@ enum Cmd {
         /// Base URL of the tekton-sidekick service
         #[arg(long, env = "SIDEKICK_URL", default_value = "http://localhost:8000")]
         sidekick_url: String,
+
+        /// Print newline-delimited JSON instead of the colored
+        /// human-facing view -- no ANSI color, no banner, one JSON
+        /// object per line. Intended for AI coding agents or other
+        /// tooling consuming this stream programmatically.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
 
     #[command(hide = true)]
@@ -93,8 +100,8 @@ async fn main() {
         return;
     }
 
-    if let Cmd::LogsRun { ref run_name, ref sidekick_url } = cmd {
-        if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name).await {
+    if let Cmd::LogsRun { ref run_name, ref sidekick_url, raw } = cmd {
+        if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name, raw).await {
             eprintln!("✗  {e}");
             std::process::exit(1);
         }

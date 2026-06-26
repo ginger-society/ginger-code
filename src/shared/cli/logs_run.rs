@@ -4,6 +4,11 @@
 // tekton-sidekick SSE endpoint (`GET /runs/<run_name>/stream`) and renders
 // the event stream live in the terminal.
 //
+// Pass `--raw` to get newline-delimited JSON instead (no color, no
+// banner) -- meant for AI coding agents or other tooling consuming this
+// programmatically rather than a person reading it. See
+// `print_raw_line` near the bottom for the exact line format.
+//
 // Not a TUI — no alternate screen, no redraw-in-place. It's a flat,
 // append-only stream, and deliberately does NOT use nested box-drawing
 // (┌─/│/└─) per task. That looked good for a single linear task-by-task
@@ -372,7 +377,17 @@ impl Renderer {
 /// `http://localhost:8000` via port-forward) -- passed in by the caller
 /// rather than hardcoded, since it differs between local dev and in-cluster
 /// use.
-pub async fn stream_run_logs(base_url: &str, run_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `raw`, when true, switches from the colored human-facing renderer to
+/// newline-delimited JSON (NDJSON) on stdout -- one line per SSE event,
+/// each a JSON object with an `"event"` field plus whatever fields that
+/// event type carries (see `print_raw_line` below for the exact shape).
+/// Intended for AI coding agents or other tooling that wants to consume
+/// this stream programmatically rather than read it: no ANSI color, no
+/// banner/skeleton decoration, no box-drawing or alignment padding --
+/// just one parseable object per line, in the same order the server sent
+/// them.
+pub async fn stream_run_logs(base_url: &str, run_name: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!(
         "{}/runs/{}/stream",
         base_url.trim_end_matches('/'),
@@ -383,16 +398,51 @@ pub async fn stream_run_logs(base_url: &str, run_name: &str) -> Result<(), Box<d
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
-        eprintln!(
-            "{}  sidekick returned HTTP {} for run '{}'",
-            red("✗"),
-            response.status(),
-            run_name
-        );
+        if raw {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "error",
+                    "message": format!("sidekick returned HTTP {} for run '{}'", response.status(), run_name)
+                })
+            );
+        } else {
+            eprintln!(
+                "{}  sidekick returned HTTP {} for run '{}'",
+                red("✗"),
+                response.status(),
+                run_name
+            );
+        }
         std::process::exit(1);
     }
 
     let mut stream = response.bytes_stream().eventsource();
+
+    if raw {
+        // No banner, no buffering-until-meta, no renderer state at all --
+        // each SSE event already arrives as a complete, valid JSON
+        // object in `event.data`; just tag it with its event type and
+        // print it straight through, one per line, in arrival order.
+        while let Some(event) = stream.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "error", "message": format!("connection error: {e}") })
+                    );
+                    break;
+                }
+            };
+            print_raw_line(&event.event, &event.data);
+            if event.event == "done" {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
     let mut renderer: Option<Renderer> = None;
     // Holds events that arrive before `meta` (shouldn't happen per the
     // protocol over a single ordered HTTP stream, but cheap insurance
@@ -433,6 +483,46 @@ pub async fn stream_run_logs(base_url: &str, run_name: &str) -> Result<(), Box<d
     }
 
     Ok(())
+}
+
+/// Print one NDJSON line for `--raw` mode: `event.data` is already a
+/// complete, valid JSON object as sent by the server (every payload in
+/// `models::run_stream` on the sidekick side is a plain serde-derived
+/// struct, so this is guaranteed to be a JSON *object*, never an array
+/// or bare value). We parse it generically (not into this CLI's local
+/// structs) and splice in an `"event"` field, then re-serialize -- this
+/// guarantees byte-for-byte-equivalent fidelity with whatever the server
+/// actually sent (every field preserved exactly, including any this
+/// CLI's typed structs don't happen to declare), without the fragility
+/// of trying to string-splice JSON text directly.
+fn print_raw_line(event_name: &str, data_json: &str) {
+    let mut value: serde_json::Value = match serde_json::from_str(data_json) {
+        Ok(v) => v,
+        Err(_) => {
+            // Server sent something that didn't parse as JSON -- still
+            // emit a well-formed NDJSON line rather than silently
+            // dropping it or panicking, with the raw text preserved
+            // as a string field for debugging.
+            println!(
+                "{}",
+                serde_json::json!({ "event": event_name, "raw": data_json })
+            );
+            return;
+        }
+    };
+
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert("event".to_string(), serde_json::Value::String(event_name.to_string()));
+        println!("{}", value);
+    } else {
+        // Shouldn't happen given every payload type here is a struct
+        // (which always serializes to a JSON object), but handle it
+        // rather than assume.
+        println!(
+            "{}",
+            serde_json::json!({ "event": event_name, "data": value })
+        );
+    }
 }
 
 fn dispatch(event_name: &str, data: &str, renderer: &mut Renderer) -> Result<(), Box<dyn std::error::Error>> {
@@ -486,7 +576,8 @@ fn urlencode_path_segment(s: &str) -> String {
 //
 //      mod logs_run;
 //
-// 3. Add a subcommand variant to the `Cmd` enum:
+// 3. Add a subcommand variant to the `Cmd` enum, including the new
+//    `--raw` flag:
 //
 //      /// Stream logs for a Tekton PipelineRun (live or archived)
 //      LogsRun {
@@ -496,14 +587,21 @@ fn urlencode_path_segment(s: &str) -> String {
 //          /// Base URL of the tekton-sidekick service
 //          #[arg(long, env = "SIDEKICK_URL", default_value = "http://localhost:8000")]
 //          sidekick_url: String,
+//
+//          /// Print newline-delimited JSON instead of the colored
+//          /// human-facing view -- no ANSI color, no banner, one JSON
+//          /// object per line. Intended for AI coding agents or other
+//          /// tooling consuming this stream programmatically.
+//          #[arg(long, default_value_t = false)]
+//          raw: bool,
 //      },
 //
 // 4. Handle it in main(), before the generic `send(...)` dispatch block --
 //    LogsRun talks directly to tekton-sidekick over HTTP rather than
 //    going through the daemon's unix-socket `send()`:
 //
-//      if let Some(Cmd::LogsRun { run_name, sidekick_url }) = &cli.command {
-//          if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name).await {
+//      if let Some(Cmd::LogsRun { run_name, sidekick_url, raw }) = &cli.command {
+//          if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name, *raw).await {
 //              eprintln!("✗  {e}");
 //              std::process::exit(1);
 //          }
@@ -514,4 +612,6 @@ fn urlencode_path_segment(s: &str) -> String {
 //
 //      ginger-code logs-run nightly-build-042
 //      ginger-code logs-run nightly-build-042 --sidekick-url http://tekton-sidekick.mycluster.dev
+//      ginger-code logs-run nightly-build-042 --raw
+//      ginger-code logs-run nightly-build-042 --raw | jq .
 //      SIDEKICK_URL=http://localhost:8000 ginger-code logs-run nightly-build-042
