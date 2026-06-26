@@ -178,76 +178,50 @@ fn draw_left_pane(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn build_list_item<'a>(state: &'a AppState, row: &'a Selection, idx: usize) -> ListItem<'a> {
-    let is_selected = idx == state.cursor_pos;
-
     match row {
         Selection::Task(task_name) => {
-            let task_idx = state
-                .tasks
-                .iter()
-                .position(|t| &t.name == task_name)
-                .unwrap_or(0);
+            let task_idx = state.tasks.iter().position(|t| &t.name == task_name).unwrap_or(0);
             let task = &state.tasks[task_idx];
             let color = task_color(task_idx);
-
             let (status_sty, icon) = status_style(&task.status);
 
-            let expand_indicator = if task.steps.is_empty() {
-                "  "
-            } else if task.expanded {
-                "▾ "
+            // No expand indicator at all — steps are always visible.
+            let step_count = if task.steps.is_empty() {
+                String::new()
             } else {
-                "▸ "
+                format!(" ({})", task.steps.len())
             };
-
-            let step_count = format!(" ({})", task.steps.len());
 
             let line = Line::from(vec![
                 Span::styled(icon, status_sty),
                 Span::raw(" "),
-                Span::styled(expand_indicator, Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     task_name.as_str(),
-                    Style::default()
-                        .fg(color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    step_count,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(step_count, Style::default().fg(Color::DarkGray)),
             ]);
 
             ListItem::new(line)
         }
 
         Selection::Step { task, step } => {
-            let task_idx = state
-                .tasks
-                .iter()
-                .position(|t| &t.name == task)
-                .unwrap_or(0);
+            // Unchanged — indented step row.
+            let task_idx = state.tasks.iter().position(|t| &t.name == task).unwrap_or(0);
             let task_state = &state.tasks[task_idx];
             let color = task_color(task_idx);
-
-            let step_state = task_state
-                .steps
-                .iter()
-                .find(|s| &s.name == step);
-
+            let step_state = task_state.steps.iter().find(|s| &s.name == step);
             let (status_sty, icon) = step_state
                 .map(|s| status_style(&s.status))
                 .unwrap_or((Style::default().fg(Color::DarkGray), "?"));
 
             let line = Line::from(vec![
-                Span::raw("    "),
+                Span::raw("  "),
                 Span::styled(icon, status_sty),
                 Span::raw(" "),
                 Span::styled("▸", Style::default().fg(color)),
-                Span::styled(
-                    step.as_str(),
-                    Style::default().fg(Color::Reset),
-                ),
+                Span::raw(" "),
+                Span::styled(step.as_str(), Style::default().fg(Color::Reset)),
             ]);
 
             ListItem::new(line)
@@ -357,7 +331,7 @@ fn draw_footer(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let hints = format!(
-        " ↑/↓ navigate  →/Enter expand  ←/Esc collapse  PgUp/PgDn scroll logs  q quit{done_hint}"
+        " ↑/↓ navigate  PgUp/PgDn scroll logs  q quit{done_hint}"
     );
 
     let footer = Paragraph::new(hints)

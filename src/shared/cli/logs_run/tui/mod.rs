@@ -99,27 +99,14 @@ pub async fn run(
                         state.move_down();
                         terminal.draw(|f| ui::draw(f, &state))?;
                     }
-                    KeyCode::Right | KeyCode::Enter => {
-                        state.expand_or_collapse(true);
-                        terminal.draw(|f| ui::draw(f, &state))?;
-                    }
-                    KeyCode::Left | KeyCode::Esc => {
-                        state.expand_or_collapse(false);
-                        terminal.draw(|f| ui::draw(f, &state))?;
-                    }
                     KeyCode::PageUp => {
-                        // Scroll log pane up by half the terminal height.
                         let half = (terminal.size()?.height / 2) as usize;
-                        for _ in 0..half {
-                            state.scroll_log_up();
-                        }
+                        for _ in 0..half { state.scroll_log_up(); }
                         terminal.draw(|f| ui::draw(f, &state))?;
                     }
                     KeyCode::PageDown => {
                         let half = (terminal.size()?.height / 2) as usize;
-                        for _ in 0..half {
-                            state.scroll_log_down(half);
-                        }
+                        for _ in 0..half { state.scroll_log_down(half); }
                         terminal.draw(|f| ui::draw(f, &state))?;
                     }
                     _ => {}

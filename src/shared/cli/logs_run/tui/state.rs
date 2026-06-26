@@ -47,7 +47,6 @@ pub struct TaskState {
     pub status: RunStatus,
     pub reason: Option<String>,
     pub steps: Vec<StepState>,
-    pub expanded: bool,
 }
 
 // ── Log storage ───────────────────────────────────────────────────────────
@@ -146,7 +145,6 @@ impl AppState {
                         reason: s.reason,
                     })
                     .collect(),
-                expanded: false,
             };
             self.task_index.insert(task.name, i);
             self.tasks.push(ts);
@@ -169,33 +167,49 @@ impl AppState {
             .unwrap_or("--:--:--")
             .to_string();
 
-        // Git (and other tools) emit progress lines using \r to overwrite
-        // in place. A raw terminal handles this by moving the cursor back
-        // to column 0, so only the *last* \r-separated segment is visible.
-        // We simulate that here: split on \r, keep the last non-empty
-        // segment. This also strips any stray \r\n line endings.
         let text = log
             .line
             .split('\r')
             .filter(|s| !s.is_empty())
             .last()
             .unwrap_or(&log.line)
-            .trim_end_matches('\n')
+            .trim_end()
             .to_string();
 
-        // Skip lines that are empty after sanitization (pure \r flicker
-        // frames with no final content, e.g. intermediate git progress
-        // that resolved to nothing).
         if text.is_empty() {
             return;
         }
 
         self.log_lines.push(StoredLogLine {
-            task: log.task,
-            step: log.step,
+            task: log.task.clone(),
+            step: log.step.clone(),
             timestamp: ts,
             text,
         });
+
+        // If we're receiving logs for a task/step that's still Pending or
+        // Unknown, it must be running — promote it. We never demote: a step
+        // already Succeeded or Failed stays that way even if a stale log
+        // line arrives out of order (can happen with archived runs).
+        if let Some(&ti) = self.task_index.get(&log.task) {
+            if matches!(self.tasks[ti].status, RunStatus::Pending | RunStatus::Unknown) {
+                self.tasks[ti].status = RunStatus::Running;
+            }
+
+            if let Some(step) = self.tasks[ti].steps.iter_mut().find(|s| s.name == log.step) {
+                if matches!(step.status, RunStatus::Pending | RunStatus::Unknown) {
+                    step.status = RunStatus::Running;
+                }
+            } else {
+                // Step not yet declared (meta sent 0 steps) — create it as Running.
+                self.tasks[ti].steps.push(StepState {
+                    name: log.step,
+                    status: RunStatus::Running,
+                    reason: None,
+                });
+                self.rebuild_flat_rows();
+            }
+        }
 
         if self.log_follow {
             self.log_scroll = usize::MAX;
@@ -207,6 +221,16 @@ impl AppState {
             if let Some(step) = self.tasks[ti].steps.iter_mut().find(|s| s.name == upd.step) {
                 step.status = upd.status;
                 step.reason = upd.reason;
+            } else {
+                // Step wasn't declared in meta (server sent 0 steps for this
+                // task) — create it on first status update so it appears in
+                // the list and can be expanded/selected.
+                self.tasks[ti].steps.push(StepState {
+                    name: upd.step,
+                    status: upd.status,
+                    reason: upd.reason,
+                });
+                self.rebuild_flat_rows();
             }
         }
     }
@@ -236,20 +260,16 @@ impl AppState {
         self.flat_rows.clear();
         for task in &self.tasks {
             self.flat_rows.push(Selection::Task(task.name.clone()));
-            if task.expanded {
-                for step in &task.steps {
-                    self.flat_rows.push(Selection::Step {
-                        task: task.name.clone(),
-                        step: step.name.clone(),
-                    });
-                }
+            for step in &task.steps {
+                self.flat_rows.push(Selection::Step {
+                    task: task.name.clone(),
+                    step: step.name.clone(),
+                });
             }
         }
-        // Keep cursor_pos in bounds.
         if self.cursor_pos >= self.flat_rows.len() {
             self.cursor_pos = self.flat_rows.len().saturating_sub(1);
         }
-        // Sync selection.
         self.selection = self.flat_rows.get(self.cursor_pos).cloned();
     }
 
@@ -277,7 +297,6 @@ impl AppState {
         match self.selection.clone() {
             Some(Selection::Task(ref task_name)) => {
                 if let Some(&ti) = self.task_index.get(task_name) {
-                    self.tasks[ti].expanded = expand;
                     self.rebuild_flat_rows();
                     // After expanding, move cursor to first step if it exists.
                     if expand && !self.tasks[ti].steps.is_empty() {
@@ -295,7 +314,6 @@ impl AppState {
                 if !expand {
                     // Collapse: move cursor to parent task row.
                     if let Some(&ti) = self.task_index.get(task) {
-                        self.tasks[ti].expanded = false;
                         self.rebuild_flat_rows();
                         if let Some(pos) = self
                             .flat_rows
