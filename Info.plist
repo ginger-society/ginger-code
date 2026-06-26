@@ -5,14 +5,18 @@
 <dict>
   <key>CFBundleExecutable</key>
   <string>ginger-code</string>
+  <key>CFBundleDisplayName</key>
+  <string>Ginger Code</string>
   <key>CFBundleIdentifier</key>
-  <string>com.gingersociety.ginger-code</string>
+  <string>org.gingersociety.ginger-code</string>
   <key>CFBundleName</key>
   <string>ginger-code</string>
   <key>CFBundleVersion</key>
   <string>1.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>ginger-code</string>
   <key>LSUIElement</key>
   <true/>                    <!-- ← this is the magic: hides Dock icon + no terminal -->
   <key>NSHighResolutionCapable</key>

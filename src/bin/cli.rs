@@ -1,12 +1,10 @@
 use clap::{Parser, Subcommand};
-
 use ginger_shared_rs::utils::get_token_from_file_storage;
 use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, handle_branch,
-    print_deployments, print_status, send,
+    check_session_guard, handle_branch, logs_run, print_deployments, print_status, send,
 };
 
 #[derive(Parser)]
@@ -56,6 +54,16 @@ enum Cmd {
     /// Show the current active branch and env info
     Status,
 
+    /// Stream logs for a Tekton PipelineRun (live or archived)
+    LogsRun {
+        /// The PipelineRun's generated name
+        run_name: String,
+ 
+        /// Base URL of the tekton-sidekick service
+        #[arg(long, env = "SIDEKICK_URL", default_value = "http://localhost:8000")]
+        sidekick_url: String,
+    },
+
     #[command(hide = true)]
     Config,
 }
@@ -85,6 +93,14 @@ async fn main() {
         return;
     }
 
+    if let Cmd::LogsRun { ref run_name, ref sidekick_url } = cmd {
+        if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name).await {
+            eprintln!("✗  {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let val = match cmd {
         Cmd::Ping => send(r#"{"cmd":"ping"}"#),
 
@@ -106,7 +122,7 @@ async fn main() {
             }).to_string())
         }
 
-        Cmd::Config | Cmd::Status => unreachable!(),
+        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. }=> unreachable!(),
     };
 
     match val["status"].as_str() {

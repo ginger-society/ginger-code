@@ -21,7 +21,7 @@ toml        = "0.7"
 serde_json  = "1"
 indexmap    = "2"
 libc        = "0.2"
-clap        = { version = "4", features = ["derive"] }
+clap        = { version = "4", features = ["derive", "env"] }
 MetadataService = { path = "./MetadataService_client" }
 ginger-shared-rs = {version = "0.51.0-nightly.0", organization = "ginger-society"}
 IAMService = { path = "./IAMService_client" }
@@ -57,6 +57,10 @@ ginger-gitter = { path = "./ginger-gitter_client" }
 lazy_static = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures-util = "0.3.31"
+
 
 [package.metadata]
 organization = "ginger-society"

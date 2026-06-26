@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use kube::Client;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tracing::{error, info, warn};
 
 // ── Global state ──────────────────────────────────────────────────────────────
 
@@ -70,6 +71,17 @@ fn hooks_path() -> PathBuf {
 }
 
 pub async fn run_auth_refresh_hook() {
+    // CHANGED: every eprintln! in this function is now a tracing:: call.
+    // eprintln! writes to raw stderr (fd 2), which goes nowhere useful when
+    // launched as a bundled .app (no terminal attached) — it does NOT reach
+    // the CappedFileWriter-backed log file that tracing_subscriber writes to
+    // in init_logging(). That's almost certainly why hook activity vanished
+    // from the log entirely when running from the .app bundle versus from a
+    // terminal: it was never a PATH/spawn failure, it was output going to a
+    // file descriptor nobody was reading. tracing:: macros go through the
+    // same subscriber as every other log line in this codebase, so hook
+    // activity will now show up in ~/.ginger-society/logs/ginger-code.log
+    // regardless of how the binary was launched.
     let cooldown_arc = HOOK_COOLDOWN
         .get_or_init(|| async { Arc::new(Mutex::new(None)) })
         .await;
@@ -81,9 +93,9 @@ pub async fn run_auth_refresh_hook() {
             Some(t) => t.elapsed() >= AUTH_HOOK_COOLDOWN,
         };
         if !should_run {
-            eprintln!(
-                "[k8s_client] auth-refresh hook skipped — within {}s cooldown",
-                AUTH_HOOK_COOLDOWN.as_secs()
+            warn!(
+                cooldown_secs = AUTH_HOOK_COOLDOWN.as_secs(),
+                "auth-refresh hook skipped — within cooldown"
             );
             return;
         }
@@ -92,6 +104,7 @@ pub async fn run_auth_refresh_hook() {
 
     let hook = hooks_path().join("k8-auth-refresh.sh");
     if !hook.exists() {
+        warn!(path = %hook.display(), "auth-refresh hook script not found — skipping");
         return;
     }
 
@@ -102,42 +115,46 @@ pub async fn run_auth_refresh_hook() {
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false);
         if !executable {
-            eprintln!(
-                "[k8s_client] hook {} exists but is not executable — skipping",
-                hook.display()
-            );
+            warn!(path = %hook.display(), "hook exists but is not executable — skipping");
             return;
         }
     }
 
-    eprintln!("[k8s_client] running auth-refresh hook: {}", hook.display());
+    // NEW: log the environment the hook will actually run with. If PATH is
+    // ever the real culprit (bundled .app launched without a shell profile),
+    // this line tells you immediately rather than requiring guesswork.
+    info!(
+        path = %hook.display(),
+        env_path = %std::env::var("PATH").unwrap_or_default(),
+        "running auth-refresh hook"
+    );
 
     let run = tokio::process::Command::new(&hook).output();
     match tokio::time::timeout(Duration::from_secs(30), run).await {
         Ok(Ok(out)) => {
             if !out.stdout.is_empty() {
-                eprintln!(
-                    "[k8s_client] hook stdout: {}",
-                    String::from_utf8_lossy(&out.stdout)
+                info!(
+                    stdout = %String::from_utf8_lossy(&out.stdout),
+                    "hook stdout"
                 );
             }
             if !out.stderr.is_empty() {
-                eprintln!(
-                    "[k8s_client] hook stderr: {}",
-                    String::from_utf8_lossy(&out.stderr)
+                warn!(
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "hook stderr"
                 );
             }
             if out.status.success() {
-                eprintln!("[k8s_client] auth-refresh hook completed");
+                info!("auth-refresh hook completed");
             } else {
-                eprintln!(
-                    "[k8s_client] hook exited {:?} — continuing anyway",
-                    out.status.code()
+                error!(
+                    exit_code = ?out.status.code(),
+                    "hook exited non-zero — continuing anyway"
                 );
             }
         }
-        Ok(Err(e)) => eprintln!("[k8s_client] failed to spawn hook: {e}"),
-        Err(_)     => eprintln!("[k8s_client] hook timed out after 30s"),
+        Ok(Err(e)) => error!(error = %e, "failed to spawn hook"),
+        Err(_)     => error!("hook timed out after 30s"),
     }
 }
 
@@ -153,18 +170,18 @@ async fn fresh_client() -> Result<Client, Box<dyn std::error::Error + Send + Syn
 
 /// Rebuild and store in the global cell; returns the new client.
 async fn rebuild_client_inner() -> Option<Client> {
-    eprintln!("[k8s_client] rebuilding kube client from latest kubeconfig");
+    info!("rebuilding kube client from latest kubeconfig");
 
     match fresh_client().await {
         Ok(new_client) => {
             if let Some(arc) = CLIENT.get() {
                 *arc.lock().await = new_client.clone();
-                eprintln!("[k8s_client] client refreshed");
+                info!("client refreshed");
             }
             Some(new_client)
         }
         Err(e) => {
-            eprintln!("[k8s_client] kubeconfig reload failed: {e}");
+            error!(error = %e, "kubeconfig reload failed");
             None
         }
     }
