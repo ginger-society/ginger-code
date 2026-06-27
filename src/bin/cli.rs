@@ -4,7 +4,7 @@ use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, handle_branch, logs_run, print_deployments, print_status, send,
+    check_session_guard, handle_branch, logs_run, print_deployments, print_status, push_helpers::{git_push, resolve_branch, resolve_remote}, send,
 };
 
 #[derive(Parser)]
@@ -56,6 +56,8 @@ enum Cmd {
 
     /// Stream logs for a Tekton PipelineRun (live or archived)
     LogsRun {
+        /// namespace : {workspace}-{reponame}
+        namespace: String,
         /// The PipelineRun's generated name
         run_name: String,
  
@@ -67,6 +69,27 @@ enum Cmd {
         /// human-facing view -- no ANSI color, no banner, one JSON
         /// object per line. Intended for AI coding agents or other
         /// tooling consuming this stream programmatically.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+
+    /// Push to git remote and watch triggered pipelines
+    Push {
+        /// Git remote (defaults to origin or sole remote)
+        remote: Option<String>,
+
+        /// Branch to push (defaults to current branch)
+        branch: Option<String>,  // ← positional, no #[arg(short, long)]
+
+        /// Base URL of the tekton-sidekick service
+        #[arg(long, env = "SIDEKICK_URL", default_value = "https://tekton.gingersociety.org/sidekick")]
+        sidekick_url: String,
+
+        /// Don't open TUI after push, just print triggered pipelines
+        #[arg(long, default_value_t = false)]
+        no_watch: bool,
+
+        /// Use raw NDJSON mode instead of TUI
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
@@ -100,10 +123,62 @@ async fn main() {
         return;
     }
 
-    if let Cmd::LogsRun { ref run_name, ref sidekick_url, raw } = cmd {
-        if let Err(e) = logs_run::stream_run_logs(sidekick_url, run_name, raw).await {
+    if let Cmd::LogsRun { ref namespace, ref run_name, ref sidekick_url, raw } = cmd {
+        let targets = vec![logs_run::RunTarget {
+            namespace: namespace.clone(),
+            run_name: run_name.clone(),
+        }];
+        if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
             eprintln!("✗  {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+
+
+    if let Cmd::Push { ref remote, ref branch, ref sidekick_url, no_watch, raw } = cmd {
+        let remote = match resolve_remote(remote).await {
+            Ok(r) => r,
+            Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+        };
+        let branch = match resolve_branch(branch).await {
+            Ok(b) => b,
+            Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+        };
+
+        let triggered = match git_push(&remote, &branch).await {
+            Ok(t) => t,
+            Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+        };
+
+        if triggered.is_empty() {
+            println!("✓ Pushed — no pipelines triggered");
+            return;
+        }
+
+        println!("\n✓ {} pipeline(s) triggered:\n", triggered.len());
+        for p in &triggered {
+            println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
+            println!("    namespace: {}", p.namespace);
+        }
+
+        if no_watch {
+            return;
+        }
+
+        if !no_watch && !triggered.is_empty() {
+            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
+                logs_run::RunTarget {
+                    namespace: p.namespace.clone(),
+                    run_name: p.run_name.clone(),
+                }
+            }).collect();
+
+            if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
+                eprintln!("✗  {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -129,7 +204,7 @@ async fn main() {
             }).to_string())
         }
 
-        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. }=> unreachable!(),
+        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. } | Cmd::Push{..}=> unreachable!(),
     };
 
     match val["status"].as_str() {

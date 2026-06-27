@@ -1,15 +1,4 @@
 // src/bin/logs_run/tui/events.rs
-//
-// Runs two background tasks that feed into the TUI event loop via mpsc:
-//
-//   1. `sse_task`  — connects to tekton-sidekick SSE stream, deserializes
-//      events, sends `AppEvent::Sse(...)` to the main loop.
-//
-//   2. `key_task`  — polls `crossterm::event::read()` in a blocking thread
-//      (via `tokio::task::spawn_blocking`) and sends `AppEvent::Key(...)`.
-//      This avoids needing the `event-stream` feature flag on crossterm.
-//
-// The main loop (tui/mod.rs) does `tokio::select!` on both channels.
 
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers};
 use eventsource_stream::Eventsource;
@@ -35,40 +24,41 @@ pub enum SseEvent {
     UnknownEvent(String),
 }
 
+/// SSE event tagged with which pipeline run it came from.
+#[derive(Debug)]
+pub struct TaggedSseEvent {
+    pub run_name: String,
+    pub event: SseEvent,
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
-    Sse(SseEvent),
+    Sse(TaggedSseEvent),
     Key(KeyEvent),
     Tick,
 }
 
 // ── Key polling task ──────────────────────────────────────────────────────
-//
-// `crossterm::event::read()` is synchronous/blocking. We run it in a
-// `spawn_blocking` loop so it doesn't block the tokio runtime, and
-// forward `KeyEvent`s into the mpsc channel.
 
 pub fn spawn_key_task(tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || {
         loop {
-            // `poll` with a short timeout so the thread can exit cleanly
-            // if the channel is dropped (run finished / quit).
             match event::poll(std::time::Duration::from_millis(100)) {
                 Ok(true) => {
                     if let Ok(event::Event::Key(key)) = event::read() {
                         if tx.blocking_send(AppEvent::Key(key)).is_err() {
-                            break; // channel closed → TUI exited
+                            break;
                         }
                     }
                 }
-                Ok(false) => {} // timeout, loop
+                Ok(false) => {}
                 Err(_) => break,
             }
         }
     });
 }
 
-// ── Tick task (for animation / status refresh) ────────────────────────────
+// ── Tick task ─────────────────────────────────────────────────────────────
 
 pub fn spawn_tick_task(tx: mpsc::Sender<AppEvent>, interval_ms: u64) {
     tokio::spawn(async move {
@@ -83,26 +73,29 @@ pub fn spawn_tick_task(tx: mpsc::Sender<AppEvent>, interval_ms: u64) {
     });
 }
 
-// ── SSE task ─────────────────────────────────────────────────────────────
+// ── SSE task — one per pipeline run ───────────────────────────────────────
 
 pub async fn run_sse_task(
     base_url: String,
+    namespace: String,
     run_name: String,
     tx: mpsc::Sender<AppEvent>,
 ) {
     let url = format!(
-        "{}/runs/{}/stream",
+        "{}/runs/{}/{}/stream",
         base_url.trim_end_matches('/'),
-        urlencode_path_segment(&run_name)
+        urlencode_path_segment(&namespace),
+        urlencode_path_segment(&run_name),
     );
 
     let client = reqwest::Client::new();
     let response = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx
-                .send(AppEvent::Sse(SseEvent::ConnectionError(e.to_string())))
-                .await;
+            let _ = tx.send(AppEvent::Sse(TaggedSseEvent {
+                run_name: run_name.clone(),
+                event: SseEvent::ConnectionError(e.to_string()),
+            })).await;
             return;
         }
     };
@@ -113,28 +106,32 @@ pub async fn run_sse_task(
             response.status(),
             run_name
         );
-        let _ = tx
-            .send(AppEvent::Sse(SseEvent::ConnectionError(msg)))
-            .await;
+        let _ = tx.send(AppEvent::Sse(TaggedSseEvent {
+            run_name: run_name.clone(),
+            event: SseEvent::ConnectionError(msg),
+        })).await;
         return;
     }
 
     let mut stream = response.bytes_stream().eventsource();
-
     while let Some(event) = stream.next().await {
         let event = match event {
             Ok(e) => e,
             Err(e) => {
-                let _ = tx
-                    .send(AppEvent::Sse(SseEvent::ConnectionError(e.to_string())))
-                    .await;
+                let _ = tx.send(AppEvent::Sse(TaggedSseEvent {
+                    run_name: run_name.clone(),
+                    event: SseEvent::ConnectionError(e.to_string()),
+                })).await;
                 break;
             }
         };
 
         let sse = parse_sse_event(&event.event, &event.data);
         let is_done = matches!(sse, SseEvent::Done(_));
-        if tx.send(AppEvent::Sse(sse)).await.is_err() {
+        if tx.send(AppEvent::Sse(TaggedSseEvent {
+            run_name: run_name.clone(),
+            event: sse,
+        })).await.is_err() {
             break;
         }
         if is_done {
@@ -178,13 +175,7 @@ fn parse_sse_event(event_name: &str, data: &str) -> SseEvent {
 pub fn is_quit(key: &KeyEvent) -> bool {
     matches!(
         key,
-        KeyEvent {
-            code: KeyCode::Char('q'),
-            ..
-        } | KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        }
+        KeyEvent { code: KeyCode::Char('q'), .. }
+        | KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }
     )
 }

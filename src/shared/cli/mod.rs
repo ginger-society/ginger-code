@@ -4,6 +4,7 @@ pub mod handlers;
 pub mod session;
 pub mod socket;
 pub mod logs_run;
+pub mod push_helpers;
 // Flatten the most-used surface for callers
 pub use handlers::{handle_branch, print_deployments, print_status};
 pub use session::check_session_guard;

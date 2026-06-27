@@ -62,6 +62,7 @@ eventsource-stream = "0.2"
 futures-util = "0.3.31"
 
 
+
 [package.metadata]
 organization = "ginger-society"
 

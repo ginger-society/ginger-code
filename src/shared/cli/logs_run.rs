@@ -1,37 +1,24 @@
 // src/bin/logs_run.rs
-//
-// Entry point for `ginger-code logs-run <RUN_NAME>`.
-//
-// Delegates to one of two backends depending on the `--raw` / `--tui` flags:
-//
-//   (default / --tui)   tui::run   — full ratatui TUI: alternate screen,
-//                                    left pane task/step list, right pane
-//                                    scrollable logs, keyboard navigation.
-//
-//   --raw               raw::run   — newline-delimited JSON (NDJSON) on
-//                                    stdout, one object per SSE event,
-//                                    tagged with an `"event"` field.
-//                                    No ANSI color, no banner, no TUI.
-//                                    Intended for AI coding agents or other
-//                                    tooling consuming this stream
-//                                    programmatically.
-//
-// Wire types shared by both backends live in `wire`.
 
 pub mod raw;
 pub mod tui;
 pub mod wire;
 
-// ── Entry point ───────────────────────────────────────────────────────────
+/// A single pipeline run to watch, with its namespace.
+#[derive(Debug, Clone)]
+pub struct RunTarget {
+    pub namespace: String,
+    pub run_name: String,
+}
 
 pub async fn stream_run_logs(
     base_url: &str,
-    run_name: &str,
+    targets: Vec<RunTarget>,
     raw: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if raw {
-        self::raw::run(base_url, run_name).await
+        self::raw::run(base_url, targets).await
     } else {
-        self::tui::run(base_url, run_name).await
+        self::tui::run(base_url, targets).await
     }
 }
