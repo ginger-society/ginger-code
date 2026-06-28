@@ -5,6 +5,7 @@ use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
     check_session_guard, handle_branch, logs_run, print_deployments, print_status, push_helpers::{git_push, resolve_branch, resolve_remote}, send,
+    pipeline_run::run_pipeline_command,
 };
 
 #[derive(Parser)]
@@ -94,6 +95,27 @@ enum Cmd {
         raw: bool,
     },
 
+    Pipeline {
+       /// Git ref to look up — HEAD, HEAD~1, a branch name, a partial
+       /// SHA, etc. Defaults to HEAD (the last commit) when omitted.
+       #[arg(default_value = "HEAD")]
+       git_ref: String,
+
+       /// Override the namespace (defaults to tasks-{repo-name},
+       /// where repo-name is the git repo root's folder name).
+       #[arg(long)]
+       namespace: Option<String>,
+
+       /// Base URL of the tekton-sidekick service
+       #[arg(long, env = "SIDEKICK_URL", default_value = "https://tekton.gingersociety.org/sidekick")]
+       sidekick_url: String,
+
+       /// Print newline-delimited JSON instead of the colored
+       /// human-facing view — same convention as LogsRun/Push's --raw.
+       #[arg(long, default_value_t = false)]
+       raw: bool,
+   },
+
     #[command(hide = true)]
     Config,
 }
@@ -134,6 +156,14 @@ async fn main() {
         }
         return;
     }
+
+       if let Cmd::Pipeline { ref git_ref, ref namespace, ref sidekick_url, raw } = cmd {
+       if let Err(e) = run_pipeline_command(git_ref, namespace.clone(), sidekick_url, raw).await {
+           eprintln!("✗  {e}");
+           std::process::exit(1);
+       }
+       return;
+   }
 
 
 
@@ -183,6 +213,7 @@ async fn main() {
         return;
     }
 
+
     let val = match cmd {
         Cmd::Ping => send(r#"{"cmd":"ping"}"#),
 
@@ -204,7 +235,7 @@ async fn main() {
             }).to_string())
         }
 
-        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. } | Cmd::Push{..}=> unreachable!(),
+        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. } | Cmd::Push{..} | Cmd::Pipeline { .. }=> unreachable!(),
     };
 
     match val["status"].as_str() {

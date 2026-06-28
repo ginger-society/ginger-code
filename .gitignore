@@ -1,6 +1,7 @@
 /target
 MetadataService_client
 ginger-gitter_client
+tekton-sidekick_client
 IAMService_client
 .DS_Store
 ginger-code.app
