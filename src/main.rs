@@ -311,18 +311,7 @@ async fn resolve_pod(
 }
 
 // ── Core forward loop ─────────────────────────────────────────────────────────
-//
-// CHANGED: takes `active_conns: ActiveConnCounter` now — the shared, global
-// counter (not a per-forward one). This loop's own per-second tick no longer
-// makes any apiserver call itself; that's been pulled out into run_heartbeat
-// so N forwards don't each redundantly probe the same shared client. This
-// loop's only new responsibility is incrementing/decrementing the shared
-// counter around each connection's lifetime so the heartbeat knows whether
-// it's safe to probe.
-//
-// Everything about local socket persistence is UNCHANGED: the listener is
-// still bound once up front, accepted connections are still handed to their
-// own spawned copy task and never torn down by anything in this function.
+
 async fn run_forward(
     shared_client: SharedClient,
     entry:         DeploymentEntry,
@@ -422,19 +411,6 @@ async fn run_forward(
         info!(deployment = %name, pod = %pod_name, "resolved pod");
         update_status(&state_map, &name, ForwardStatus::Connected);
 
-        // REMOVED the once-per-outer-loop `pods_for_pf` snapshot that used
-        // to live here. It was captured exactly once when this lap of the
-        // loop started and then reused for every accept() until something
-        // forced the loop back around — which meant a heartbeat-triggered
-        // refresh of `shared_client` had NO effect on any forward already
-        // sitting idle in 'accept: the snapshot just kept pointing at the
-        // old, now-401-ing client. `pods_for_pf` is now derived fresh from
-        // `shared_client` inside the accept_result arm below, right before
-        // each portforward() call — so it always reflects whatever the
-        // heartbeat (or anything else) most recently swapped in, with no
-        // staleness window at all. The lock + clone is cheap and this is
-        // off the hot data path (it only runs once per NEW connection, not
-        // per byte), so there's no meaningful cost to dropping the snapshot.
 
         'accept: loop {
             tokio::select! {
@@ -444,10 +420,7 @@ async fn run_forward(
                 }
 
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    // CHANGED: no apiserver call here anymore — that's now the
-                    // centralized run_heartbeat task's job. This just keeps the
-                    // displayed status honest for the common case (no network
-                    // loss, no auth issue) without making any API call.
+
                     if !offline.load(Ordering::Relaxed) {
                         update_status(&state_map, &name, ForwardStatus::Connected);
                     }
@@ -462,26 +435,11 @@ async fn run_forward(
                         }
                     };
 
-                    // NEW: build pods_for_pf fresh, from whatever client is
-                    // currently in shared_client, right here — not from a
-                    // stale snapshot. This is the actual fix for "heartbeat
-                    // refreshed the client but green tunnels still 401 on
-                    // first real use": there is no more snapshot to go stale.
                     let mut pods_for_pf: Api<Pod> = {
                         let c = shared_client.lock().await;
                         Api::default_namespaced(c.clone())
                     };
 
-                    // FIXED: portforward() can still 401 in the rare window
-                    // where the token expires AFTER this snapshot was taken
-                    // but BEFORE portforward() completes (a few hundred ms
-                    // wide at most, vs. the previous unbounded staleness
-                    // window that could last as long as the forward stayed
-                    // idle). Kept as defense in depth: detect the 401
-                    // specifically, refresh inline, and retry portforward()
-                    // ONCE on the SAME accepted `tcp` socket before giving up.
-                    // From VS Code's point of view this just looks like a
-                    // slow connect, not a failed one.
                     let mut pf = match pods_for_pf
                         .portforward(&pod_name, &[entry.deployment_port])
                         .await
