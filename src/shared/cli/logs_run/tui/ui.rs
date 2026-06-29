@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame,
 };
 
@@ -299,13 +302,16 @@ fn draw_task_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, ar
 
 fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, area: Rect) {
     let title = match &pipeline.selection {
-        None                                          => " Logs ".to_string(),
-        Some(TaskSelection::Task(t))                  => format!(" Logs: {t} (all steps) "),
-        Some(TaskSelection::Step { task, step })      => format!(" Logs: {task} ▸ {step} "),
+        None                                     => " Logs ".to_string(),
+        Some(TaskSelection::Task(t))             => format!(" Logs: {t} (all steps) "),
+        Some(TaskSelection::Step { task, step }) => format!(" Logs: {task} ▸ {step} "),
     };
 
-    // Show [follow] or [manual] so the user always knows which mode is active
-    let follow_indicator = if pipeline.log_follow { " [follow]" } else { " [manual — Ctrl+↓ to follow]" };
+    let follow_indicator = if pipeline.log_follow {
+        " [follow]"
+    } else {
+        " [manual — Ctrl+↓ to follow]"
+    };
 
     let block = Block::default()
         .title(format!("{title}{follow_indicator}"))
@@ -316,6 +322,7 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
     let visible_height = inner.height as usize;
 
     let lines = pipeline.visible_log_lines();
+    let total = lines.len();
     let scroll = pipeline.clamped_log_scroll(visible_height);
 
     let show_step_prefix = matches!(&pipeline.selection, Some(TaskSelection::Task(_)));
@@ -345,7 +352,6 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
         })
         .collect();
 
-    let total = lines.len();
     let scroll_info = if total > 0 {
         let from = scroll + 1;
         let to = (scroll + visible_height).min(total);
@@ -367,7 +373,34 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
 
     frame.render_widget(log_widget, area);
 
-    // Empty state message centred in the pane
+    // ── Scrollbar ─────────────────────────────────────────────────────────
+    if total > visible_height {
+        // Reserve the rightmost column of `inner` for the scrollbar track.
+        let scrollbar_area = Rect {
+            x: inner.x + inner.width.saturating_sub(1),
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            });
+
+        let mut scrollbar_state = ScrollbarState::new(total.saturating_sub(visible_height))
+            .position(scroll);
+
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+
+    // ── Empty state ───────────────────────────────────────────────────────
     if total == 0 {
         let msg = if pipeline.error.is_some() {
             pipeline.error.as_deref().unwrap_or("connection error")

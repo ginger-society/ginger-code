@@ -4,7 +4,9 @@ use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, handle_branch, logs_run, print_deployments, print_status, push_helpers::{git_push, resolve_branch, resolve_remote}, send,
+    check_session_guard, handle_branch, logs_run, print_deployments, print_status,
+    push_helpers::{force_trigger, git_push, resolve_branch, resolve_remote},
+    send,
     pipeline_run::run_pipeline_command,
 };
 
@@ -61,15 +63,13 @@ enum Cmd {
         namespace: String,
         /// The PipelineRun's generated name
         run_name: String,
- 
+
         /// Base URL of the tekton-sidekick service
         #[arg(long, env = "SIDEKICK_URL", default_value = "http://localhost:8000")]
         sidekick_url: String,
 
-        /// Print newline-delimited JSON instead of the colored
-        /// human-facing view -- no ANSI color, no banner, one JSON
-        /// object per line. Intended for AI coding agents or other
-        /// tooling consuming this stream programmatically.
+        /// Print newline-delimited JSON instead of the colored human-facing
+        /// view — no ANSI color, no banner, one JSON object per line.
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
@@ -80,7 +80,7 @@ enum Cmd {
         remote: Option<String>,
 
         /// Branch to push (defaults to current branch)
-        branch: Option<String>,  // ← positional, no #[arg(short, long)]
+        branch: Option<String>,
 
         /// Base URL of the tekton-sidekick service
         #[arg(long, env = "SIDEKICK_URL", default_value = "https://tekton.gingersociety.org/sidekick")]
@@ -93,28 +93,34 @@ enum Cmd {
         /// Use raw NDJSON mode instead of TUI
         #[arg(long, default_value_t = false)]
         raw: bool,
+
+        /// Skip the git push and manually trigger pipelines for the current
+        /// branch — useful when code is already up to date on the remote.
+        /// Derives repo name from the current directory and triggered_by from
+        /// git config user.email. Opens the pipeline HEAD TUI on success
+        /// (pass --no-watch to suppress).
+        #[arg(long, default_value_t = false)]
+        force_pipeline: bool,
     },
 
     Pipeline {
-       /// Git ref to look up — HEAD, HEAD~1, a branch name, a partial
-       /// SHA, etc. Defaults to HEAD (the last commit) when omitted.
-       #[arg(default_value = "HEAD")]
-       git_ref: String,
+        /// Git ref to look up — HEAD, HEAD~1, a branch name, a partial
+        /// SHA, etc. Defaults to HEAD (the last commit) when omitted.
+        #[arg(default_value = "HEAD")]
+        git_ref: String,
 
-       /// Override the namespace (defaults to tasks-{repo-name},
-       /// where repo-name is the git repo root's folder name).
-       #[arg(long)]
-       namespace: Option<String>,
+        /// Override the namespace (defaults to tasks-{repo-name}).
+        #[arg(long)]
+        namespace: Option<String>,
 
-       /// Base URL of the tekton-sidekick service
-       #[arg(long, env = "SIDEKICK_URL", default_value = "https://tekton.gingersociety.org/sidekick")]
-       sidekick_url: String,
+        /// Base URL of the tekton-sidekick service
+        #[arg(long, env = "SIDEKICK_URL", default_value = "https://tekton.gingersociety.org/sidekick")]
+        sidekick_url: String,
 
-       /// Print newline-delimited JSON instead of the colored
-       /// human-facing view — same convention as LogsRun/Push's --raw.
-       #[arg(long, default_value_t = false)]
-       raw: bool,
-   },
+        /// Print newline-delimited JSON instead of the colored human-facing view.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 
     #[command(hide = true)]
     Config,
@@ -157,17 +163,61 @@ async fn main() {
         return;
     }
 
-       if let Cmd::Pipeline { ref git_ref, ref namespace, ref sidekick_url, raw } = cmd {
-       if let Err(e) = run_pipeline_command(git_ref, namespace.clone(), sidekick_url, raw).await {
-           eprintln!("✗  {e}");
-           std::process::exit(1);
-       }
-       return;
-   }
+    if let Cmd::Pipeline { ref git_ref, ref namespace, ref sidekick_url, raw } = cmd {
+        if let Err(e) = run_pipeline_command(git_ref, namespace.clone(), sidekick_url, raw).await {
+            eprintln!("✗  {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
+    if let Cmd::Push { ref remote, ref branch, ref sidekick_url, no_watch, raw, force_pipeline } = cmd {
 
+        // ── --force-pipeline: skip git push, trigger directly, open TUI ──────
+        if force_pipeline {
+            let branch = match resolve_branch(branch).await {
+                Ok(b) => b,
+                Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+            };
 
-    if let Cmd::Push { ref remote, ref branch, ref sidekick_url, no_watch, raw } = cmd {
+            println!("\n⚡ Force-triggering pipeline for branch '{branch}'...\n");
+
+            let triggered = match force_trigger(&branch).await {
+                Ok(t) => t,
+                Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+            };
+
+            if triggered.is_empty() {
+                println!("✓ Pipeline triggered — no runs were created (no .tekton files matched?)");
+                return;
+            }
+
+            println!("\n✓ {} pipeline(s) triggered:\n", triggered.len());
+            for p in &triggered {
+                println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
+                println!("    namespace: {}", p.namespace);
+            }
+
+            if no_watch {
+                return;
+            }
+
+            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
+                logs_run::RunTarget {
+                    namespace: p.namespace.clone(),
+                    run_name:  p.run_name.clone(),
+                }
+            }).collect();
+
+            if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
+                eprintln!("✗  {e}");
+                std::process::exit(1);
+            }
+
+            return;
+        }
+
+        // ── normal push path ──────────────────────────────────────────────────
         let remote = match resolve_remote(remote).await {
             Ok(r) => r,
             Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
@@ -197,22 +247,20 @@ async fn main() {
             return;
         }
 
-        if !no_watch && !triggered.is_empty() {
-            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
-                logs_run::RunTarget {
-                    namespace: p.namespace.clone(),
-                    run_name: p.run_name.clone(),
-                }
-            }).collect();
-
-            if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
-                eprintln!("✗  {e}");
-                std::process::exit(1);
+        let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
+            logs_run::RunTarget {
+                namespace: p.namespace.clone(),
+                run_name: p.run_name.clone(),
             }
+        }).collect();
+
+        if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
+            eprintln!("✗  {e}");
+            std::process::exit(1);
         }
+
         return;
     }
-
 
     let val = match cmd {
         Cmd::Ping => send(r#"{"cmd":"ping"}"#),
@@ -235,7 +283,9 @@ async fn main() {
             }).to_string())
         }
 
-        Cmd::Config | Cmd::Status  | Cmd::LogsRun { .. } | Cmd::Push{..} | Cmd::Pipeline { .. }=> unreachable!(),
+        Cmd::Config | Cmd::Status | Cmd::LogsRun { .. } | Cmd::Push { .. } | Cmd::Pipeline { .. } => {
+            unreachable!()
+        }
     };
 
     match val["status"].as_str() {
