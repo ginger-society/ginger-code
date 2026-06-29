@@ -3,19 +3,23 @@ organization_id = "ginger-society"
 dir = "."
 spec_url = "/openapi.json"
 
+[services."@ginger-society/tekton-sidekick"]
+prod = "https://tekton.gingersociety.org/sidekick"
+stage = "https://tekton.gingersociety.org/sidekick"
+
+[services."@ginger-society/IAMService"]
+stage = "https://api.gingersociety.org/iam"
+prod = "https://api.gingersociety.org/iam"
+stage_k8 = "http://iam-service-api-service/iam"
+prod_k8 = "http://iam-service-api-service/iam"
+
+[services."@ginger-society/ginger-gitter"]
+stage = "https://source.gingersociety.org"
+prod = "https://source.gingersociety.org"
+
 [services."@ginger-society/MetadataService"]
 stage = "https://api.gingersociety.org/metadata"
 prod = "https://api.gingersociety.org/metadata"
-
-[services."@ginger-society/IAMService"]
-stage_k8 = "http://iam-service-api-service/iam"
-prod = "https://api.gingersociety.org/iam"
-prod_k8 = "http://iam-service-api-service/iam"
-stage = "https://api.gingersociety.org/iam"
-
-[services."@ginger-society/tekton-sidekick"]
-stage = "https://tekton.gingersociety.org/sidekick"
-prod = "https://tekton.gingersociety.org/sidekick"
 
 [portals_refs]
 
@@ -23,11 +27,15 @@ prod = "https://tekton.gingersociety.org/sidekick"
 prod = ""
 stage = ""
 
+[ws_refs."@ginger-society/ginger-gitter"]
+stage = ""
+prod = ""
+
 [ws_refs."@ginger-society/IAMService"]
 stage = ""
+stage_k8 = ""
 prod_k8 = ""
 prod = ""
-stage_k8 = ""
 
 [ws_refs."@ginger-society/tekton-sidekick"]
 prod = ""
