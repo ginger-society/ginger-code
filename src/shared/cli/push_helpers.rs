@@ -37,10 +37,15 @@ fn parse_gitter_line(line: &str) -> Option<GitterEvent> {
     None
 }
 
+pub enum PushResult {
+    Triggered(Vec<TriggeredPipeline>),
+    UpToDate,
+}
+
 pub async fn git_push(
     remote: &str,
     branch: &str,
-) -> Result<Vec<TriggeredPipeline>, Box<dyn std::error::Error>> {
+) -> Result<PushResult, Box<dyn std::error::Error>> {
     let mut child = Command::new("git")
         .args(["push", remote, branch])
         .stdout(Stdio::piped())
@@ -53,9 +58,15 @@ pub async fn git_push(
     let mut current_namespace: Option<String> = None;
     let mut current_pipeline: Option<String> = None;
     let mut triggered: Vec<TriggeredPipeline> = Vec::new();
+    let mut up_to_date = false;
 
     while let Some(line) = lines.next_line().await? {
         eprintln!("{line}");
+
+        // detect "Everything up-to-date" from git
+        if line.contains("Everything up-to-date") {
+            up_to_date = true;
+        }
 
         match parse_gitter_line(&line) {
             Some(GitterEvent::Namespace(ns)) => {
@@ -85,7 +96,11 @@ pub async fn git_push(
         return Err(format!("git push failed with exit code {:?}", status.code()).into());
     }
 
-    Ok(triggered)
+    if up_to_date || triggered.is_empty() {
+        Ok(PushResult::UpToDate)
+    } else {
+        Ok(PushResult::Triggered(triggered))
+    }
 }
 
 /// Manually trigger a pipeline without pushing — used by `--force-pipeline`.

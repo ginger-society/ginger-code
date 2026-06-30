@@ -14,23 +14,6 @@ pub enum Focus {
     Logs,
 }
 
-// ── Per-pipeline task selection ───────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskSelection {
-    Task(String),
-    Step { task: String, step: String },
-}
-
-impl TaskSelection {
-    pub fn task_name(&self) -> &str {
-        match self {
-            TaskSelection::Task(t) => t,
-            TaskSelection::Step { task, .. } => task,
-        }
-    }
-}
-
 // ── Per-pipeline task/step state ──────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -56,6 +39,14 @@ pub struct StoredLogLine {
     pub text: String,
 }
 
+/// One renderable row in the accordion log view: either a step header
+/// (always shown) or a log line belonging to the currently-expanded step.
+#[derive(Debug)]
+pub enum LogRow<'a> {
+    Header { step: String, status: RunStatus },
+    Line(&'a StoredLogLine),
+}
+
 // ── Per-pipeline state ────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -72,12 +63,14 @@ pub struct PipelineState {
     task_index: HashMap<String, usize>,
     pub log_lines: Vec<StoredLogLine>,
 
-    pub selection: Option<TaskSelection>,
-    pub flat_rows: Vec<TaskSelection>,
+    /// Name of the task currently selected in the center panel.
+    pub selected_task: Option<String>,
     pub cursor_pos: usize,
 
     pub log_scroll: usize,
     pub log_follow: bool,
+    /// When true, all step accordion sections are collapsed (headers only).
+    pub logs_collapsed: bool,
 }
 
 impl PipelineState {
@@ -93,11 +86,11 @@ impl PipelineState {
             tasks: Vec::new(),
             task_index: HashMap::new(),
             log_lines: Vec::new(),
-            selection: None,
-            flat_rows: Vec::new(),
+            selected_task: None,
             cursor_pos: 0,
             log_scroll: 0,
             log_follow: true,
+            logs_collapsed: false,
         }
     }
 
@@ -123,10 +116,10 @@ impl PipelineState {
             self.tasks.push(ts);
         }
 
-        if !self.tasks.is_empty() {
-            self.selection = Some(TaskSelection::Task(self.tasks[0].name.clone()));
+        if !self.tasks.is_empty() && self.selected_task.is_none() {
+            self.cursor_pos = 0;
+            self.selected_task = Some(self.tasks[0].name.clone());
         }
-        self.rebuild_flat_rows();
     }
 
     pub fn apply_log_line(&mut self, log: LogLine) {
@@ -178,7 +171,6 @@ impl PipelineState {
                     status: RunStatus::Running,
                     reason: None,
                 });
-                self.rebuild_flat_rows();
             }
         }
 
@@ -200,7 +192,6 @@ impl PipelineState {
                     status: upd.status,
                     reason: upd.reason,
                 });
-                self.rebuild_flat_rows();
             }
         }
     }
@@ -218,65 +209,74 @@ impl PipelineState {
         self.duration_seconds = done.duration_seconds;
     }
 
-    // ── Task navigation ───────────────────────────────────────────────────
-
-    pub fn rebuild_flat_rows(&mut self) {
-        self.flat_rows.clear();
-        for task in &self.tasks {
-            self.flat_rows.push(TaskSelection::Task(task.name.clone()));
-            for step in &task.steps {
-                self.flat_rows.push(TaskSelection::Step {
-                    task: task.name.clone(),
-                    step: step.name.clone(),
-                });
-            }
-        }
-        if self.cursor_pos >= self.flat_rows.len() {
-            self.cursor_pos = self.flat_rows.len().saturating_sub(1);
-        }
-        self.selection = self.flat_rows.get(self.cursor_pos).cloned();
-    }
+    // ── Task navigation (center panel) ─────────────────────────────────────
 
     pub fn move_up(&mut self) {
         if self.cursor_pos > 0 {
             self.cursor_pos -= 1;
-            self.selection = self.flat_rows.get(self.cursor_pos).cloned();
-            // switching task resets log view to follow bottom
+            self.selected_task = self.tasks.get(self.cursor_pos).map(|t| t.name.clone());
             self.log_scroll = usize::MAX;
             self.log_follow = true;
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor_pos + 1 < self.flat_rows.len() {
+        if self.cursor_pos + 1 < self.tasks.len() {
             self.cursor_pos += 1;
-            self.selection = self.flat_rows.get(self.cursor_pos).cloned();
+            self.selected_task = self.tasks.get(self.cursor_pos).map(|t| t.name.clone());
             self.log_scroll = usize::MAX;
             self.log_follow = true;
         }
     }
 
+    // ── Log accordion ────────────────────────────────────────────────────
+
+    /// Toggle collapse/expand of all step sections in the logs panel.
+    pub fn toggle_logs_collapse(&mut self) {
+        self.logs_collapsed = !self.logs_collapsed;
+        self.log_follow = true;
+        self.log_scroll = usize::MAX;
+    }
+
+    /// Build the flattened accordion rows (headers + lines) for the
+    /// currently-selected task, in step order.
+    pub fn visible_log_rows(&self) -> Vec<LogRow<'_>> {
+        let mut rows = Vec::new();
+        let Some(task_name) = self.selected_task.as_ref() else { return rows; };
+        let Some(task) = self.tasks.iter().find(|t| &t.name == task_name) else { return rows; };
+
+        for step in &task.steps {
+            rows.push(LogRow::Header { step: step.name.clone(), status: step.status });
+            if !self.logs_collapsed {
+                for line in self.log_lines.iter()
+                    .filter(|l| &l.task == task_name && l.step == step.name)
+                {
+                    rows.push(LogRow::Line(line));
+                }
+            }
+        }
+        rows
+    }
+
     // ── Log scrolling ─────────────────────────────────────────────────────
 
-    /// Scroll up one line — disables follow mode so new lines don't yank
+    /// Scroll up one row — disables follow mode so new lines don't yank
     /// the view back to the bottom while the user is reading.
     pub fn scroll_log_up(&mut self) {
-        let count = self.visible_log_lines().len();
+        let count = self.visible_log_rows().len();
         if count == 0 { return; }
-        // Resolve current offset before mutating follow flag
         let current = self.clamped_log_scroll_raw(0); // height=0 → unclamped
-        if current == 0 { return; } // already at top, nothing to do
+        if current == 0 { return; }
         self.log_follow = false;
         self.log_scroll = current.saturating_sub(1);
     }
 
-    /// Scroll down one line. Re-enables follow mode if we reach the bottom.
+    /// Scroll down one row. Re-enables follow mode if we reach the bottom.
     pub fn scroll_log_down(&mut self, visible_height: usize) {
-        let count = self.visible_log_lines().len();
+        let count = self.visible_log_rows().len();
         let max = count.saturating_sub(visible_height);
         let current = self.clamped_log_scroll_raw(visible_height);
         if current >= max {
-            // At or past the bottom — snap to follow
             self.log_follow = true;
             self.log_scroll = usize::MAX;
         } else {
@@ -285,9 +285,9 @@ impl PipelineState {
         }
     }
 
-    /// Page up by `page` lines.
+    /// Page up by `page` rows.
     pub fn page_log_up(&mut self, page: usize) {
-        let count = self.visible_log_lines().len();
+        let count = self.visible_log_rows().len();
         if count == 0 { return; }
         let current = self.clamped_log_scroll_raw(0);
         if current == 0 { return; }
@@ -295,9 +295,9 @@ impl PipelineState {
         self.log_scroll = current.saturating_sub(page);
     }
 
-    /// Page down by `page` lines. Re-enables follow if we reach the bottom.
+    /// Page down by `page` rows. Re-enables follow if we reach the bottom.
     pub fn page_log_down(&mut self, page: usize, visible_height: usize) {
-        let count = self.visible_log_lines().len();
+        let count = self.visible_log_rows().len();
         let max = count.saturating_sub(visible_height);
         let current = self.clamped_log_scroll_raw(visible_height);
         let next = (current + page).min(max);
@@ -316,18 +316,6 @@ impl PipelineState {
         self.log_scroll = usize::MAX;
     }
 
-    // ── Queries ───────────────────────────────────────────────────────────
-
-    pub fn visible_log_lines(&self) -> Vec<&StoredLogLine> {
-        match &self.selection {
-            None => vec![],
-            Some(TaskSelection::Task(task)) => self.log_lines.iter()
-                .filter(|l| &l.task == task).collect(),
-            Some(TaskSelection::Step { task, step }) => self.log_lines.iter()
-                .filter(|l| &l.task == task && &l.step == step).collect(),
-        }
-    }
-
     /// Clamped scroll offset for rendering. Pass the actual visible height.
     pub fn clamped_log_scroll(&self, visible_height: usize) -> usize {
         self.clamped_log_scroll_raw(visible_height)
@@ -336,7 +324,7 @@ impl PipelineState {
     /// Internal — computes the real offset regardless of follow flag,
     /// used by scroll methods to know where we currently are.
     fn clamped_log_scroll_raw(&self, visible_height: usize) -> usize {
-        let count = self.visible_log_lines().len();
+        let count = self.visible_log_rows().len();
         let max = count.saturating_sub(visible_height);
         if self.log_follow || self.log_scroll > max { max } else { self.log_scroll }
     }

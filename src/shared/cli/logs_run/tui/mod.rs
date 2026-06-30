@@ -104,9 +104,13 @@ pub async fn run(
                     },
 
                     // ── Logs panel (rightmost panel) ──────────────────────
+                    // ── Logs panel (rightmost panel) ──────────────────────
                     Focus::Logs => match (key.code, key.modifiers) {
                         (KeyCode::Left, _) => {
                             state.focus = Focus::TaskLog;
+                        }
+                        (KeyCode::Char(' '), _) => {
+                            if let Some(p) = state.current_mut() { p.toggle_logs_collapse(); }
                         }
                         (KeyCode::Up, _) => {
                             if let Some(p) = state.current_mut() { p.scroll_log_up(); }
@@ -114,8 +118,7 @@ pub async fn run(
                         (KeyCode::Down, KeyModifiers::CONTROL) => {
                             // Ctrl+↓ re-enables auto-scroll / follow mode
                             if let Some(p) = state.current_mut() {
-                                p.log_follow = true;
-                                p.log_scroll = usize::MAX;
+                                p.follow_logs();
                             }
                         }
                         (KeyCode::Down, _) => {
@@ -127,13 +130,13 @@ pub async fn run(
                         (KeyCode::PageUp, _) => {
                             let half = (terminal.size()?.height / 2) as usize;
                             if let Some(p) = state.current_mut() {
-                                for _ in 0..half { p.scroll_log_up(); }
+                                p.page_log_up(half);
                             }
                         }
                         (KeyCode::PageDown, _) => {
                             let half = (terminal.size()?.height / 2) as usize;
                             if let Some(p) = state.current_mut() {
-                                for _ in 0..half { p.scroll_log_down(half); }
+                                p.page_log_down(half, half);
                             }
                         }
                         _ => {}

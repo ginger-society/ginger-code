@@ -11,24 +11,12 @@ use ratatui::{
     Frame,
 };
 
-use super::state::{AppState, Focus, PipelineState, TaskSelection};
+use super::state::{AppState, Focus, LogRow, PipelineState};
 use crate::shared::cli::logs_run::wire::RunStatus;
 
-// ── Palette ───────────────────────────────────────────────────────────────
+// ── Status visuals ───────────────────────────────────────────────────────
 
-const TASK_COLORS: &[Color] = &[
-    Color::Blue,
-    Color::Magenta,
-    Color::Cyan,
-    Color::Yellow,
-    Color::Green,
-    Color::Gray,
-];
-
-fn task_color(idx: usize) -> Color {
-    TASK_COLORS[idx % TASK_COLORS.len()]
-}
-
+/// Icon + style used for pipeline-level / step-header status badges.
 fn status_style(status: &RunStatus) -> (Style, &'static str) {
     match status {
         RunStatus::Succeeded => (Style::default().fg(Color::Green).add_modifier(Modifier::BOLD), "✓"),
@@ -39,12 +27,43 @@ fn status_style(status: &RunStatus) -> (Style, &'static str) {
     }
 }
 
+/// Plain status → color/style for the center task panel. No icon, no
+/// per-task palette — just a single, unambiguous signal: faded when not
+/// started, yellow while running, green on success, red on failure.
+fn task_label_style(status: &RunStatus) -> Style {
+    match status {
+        RunStatus::Succeeded => Style::default().fg(Color::Green),
+        RunStatus::Failed    => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        RunStatus::Running   => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        RunStatus::Pending   => Style::default().fg(Color::DarkGray),
+        RunStatus::Unknown   => Style::default().fg(Color::DarkGray),
+    }
+}
+
+/// Title style for a panel: an inverted (filled) bar when focused, so
+/// it's unmistakable which panel currently has keyboard focus.
+fn panel_title_style(focused: bool) -> Style {
+    if focused {
+        Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
 fn focused_border_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
     }
+}
+
+/// Build a bordered block whose title bar is inverted when focused.
+fn panel_block(title_spans: Vec<Span<'static>>, focused: bool, borders: Borders) -> Block<'static> {
+    Block::default()
+        .title(Line::from(title_spans))
+        .borders(borders)
+        .border_style(focused_border_style(focused))
 }
 
 // ── Top-level draw ────────────────────────────────────────────────────────
@@ -63,7 +82,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 
     draw_header(frame, state, vertical[0]);
 
-    // Three columns: pipeline list (20%), task/step list (25%), logs (55%).
+    // Three columns: pipeline list (20%), task list (25%), logs (55%).
     // If only one pipeline, collapse the pipeline list to 0 width — the
     // user never needs to switch between pipelines so the space is wasted.
     let constraints = if state.pipelines.len() == 1 {
@@ -165,10 +184,11 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
 fn draw_pipeline_list(frame: &mut Frame, state: &AppState, area: Rect) {
     let focused = state.focus == Focus::PipelineList;
 
-    let block = Block::default()
-        .title(" Pipelines ")
-        .borders(Borders::RIGHT | Borders::BOTTOM)
-        .border_style(focused_border_style(focused));
+    let block = panel_block(
+        vec![Span::styled(" Pipelines ", panel_title_style(focused))],
+        focused,
+        Borders::RIGHT | Borders::BOTTOM,
+    );
 
     let items: Vec<ListItem> = state.pipelines.iter().enumerate().map(|(i, p)| {
         let (status_sty, icon) = status_style(&p.run_status);
@@ -216,64 +236,29 @@ fn draw_pipeline_list(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-// ── Middle panel: task/step list ──────────────────────────────────────────
+// ── Middle panel: task list ───────────────────────────────────────────────
 
 fn draw_task_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, area: Rect) {
-    let block = Block::default()
-        .title(" Tasks ")
-        .borders(Borders::RIGHT | Borders::BOTTOM)
-        .border_style(focused_border_style(focused));
+    let block = panel_block(
+        vec![Span::styled(" Tasks ", panel_title_style(focused))],
+        focused,
+        Borders::RIGHT | Borders::BOTTOM,
+    );
 
     let inner = block.inner(area);
 
-    let items: Vec<ListItem> = pipeline.flat_rows.iter().map(|row| {
-        match row {
-            TaskSelection::Task(task_name) => {
-                let task_idx = pipeline.tasks.iter()
-                    .position(|t| &t.name == task_name)
-                    .unwrap_or(0);
-                let task = &pipeline.tasks[task_idx];
-                let color = task_color(task_idx);
-                let (status_sty, icon) = status_style(&task.status);
+    let items: Vec<ListItem> = pipeline.tasks.iter().map(|task| {
+        let label_style = task_label_style(&task.status);
+        let step_count = if task.steps.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", task.steps.len())
+        };
 
-                let step_count = if task.steps.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", task.steps.len())
-                };
-
-                ListItem::new(Line::from(vec![
-                    Span::styled(icon, status_sty),
-                    Span::raw(" "),
-                    Span::styled(
-                        task_name.as_str(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(step_count, Style::default().fg(Color::DarkGray)),
-                ]))
-            }
-
-            TaskSelection::Step { task, step } => {
-                let task_idx = pipeline.tasks.iter()
-                    .position(|t| &t.name == task)
-                    .unwrap_or(0);
-                let color = task_color(task_idx);
-                let step_state = pipeline.tasks[task_idx].steps.iter()
-                    .find(|s| &s.name == step);
-                let (status_sty, icon) = step_state
-                    .map(|s| status_style(&s.status))
-                    .unwrap_or((Style::default().fg(Color::DarkGray), "?"));
-
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(icon, status_sty),
-                    Span::raw(" "),
-                    Span::styled("▸", Style::default().fg(color)),
-                    Span::raw(" "),
-                    Span::styled(step.as_str(), Style::default().fg(Color::Reset)),
-                ]))
-            }
-        }
+        ListItem::new(Line::from(vec![
+            Span::styled(task.name.as_str(), label_style),
+            Span::styled(step_count, Style::default().fg(Color::DarkGray)),
+        ]))
     }).collect();
 
     let mut list_state = ListState::default();
@@ -298,57 +283,72 @@ fn draw_task_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, ar
     }
 }
 
-// ── Right panel: log lines ────────────────────────────────────────────────
+// ── Right panel: log accordion ────────────────────────────────────────────
 
 fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, area: Rect) {
-    let title = match &pipeline.selection {
-        None                                     => " Logs ".to_string(),
-        Some(TaskSelection::Task(t))             => format!(" Logs: {t} (all steps) "),
-        Some(TaskSelection::Step { task, step }) => format!(" Logs: {task} ▸ {step} "),
+    let title_text = match &pipeline.selected_task {
+        None       => " Logs ".to_string(),
+        Some(task) => format!(" Logs: {task} "),
     };
 
+    let collapse_indicator = if pipeline.logs_collapsed {
+        " [collapsed — space to expand]"
+    } else {
+        " [expanded — space to collapse]"
+    };
     let follow_indicator = if pipeline.log_follow {
         " [follow]"
     } else {
         " [manual — Ctrl+↓ to follow]"
     };
 
-    let block = Block::default()
-        .title(format!("{title}{follow_indicator}"))
-        .borders(Borders::BOTTOM)
-        .border_style(focused_border_style(focused));
+    let block = panel_block(
+        vec![
+            Span::styled(title_text, panel_title_style(focused)),
+            Span::styled(collapse_indicator, Style::default().fg(Color::DarkGray)),
+            Span::styled(follow_indicator, Style::default().fg(Color::DarkGray)),
+        ],
+        focused,
+        Borders::BOTTOM,
+    );
 
     let inner = block.inner(area);
     let visible_height = inner.height as usize;
 
-    let lines = pipeline.visible_log_lines();
-    let total = lines.len();
+    let rows = pipeline.visible_log_rows();
+    let total = rows.len();
     let scroll = pipeline.clamped_log_scroll(visible_height);
 
-    let show_step_prefix = matches!(&pipeline.selection, Some(TaskSelection::Task(_)));
-
-    let styled_lines: Vec<Line> = lines.iter()
+    let styled_lines: Vec<Line> = rows.iter()
         .skip(scroll)
         .take(visible_height)
-        .map(|l| {
-            let mut spans = vec![
-                Span::styled(
-                    format!("{} ", l.timestamp),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ];
-            if show_step_prefix {
-                spans.push(Span::styled(
-                    format!("[{}] ", l.step),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ));
+        .map(|row| match row {
+            LogRow::Header { step, status } => {
+                let (_, icon) = status_style(status);
+                // Inverted bar makes each accordion section heading
+                // unmistakable amid the surrounding log text.
+                let header_style = Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD);
+                let arrow = if pipeline.logs_collapsed { "▸" } else { "▾" };
+                Line::from(vec![
+                    Span::styled(format!(" {arrow} {icon} {step} "), header_style),
+                ])
             }
-            spans.push(Span::raw(
-                l.text.split('\r').last().unwrap_or(&l.text).trim_end()
-            ));
-            Line::from(spans)
+            LogRow::Line(l) => {
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{} ", l.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                spans.push(Span::raw(
+                    l.text.split('\r').last().unwrap_or(&l.text).trim_end()
+                ));
+                Line::from(spans)
+            }
         })
         .collect();
 
@@ -375,7 +375,6 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
 
     // ── Scrollbar ─────────────────────────────────────────────────────────
     if total > visible_height {
-        // Reserve the rightmost column of `inner` for the scrollbar track.
         let scrollbar_area = Rect {
             x: inner.x + inner.width.saturating_sub(1),
             y: inner.y,
@@ -431,7 +430,7 @@ fn draw_footer(frame: &mut Frame, state: &AppState, area: Rect) {
     let focus_hints = match state.focus {
         Focus::PipelineList => "↑/↓ select pipeline  → focus tasks  q quit",
         Focus::TaskLog      => "← pipelines  ↑/↓ navigate  → logs  q quit",
-        Focus::Logs         => "← tasks  ↑/↓ scroll  PgUp/PgDn page  Ctrl+↓ follow  q quit",
+        Focus::Logs         => "← tasks  ↑/↓ scroll  PgUp/PgDn page  space collapse/expand  Ctrl+↓ follow  q quit",
     };
 
     let done_hint = state.current()

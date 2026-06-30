@@ -4,10 +4,7 @@ use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, handle_branch, logs_run, print_deployments, print_status,
-    push_helpers::{force_trigger, git_push, resolve_branch, resolve_remote},
-    send,
-    pipeline_run::run_pipeline_command,
+    check_session_guard, handle_branch, logs_run, pipeline_run::run_pipeline_command, print_deployments, print_status, push_helpers::{PushResult, force_trigger, git_push, resolve_branch, resolve_remote}, send,
 };
 
 #[derive(Parser)]
@@ -175,38 +172,56 @@ async fn main() {
 
         // ── --force-pipeline: skip git push, trigger directly, open TUI ──────
         if force_pipeline {
+            let remote = match resolve_remote(remote).await {
+                Ok(r) => r,
+                Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+            };
             let branch = match resolve_branch(branch).await {
                 Ok(b) => b,
                 Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
             };
 
-            println!("\n⚡ Force-triggering pipeline for branch '{branch}'...\n");
+            println!("\n⚡ Pushing branch '{branch}' to '{remote}'...\n");
 
-            let triggered = match force_trigger(&branch).await {
-                Ok(t) => t,
+            let triggered = match git_push(&remote, &branch).await {
+                Ok(PushResult::Triggered(runs)) => {
+                    println!("\n✓ {} pipeline(s) triggered by push:\n", runs.len());
+                    for p in &runs {
+                        println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
+                        println!("    namespace: {}", p.namespace);
+                    }
+                    runs
+                }
+                Ok(PushResult::UpToDate) => {
+                    println!("✓ Already up-to-date — force-triggering pipeline for branch '{branch}'...\n");
+
+                    let runs = match force_trigger(&branch).await {
+                        Ok(t) => t,
+                        Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
+                    };
+
+                    if runs.is_empty() {
+                        println!("✓ Pipeline triggered — no runs created (no .tekton files matched?)");
+                        return;
+                    }
+
+                    println!("\n✓ {} pipeline(s) triggered:\n", runs.len());
+                    for p in &runs {
+                        println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
+                        println!("    namespace: {}", p.namespace);
+                    }
+                    runs
+                }
                 Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
             };
-
-            if triggered.is_empty() {
-                println!("✓ Pipeline triggered — no runs were created (no .tekton files matched?)");
-                return;
-            }
-
-            println!("\n✓ {} pipeline(s) triggered:\n", triggered.len());
-            for p in &triggered {
-                println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
-                println!("    namespace: {}", p.namespace);
-            }
 
             if no_watch {
                 return;
             }
 
-            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
-                logs_run::RunTarget {
-                    namespace: p.namespace.clone(),
-                    run_name:  p.run_name.clone(),
-                }
+            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| logs_run::RunTarget {
+                namespace: p.namespace.clone(),
+                run_name:  p.run_name.clone(),
             }).collect();
 
             if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
@@ -228,7 +243,11 @@ async fn main() {
         };
 
         let triggered = match git_push(&remote, &branch).await {
-            Ok(t) => t,
+            Ok(PushResult::Triggered(t)) => t,
+            Ok(PushResult::UpToDate) => {
+                println!("✓ Pushed — no pipelines triggered");
+                return;
+            }
             Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
         };
 
