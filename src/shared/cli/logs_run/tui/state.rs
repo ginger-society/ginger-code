@@ -1,6 +1,6 @@
 // src/bin/logs_run/tui/state.rs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::shared::cli::logs_run::wire::{
     LogLine, RunDone, RunMeta, RunSource, RunStatus, StepStatusUpdate, TaskStatusUpdate,
 };
@@ -71,6 +71,10 @@ pub struct PipelineState {
     pub log_follow: bool,
     /// When true, all step accordion sections are collapsed (headers only).
     pub logs_collapsed: bool,
+
+    /// Tasks we've already auto-advanced past (or that the user has
+    /// otherwise visited), so we only jump to a task on its *first* event.
+    activated_tasks: HashSet<String>,
 }
 
 impl PipelineState {
@@ -91,6 +95,7 @@ impl PipelineState {
             log_scroll: 0,
             log_follow: true,
             logs_collapsed: false,
+            activated_tasks: HashSet::new(),
         }
     }
 
@@ -118,7 +123,11 @@ impl PipelineState {
 
         if !self.tasks.is_empty() && self.selected_task.is_none() {
             self.cursor_pos = 0;
-            self.selected_task = Some(self.tasks[0].name.clone());
+            let first = self.tasks[0].name.clone();
+            self.selected_task = Some(first.clone());
+            // The initially-selected task is considered "activated" so we
+            // don't immediately re-trigger an auto-jump onto itself.
+            self.activated_tasks.insert(first);
         }
     }
 
@@ -207,6 +216,36 @@ impl PipelineState {
         self.run_status = done.status;
         self.run_done = true;
         self.duration_seconds = done.duration_seconds;
+    }
+
+    // ── Auto-advance ────────────────────────────────────────────────────
+
+    /// Called whenever any event arrives that's tied to a specific task
+    /// (log line, step-status, task-status). If the user hasn't manually
+    /// pressed a key yet, and this is the first event we've seen for a
+    /// task later than the currently-selected one, jump the selection
+    /// there and make sure the logs panel is following.
+    pub fn maybe_auto_advance(&mut self, user_touched: bool, task_name: &str) {
+        let first_time = !self.activated_tasks.contains(task_name);
+        if first_time {
+            self.activated_tasks.insert(task_name.to_string());
+        }
+
+        if user_touched || !first_time {
+            return;
+        }
+
+        let Some(&new_idx) = self.task_index.get(task_name) else { return; };
+        let is_ahead = match self.selected_task.as_ref() {
+            None => true,
+            Some(cur) => self.task_index.get(cur).map_or(true, |&cur_idx| new_idx > cur_idx),
+        };
+        if is_ahead {
+            self.cursor_pos = new_idx;
+            self.selected_task = Some(task_name.to_string());
+            self.log_follow = true;
+            self.log_scroll = usize::MAX;
+        }
     }
 
     // ── Task navigation (center panel) ─────────────────────────────────────
@@ -337,22 +376,22 @@ pub struct AppState {
     pub pipelines: Vec<PipelineState>,
     pub selected_pipeline: usize,
     pub focus: Focus,
+    /// True once the user has pressed any key. While false, the task
+    /// selection auto-follows progress (jumps to the next task on its
+    /// first event) and the logs panel stays in follow mode.
+    pub user_touched: bool,
 }
 
 impl AppState {
     pub fn new(run_names: Vec<String>) -> Self {
-        // Skip pipeline list panel if there's only one run — go straight
-        // to tasks so there's no extra keypress for the common case.
-        let focus = if run_names.len() == 1 {
-            Focus::TaskLog
-        } else {
-            Focus::PipelineList
-        };
+        // The task list is the default panel regardless of run count —
+        // it's the panel people care about immediately on open.
         let pipelines = run_names.into_iter().map(PipelineState::new).collect();
         AppState {
             pipelines,
             selected_pipeline: 0,
-            focus,
+            focus: Focus::TaskLog,
+            user_touched: false,
         }
     }
 

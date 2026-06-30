@@ -71,6 +71,10 @@ pub async fn run(
             }
 
             AppEvent::Key(key) => {
+                // Any keypress disables auto-advance/auto-follow for the
+                // rest of the session — the user has taken manual control.
+                state.user_touched = true;
+
                 if events::is_quit(&key) {
                     break;
                 }
@@ -86,7 +90,7 @@ pub async fn run(
                         _ => {}
                     },
 
-                    // ── Task/step list (middle panel) ─────────────────────
+                    // ── Task list (middle panel) ──────────────────────────
                     Focus::TaskLog => match key.code {
                         KeyCode::Left => {
                             state.focus = Focus::PipelineList;
@@ -103,7 +107,6 @@ pub async fn run(
                         _ => {}
                     },
 
-                    // ── Logs panel (rightmost panel) ──────────────────────
                     // ── Logs panel (rightmost panel) ──────────────────────
                     Focus::Logs => match (key.code, key.modifiers) {
                         (KeyCode::Left, _) => {
@@ -146,7 +149,17 @@ pub async fn run(
             }
 
             AppEvent::Sse(tagged) => {
+                let user_touched = state.user_touched;
                 if let Some(pipeline) = state.pipeline_mut(&tagged.run_name) {
+                    // Capture which task this event belongs to (if any)
+                    // before we consume `tagged.event` in the match below.
+                    let task_name = match &tagged.event {
+                        SseEvent::Log(log)        => Some(log.task.clone()),
+                        SseEvent::StepStatus(upd) => Some(upd.task.clone()),
+                        SseEvent::TaskStatus(upd) => Some(upd.task.clone()),
+                        _ => None,
+                    };
+
                     match tagged.event {
                         SseEvent::Meta(meta)           => pipeline.apply_meta(meta),
                         SseEvent::Log(log)             => pipeline.apply_log_line(log),
@@ -156,6 +169,10 @@ pub async fn run(
                         SseEvent::Error(err)           => pipeline.error = Some(err.message),
                         SseEvent::ConnectionError(msg) => pipeline.error = Some(msg),
                         SseEvent::UnknownEvent(_)      => {}
+                    }
+
+                    if let Some(task_name) = task_name {
+                        pipeline.maybe_auto_advance(user_touched, &task_name);
                     }
                 }
                 terminal.draw(|f| ui::draw(f, &state))?;
