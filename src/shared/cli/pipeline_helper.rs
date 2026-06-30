@@ -28,6 +28,22 @@ pub async fn resolve_sha(git_ref: &str) -> Result<String, Box<dyn std::error::Er
     Ok(std::str::from_utf8(&out.stdout)?.trim().to_string())
 }
 
+/// Returns the subject line (`%s`) of the given commit — used to show
+/// "what this pipeline run is for" in the TUI header alongside the SHA.
+pub async fn resolve_commit_message(sha: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%s", sha])
+        .output()
+        .await?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("could not resolve commit message for '{sha}': {stderr}").into());
+    }
+
+    Ok(std::str::from_utf8(&out.stdout)?.trim().to_string())
+}
+
 /// Repo name = basename of the git repo ROOT (`git rev-parse
 /// --show-toplevel`), not just the current working directory — so this
 /// still resolves correctly when the command is run from a subdirectory

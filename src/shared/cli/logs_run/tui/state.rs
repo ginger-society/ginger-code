@@ -59,6 +59,12 @@ pub struct PipelineState {
     pub duration_seconds: Option<i64>,
     pub error: Option<String>,
 
+    /// Short (8-char) commit SHA this run was triggered for, if known.
+    /// Only populated when launched via `ginger-code pipeline <ref>`.
+    pub commit_sha: Option<String>,
+    /// Subject line of that commit, if known.
+    pub commit_message: Option<String>,
+
     pub tasks: Vec<TaskState>,
     task_index: HashMap<String, usize>,
     pub log_lines: Vec<StoredLogLine>,
@@ -87,6 +93,8 @@ impl PipelineState {
             run_done: false,
             duration_seconds: None,
             error: None,
+            commit_sha: None,
+            commit_message: None,
             tasks: Vec::new(),
             task_index: HashMap::new(),
             log_lines: Vec::new(),
@@ -97,6 +105,16 @@ impl PipelineState {
             logs_collapsed: false,
             activated_tasks: HashSet::new(),
         }
+    }
+
+    /// Attach commit info known up-front (from `RunTarget::with_commit`,
+    /// e.g. when launched via `ginger-code pipeline <ref>`). Builder-style
+    /// so it composes cleanly with `PipelineState::new(...)` at construction
+    /// time in `AppState::new`.
+    pub fn with_commit(mut self, sha: Option<String>, message: Option<String>) -> Self {
+        self.commit_sha = sha;
+        self.commit_message = message;
+        self
     }
 
     // ── SSE handlers ──────────────────────────────────────────────────────
@@ -383,10 +401,21 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(run_names: Vec<String>) -> Self {
+    /// Builds initial per-pipeline state from the full `RunTarget` list
+    /// (not just names) so that commit info attached via
+    /// `RunTarget::with_commit` (set by the `pipeline` subcommand) makes
+    /// it into the TUI header from the very first frame, before any
+    /// `meta` SSE event has even arrived.
+    pub fn new(targets: &[super::super::RunTarget]) -> Self {
         // The task list is the default panel regardless of run count —
         // it's the panel people care about immediately on open.
-        let pipelines = run_names.into_iter().map(PipelineState::new).collect();
+        let pipelines = targets
+            .iter()
+            .map(|t| {
+                PipelineState::new(t.run_name.clone())
+                    .with_commit(t.commit_sha.clone(), t.commit_message.clone())
+            })
+            .collect();
         AppState {
             pipelines,
             selected_pipeline: 0,

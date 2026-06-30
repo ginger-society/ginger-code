@@ -149,10 +149,7 @@ async fn main() {
     }
 
     if let Cmd::LogsRun { ref namespace, ref run_name, ref sidekick_url, raw } = cmd {
-        let targets = vec![logs_run::RunTarget {
-            namespace: namespace.clone(),
-            run_name: run_name.clone(),
-        }];
+        let targets = vec![logs_run::RunTarget::new(namespace.clone(), run_name.clone())];
         if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
             eprintln!("✗  {e}");
             std::process::exit(1);
@@ -219,9 +216,8 @@ async fn main() {
                 return;
             }
 
-            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| logs_run::RunTarget {
-                namespace: p.namespace.clone(),
-                run_name:  p.run_name.clone(),
+            let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
+                logs_run::RunTarget::new(p.namespace.clone(), p.run_name.clone())
             }).collect();
 
             if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
@@ -267,10 +263,7 @@ async fn main() {
         }
 
         let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
-            logs_run::RunTarget {
-                namespace: p.namespace.clone(),
-                run_name: p.run_name.clone(),
-            }
+            logs_run::RunTarget::new(p.namespace.clone(), p.run_name.clone())
         }).collect();
 
         if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {

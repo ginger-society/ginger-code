@@ -23,7 +23,7 @@ use tekton_sidekick::{apis::default_api::{RoutesRunsByLabelRunsByLabelParams, ro
 use tekton_sidekick::apis::Error as SidekickApiError;
 
 use super::logs_run::{self, RunTarget};
-use super::pipeline_helper::{namespace_for_repo, resolve_repo_name, resolve_sha};
+use super::pipeline_helper::{namespace_for_repo, resolve_commit_message, resolve_repo_name, resolve_sha};
 
 /// Maps the generated client's `Error<E>` into a plain message. Handled
 /// explicitly (rather than relying on `?`/`From` to do this implicitly)
@@ -53,8 +53,18 @@ pub async fn run_pipeline_command(
     let repo_name = resolve_repo_name().await?;
     let namespace = namespace.unwrap_or_else(|| namespace_for_repo(&repo_name));
     let sha = resolve_sha(git_ref).await?;
+    let commit_message = super::pipeline_helper::resolve_commit_message(&sha).await.unwrap_or_default();
+
+
+    // Best-effort: if this fails for some reason (e.g. detached/odd
+    // history), we still want the pipeline lookup to proceed — just
+    // without a commit subject shown in the TUI header.
+    let commit_message = resolve_commit_message(&sha).await.unwrap_or_default();
 
     println!("→ repo: {repo_name}   namespace: {namespace}   sha: {sha}   ref: {git_ref}");
+    if !commit_message.is_empty() {
+        println!("  commit: {commit_message}");
+    }
 
     let token = get_token_from_file_storage();
     let config = get_configuration(Some(token));
@@ -116,9 +126,9 @@ pub async fn run_pipeline_command(
 
     let targets: Vec<RunTarget> = response
         .iter()
-        .map(|run| RunTarget {
-            namespace: namespace.clone(),
-            run_name: run.name.clone(),
+        .map(|run| {
+            RunTarget::new(namespace.clone(), run.name.clone())
+                .with_commit(sha.clone(), commit_message.clone())
         })
         .collect();
 

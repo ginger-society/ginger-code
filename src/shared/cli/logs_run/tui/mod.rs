@@ -50,15 +50,18 @@ pub async fn run(
     events::spawn_key_task(tx.clone());
     events::spawn_tick_task(tx.clone(), TICK_RATE_MS);
 
-    let run_names: Vec<String> = targets.iter().map(|t| t.run_name.clone()).collect();
-    let mut state = AppState::new(run_names);
+    let mut log_visible_height: usize = 0;
+    // Build state from the full targets (not just names) so commit info
+    // (sha/message), when present, is available in the header from the
+    // very first frame.
+    let mut state = AppState::new(&targets);
 
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    terminal.draw(|f| ui::draw(f, &state))?;
-
+    terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
+    
     loop {
         let event = match rx.recv().await {
             Some(e) => e,
@@ -67,7 +70,7 @@ pub async fn run(
 
         match event {
             AppEvent::Tick => {
-                terminal.draw(|f| ui::draw(f, &state))?;
+                terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
             }
 
             AppEvent::Key(key) => {
@@ -125,27 +128,26 @@ pub async fn run(
                             }
                         }
                         (KeyCode::Down, _) => {
-                            let height = (terminal.size()?.height / 2) as usize;
                             if let Some(p) = state.current_mut() {
-                                p.scroll_log_down(height);
+                                p.scroll_log_down(log_visible_height);
                             }
                         }
                         (KeyCode::PageUp, _) => {
-                            let half = (terminal.size()?.height / 2) as usize;
+                            let half = log_visible_height / 2;
                             if let Some(p) = state.current_mut() {
                                 p.page_log_up(half);
                             }
                         }
                         (KeyCode::PageDown, _) => {
-                            let half = (terminal.size()?.height / 2) as usize;
+                            let half = log_visible_height / 2;
                             if let Some(p) = state.current_mut() {
-                                p.page_log_down(half, half);
+                                p.page_log_down(half, log_visible_height);
                             }
                         }
                         _ => {}
                     },
                 }
-                terminal.draw(|f| ui::draw(f, &state))?;
+                terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
             }
 
             AppEvent::Sse(tagged) => {
@@ -175,7 +177,7 @@ pub async fn run(
                         pipeline.maybe_auto_advance(user_touched, &task_name);
                     }
                 }
-                terminal.draw(|f| ui::draw(f, &state))?;
+                terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
             }
         }
     }

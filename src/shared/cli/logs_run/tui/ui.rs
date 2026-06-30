@@ -68,7 +68,7 @@ fn panel_block(title_spans: Vec<Span<'static>>, focused: bool, borders: Borders)
 
 // ── Top-level draw ────────────────────────────────────────────────────────
 
-pub fn draw(frame: &mut Frame, state: &AppState) {
+pub fn draw(frame: &mut Frame, state: &AppState) -> usize {
     let area = frame.size();
 
     let vertical = Layout::default()
@@ -109,24 +109,27 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         draw_pipeline_list(frame, state, body[0]);
     }
 
+    let mut log_visible_height = 0;
     if let Some(pipeline) = state.current() {
         draw_task_pane(frame, pipeline, state.focus == Focus::TaskLog, body[1]);
-        draw_log_pane(frame, pipeline, state.focus == Focus::Logs, body[2]);
+        log_visible_height = draw_log_pane(frame, pipeline, state.focus == Focus::Logs, body[2]);
     }
 
     draw_footer(frame, state, vertical[2]);
+    log_visible_height
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
 
 fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
-    let (run_label, pipeline_label, current_status, source_tag, duration) = match state.current() {
+    let (run_label, pipeline_label, current_status, source_tag, duration, commit) = match state.current() {
         None => (
             "—".to_string(),
             "—".to_string(),
             RunStatus::Pending,
             "",
             String::new(),
+            None,
         ),
         Some(p) => {
             let src = match p.source {
@@ -142,6 +145,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
                 p.run_status,
                 src,
                 dur,
+                p.commit_sha.as_ref().map(|sha| (sha.clone(), p.commit_message.clone())),
             )
         }
     };
@@ -170,6 +174,19 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
             format!("  [{}/{}]", state.selected_pipeline + 1, state.pipelines.len()),
             Style::default().fg(Color::DarkGray),
         ));
+    }
+
+    // Commit sha (+ subject, if known) — only present when the TUI was
+    // launched via `ginger-code pipeline <ref>`, which resolves these
+    // up front and attaches them to the RunTarget.
+    if let Some((sha, message)) = commit {
+        spans.push(Span::styled(
+            format!("  {} ", &sha[..sha.len().min(8)]),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+        if let Some(msg) = message.filter(|m| !m.is_empty()) {
+            spans.push(Span::styled(msg, Style::default().fg(Color::White)));
+        }
     }
 
     let header = Paragraph::new(Line::from(spans))
@@ -284,8 +301,21 @@ fn draw_task_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, ar
 }
 
 // ── Right panel: log accordion ────────────────────────────────────────────
-
-fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, area: Rect) {
+//
+// NOTE on layout: this panel previously relied on `Block::inner()` to
+// account for both the top title (set via `.title(...)`, with NO
+// `Borders::TOP`) and the bottom scroll-position label (set via
+// `.title_bottom(...)`). Whether `inner()` reserves a row for a
+// borderless title is version-dependent, and on this ratatui build it
+// does NOT — so `visible_height` came out one row too tall, which meant
+// the true last log line was always rendered one row past the bottom
+// border and could never be scrolled into view.
+//
+// Fixed by not trusting Block's implicit title accounting at all: we
+// manually `Layout::split` the panel into an explicit title row and an
+// explicit content row, so `visible_height` is always exactly the number
+// of rows we actually draw into — no guessing.
+fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, area: Rect) -> usize {
     let title_text = match &pipeline.selected_task {
         None       => " Logs ".to_string(),
         Some(task) => format!(" Logs: {task} "),
@@ -302,23 +332,55 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
         " [manual — Ctrl+↓ to follow]"
     };
 
-    let block = panel_block(
-        vec![
-            Span::styled(title_text, panel_title_style(focused)),
-            Span::styled(collapse_indicator, Style::default().fg(Color::DarkGray)),
-            Span::styled(follow_indicator, Style::default().fg(Color::DarkGray)),
-        ],
-        focused,
-        Borders::BOTTOM,
-    );
-
-    let inner = block.inner(area);
-    let visible_height = inner.height as usize;
-
+    // Outer block: just the border + the bottom scroll-position label.
+    // No top title here — we draw that ourselves into its own row below,
+    // so there's no ambiguity about whether it consumes space.
     let rows = pipeline.visible_log_rows();
     let total = rows.len();
+
+    // Reserve: 1 row at top for our manual title line, 1 row at bottom
+    // for the border (which also carries the scroll-position label).
+    let outer_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(focused_border_style(focused));
+    let outer_inner = outer_block.inner(area); // excludes only the bottom border row
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(outer_inner);
+    let title_area = split[0];
+    let content_area = split[1];
+
+    let visible_height = content_area.height as usize;
     let scroll = pipeline.clamped_log_scroll(visible_height);
 
+    let scroll_info = if total > 0 {
+        let from = scroll + 1;
+        let to = (scroll + visible_height).min(total);
+        format!("{from}-{to}/{total}")
+    } else {
+        "no logs".to_string()
+    };
+
+    // Render the border (with bottom scroll-info label) first.
+    let outer_block = outer_block
+        .title_bottom(Line::from(Span::styled(
+            format!(" {scroll_info} "),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .title_alignment(Alignment::Left);
+    frame.render_widget(outer_block, area);
+
+    // Render our manual title row.
+    let title_line = Line::from(vec![
+        Span::styled(title_text, panel_title_style(focused)),
+        Span::styled(collapse_indicator, Style::default().fg(Color::DarkGray)),
+        Span::styled(follow_indicator, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(title_line), title_area);
+
+    // Render content.
     let styled_lines: Vec<Line> = rows.iter()
         .skip(scroll)
         .take(visible_height)
@@ -352,34 +414,16 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
         })
         .collect();
 
-    let scroll_info = if total > 0 {
-        let from = scroll + 1;
-        let to = (scroll + visible_height).min(total);
-        format!("{from}-{to}/{total}")
-    } else {
-        "no logs".to_string()
-    };
-
-    let log_widget = Paragraph::new(styled_lines)
-        .block(
-            block
-                .title_alignment(Alignment::Left)
-                .title_bottom(Line::from(Span::styled(
-                    format!(" {scroll_info} "),
-                    Style::default().fg(Color::DarkGray),
-                ))),
-        )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(log_widget, area);
+    let log_widget = Paragraph::new(styled_lines).wrap(Wrap { trim: false });
+    frame.render_widget(log_widget, content_area);
 
     // ── Scrollbar ─────────────────────────────────────────────────────────
     if total > visible_height {
         let scrollbar_area = Rect {
-            x: inner.x + inner.width.saturating_sub(1),
-            y: inner.y,
+            x: content_area.x + content_area.width.saturating_sub(1),
+            y: content_area.y,
             width: 1,
-            height: inner.height,
+            height: content_area.height,
         };
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -410,9 +454,9 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
         };
 
         let mid = Rect {
-            x: inner.x,
-            y: inner.y + inner.height / 2,
-            width: inner.width,
+            x: content_area.x,
+            y: content_area.y + content_area.height / 2,
+            width: content_area.width,
             height: 1,
         };
         frame.render_widget(
@@ -422,6 +466,7 @@ fn draw_log_pane(frame: &mut Frame, pipeline: &PipelineState, focused: bool, are
             mid,
         );
     }
+    visible_height
 }
 
 // ── Footer ────────────────────────────────────────────────────────────────
