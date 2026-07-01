@@ -17,7 +17,7 @@ pub struct RunTarget {
 
 impl RunTarget {
     /// Plain constructor — used by call sites that don't have commit
-    /// info available (LogsRun, Push).
+    /// info available (LogsRun).
     pub fn new(namespace: String, run_name: String) -> Self {
         RunTarget {
             namespace,
@@ -27,11 +27,21 @@ impl RunTarget {
         }
     }
 
-    /// Attach commit info — used by the `pipeline` subcommand, which
-    /// resolves a sha/message before looking up matching runs.
+    /// Attach commit info from already-`String` values — used by the
+    /// `pipeline` subcommand, which resolves sha/message before looking
+    /// up matching runs.
     pub fn with_commit(mut self, sha: String, message: String) -> Self {
-        self.commit_sha = Some(sha);
+        self.commit_sha    = Some(sha);
         self.commit_message = Some(message);
+        self
+    }
+
+    /// Attach commit info from `Option<String>` values — used by the
+    /// `push` path, where sha/message resolution is best-effort and the
+    /// result may be `None` if git is unavailable.
+    pub fn with_commit_opt(mut self, sha: Option<String>, message: Option<String>) -> Self {
+        self.commit_sha    = sha;
+        self.commit_message = message;
         self
     }
 }

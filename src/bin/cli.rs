@@ -4,7 +4,11 @@ use IAMService::get_configuration as get_iam_configuration;
 use MetadataService::get_configuration as get_metadata_configuration;
 
 use ginger_code::shared::cli::{
-    check_session_guard, handle_branch, logs_run, pipeline_run::run_pipeline_command, print_deployments, print_status, push_helpers::{PushResult, force_trigger, git_push, resolve_branch, resolve_remote}, send,
+    check_session_guard, handle_branch, logs_run, pipeline_run::run_pipeline_command,
+    pipeline_helper::{resolve_sha, resolve_commit_message},
+    print_deployments, print_status,
+    push_helpers::{PushResult, force_trigger, git_push, resolve_branch, resolve_remote},
+    send,
 };
 
 #[derive(Parser)]
@@ -123,6 +127,18 @@ enum Cmd {
     Config,
 }
 
+/// Resolve the HEAD commit's short sha and subject line. Used by the push
+/// path to attach commit context to RunTargets before opening the TUI.
+/// Both steps are best-effort — a failure here must never abort the watch.
+async fn resolve_head_commit() -> (Option<String>, Option<String>) {
+    let sha = match resolve_sha("HEAD").await {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let message = resolve_commit_message(&sha).await.ok().filter(|m| !m.is_empty());
+    (Some(sha), message)
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -167,7 +183,7 @@ async fn main() {
 
     if let Cmd::Push { ref remote, ref branch, ref sidekick_url, no_watch, raw, force_pipeline } = cmd {
 
-        // ── --force-pipeline: skip git push, trigger directly, open TUI ──────
+        // ── --force-pipeline: push, then trigger if up-to-date ───────────
         if force_pipeline {
             let remote = match resolve_remote(remote).await {
                 Ok(r) => r,
@@ -191,17 +207,14 @@ async fn main() {
                 }
                 Ok(PushResult::UpToDate) => {
                     println!("✓ Already up-to-date — force-triggering pipeline for branch '{branch}'...\n");
-
                     let runs = match force_trigger(&branch).await {
                         Ok(t) => t,
                         Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
                     };
-
                     if runs.is_empty() {
                         println!("✓ Pipeline triggered — no runs created (no .tekton files matched?)");
                         return;
                     }
-
                     println!("\n✓ {} pipeline(s) triggered:\n", runs.len());
                     for p in &runs {
                         println!("  ● {}  →  {}", p.pipeline_name, p.run_name);
@@ -212,23 +225,24 @@ async fn main() {
                 Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
             };
 
-            if no_watch {
-                return;
-            }
+            if no_watch { return; }
+
+            // Resolve HEAD commit info so the TUI header shows what was pushed.
+            let (commit_sha, commit_message) = resolve_head_commit().await;
 
             let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
                 logs_run::RunTarget::new(p.namespace.clone(), p.run_name.clone())
+                    .with_commit_opt(commit_sha.clone(), commit_message.clone())
             }).collect();
 
             if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
                 eprintln!("✗  {e}");
                 std::process::exit(1);
             }
-
             return;
         }
 
-        // ── normal push path ──────────────────────────────────────────────────
+        // ── Normal push path ──────────────────────────────────────────────
         let remote = match resolve_remote(remote).await {
             Ok(r) => r,
             Err(e) => { eprintln!("✗  {e}"); std::process::exit(1); }
@@ -258,19 +272,20 @@ async fn main() {
             println!("    namespace: {}", p.namespace);
         }
 
-        if no_watch {
-            return;
-        }
+        if no_watch { return; }
+
+        // Resolve HEAD commit info so the TUI header shows what was pushed.
+        let (commit_sha, commit_message) = resolve_head_commit().await;
 
         let targets: Vec<logs_run::RunTarget> = triggered.iter().map(|p| {
             logs_run::RunTarget::new(p.namespace.clone(), p.run_name.clone())
+                .with_commit_opt(commit_sha.clone(), commit_message.clone())
         }).collect();
 
         if let Err(e) = logs_run::stream_run_logs(sidekick_url, targets, raw).await {
             eprintln!("✗  {e}");
             std::process::exit(1);
         }
-
         return;
     }
 

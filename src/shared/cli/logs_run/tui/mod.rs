@@ -51,9 +51,6 @@ pub async fn run(
     events::spawn_tick_task(tx.clone(), TICK_RATE_MS);
 
     let mut log_visible_height: usize = 0;
-    // Build state from the full targets (not just names) so commit info
-    // (sha/message), when present, is available in the header from the
-    // very first frame.
     let mut state = AppState::new(&targets);
 
     let _guard = TerminalGuard::enter()?;
@@ -61,7 +58,7 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
-    
+
     loop {
         let event = match rx.recv().await {
             Some(e) => e,
@@ -74,8 +71,6 @@ pub async fn run(
             }
 
             AppEvent::Key(key) => {
-                // Any keypress disables auto-advance/auto-follow for the
-                // rest of the session — the user has taken manual control.
                 state.user_touched = true;
 
                 if events::is_quit(&key) {
@@ -83,78 +78,101 @@ pub async fn run(
                 }
 
                 match state.focus {
-                    // ── Pipeline list (leftmost panel) ────────────────────
+                    // ── Pipeline list ─────────────────────────────────────
                     Focus::PipelineList => match key.code {
-                        KeyCode::Right => {
-                            state.focus = Focus::TaskLog;
-                        }
-                        KeyCode::Up => state.select_prev_pipeline(),
-                        KeyCode::Down => state.select_next_pipeline(),
+                        KeyCode::Right => { state.focus = Focus::TaskLog; }
+                        KeyCode::Up    => state.select_prev_pipeline(),
+                        KeyCode::Down  => state.select_next_pipeline(),
                         _ => {}
                     },
 
-                    // ── Task list (middle panel) ──────────────────────────
+                    // ── Task list ─────────────────────────────────────────
                     Focus::TaskLog => match key.code {
-                        KeyCode::Left => {
-                            state.focus = Focus::PipelineList;
-                        }
-                        KeyCode::Right => {
-                            state.focus = Focus::Logs;
-                        }
-                        KeyCode::Up => {
-                            if let Some(p) = state.current_mut() { p.move_up(); }
-                        }
-                        KeyCode::Down => {
-                            if let Some(p) = state.current_mut() { p.move_down(); }
-                        }
+                        KeyCode::Left  => { state.focus = Focus::PipelineList; }
+                        KeyCode::Right => { state.focus = Focus::Logs; }
+                        KeyCode::Up    => { if let Some(p) = state.current_mut() { p.move_up(); } }
+                        KeyCode::Down  => { if let Some(p) = state.current_mut() { p.move_down(); } }
                         _ => {}
                     },
 
-                    // ── Logs panel (rightmost panel) ──────────────────────
-                    Focus::Logs => match (key.code, key.modifiers) {
-                        (KeyCode::Left, _) => {
-                            state.focus = Focus::TaskLog;
-                        }
-                        (KeyCode::Char(' '), _) => {
-                            if let Some(p) = state.current_mut() { p.toggle_logs_collapse(); }
-                        }
-                        (KeyCode::Up, _) => {
-                            if let Some(p) = state.current_mut() { p.scroll_log_up(); }
-                        }
-                        (KeyCode::Down, KeyModifiers::CONTROL) => {
-                            // Ctrl+↓ re-enables auto-scroll / follow mode
-                            if let Some(p) = state.current_mut() {
-                                p.follow_logs();
+                    // ── Logs panel ────────────────────────────────────────
+                    Focus::Logs => {
+                        let collapsed = state.current().map(|p| p.logs_collapsed).unwrap_or(false);
+
+                        match (key.code, key.modifiers) {
+                            // ── Panel navigation (no modifier) ────────────
+                            (KeyCode::Left, km) if km == KeyModifiers::NONE => {
+                                state.focus = Focus::TaskLog;
                             }
-                        }
-                        (KeyCode::Down, _) => {
-                            if let Some(p) = state.current_mut() {
-                                p.scroll_log_down(log_visible_height);
+
+                            // ── Horizontal scroll (Shift + arrow) ─────────
+                            (KeyCode::Left, km) if km.contains(KeyModifiers::SHIFT) => {
+                                if let Some(p) = state.current_mut() { p.scroll_log_left(8); }
                             }
-                        }
-                        (KeyCode::PageUp, _) => {
-                            let half = log_visible_height / 2;
-                            if let Some(p) = state.current_mut() {
-                                p.page_log_up(half);
+                            (KeyCode::Right, km) if km.contains(KeyModifiers::SHIFT) => {
+                                if let Some(p) = state.current_mut() { p.scroll_log_right(8); }
                             }
-                        }
-                        (KeyCode::PageDown, _) => {
-                            let half = log_visible_height / 2;
-                            if let Some(p) = state.current_mut() {
-                                p.page_log_down(half, log_visible_height);
+
+                            // ── Collapse / expand all (Space) ─────────────
+                            (KeyCode::Char(' '), _) => {
+                                if let Some(p) = state.current_mut() { p.toggle_logs_collapse(); }
                             }
+
+                            // ── Enter: expand to selected step ────────────
+                            (KeyCode::Enter, _) if collapsed => {
+                                if let Some(p) = state.current_mut() { p.expand_to_step(); }
+                            }
+
+                            // ── Follow mode ───────────────────────────────
+                            (KeyCode::Down, KeyModifiers::CONTROL) => {
+                                if let Some(p) = state.current_mut() { p.follow_logs(); }
+                            }
+
+                            // ── Up: step cursor (collapsed) / scroll (expanded) ──
+                            (KeyCode::Up, _) => {
+                                if let Some(p) = state.current_mut() {
+                                    if collapsed {
+                                        p.collapsed_select_up();
+                                    } else {
+                                        p.scroll_log_up();
+                                    }
+                                }
+                            }
+
+                            // ── Down: step cursor (collapsed) / scroll (expanded) ─
+                            (KeyCode::Down, _) => {
+                                if let Some(p) = state.current_mut() {
+                                    if collapsed {
+                                        p.collapsed_select_down(log_visible_height);
+                                    } else {
+                                        p.scroll_log_down(log_visible_height);
+                                    }
+                                }
+                            }
+
+                            // ── Page scroll ───────────────────────────────
+                            (KeyCode::PageUp, _) => {
+                                let half = log_visible_height / 2;
+                                if let Some(p) = state.current_mut() { p.page_log_up(half); }
+                            }
+                            (KeyCode::PageDown, _) => {
+                                let half = log_visible_height / 2;
+                                if let Some(p) = state.current_mut() {
+                                    p.page_log_down(half, log_visible_height);
+                                }
+                            }
+
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                 }
+
                 terminal.draw(|f| { log_visible_height = ui::draw(f, &state); })?;
             }
 
             AppEvent::Sse(tagged) => {
                 let user_touched = state.user_touched;
                 if let Some(pipeline) = state.pipeline_mut(&tagged.run_name) {
-                    // Capture which task this event belongs to (if any)
-                    // before we consume `tagged.event` in the match below.
                     let task_name = match &tagged.event {
                         SseEvent::Log(log)        => Some(log.task.clone()),
                         SseEvent::StepStatus(upd) => Some(upd.task.clone()),
